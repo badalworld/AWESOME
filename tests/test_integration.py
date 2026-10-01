@@ -119,7 +119,7 @@ class TradeLifecycleTest(unittest.IsolatedAsyncioTestCase):
     async def _open(self, side: str = LONG, price: float = 100.0, atr: float = 0.5):
         return await self.executor.open_from_signal(
             make_signal(side=side, price=price, atr=atr),
-            equity=1000.0, available=1000.0, margin_used=0.0, open_positions=0,
+
         )
 
     async def test_entry_math_and_protection(self):
@@ -283,8 +283,9 @@ class TradeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         assert small is not None
         await self.broker.close_position("TEST_USDT", small.side, small.qty, reason="test")
         self.executor.positions.clear()
+        self.broker.realized += 1000.0  # realised profit increases running equity
         large = await self.executor.open_from_signal(
-            make_signal(), equity=2000.0, available=2000.0, margin_used=0.0, open_positions=0,
+            make_signal(),
         )
         assert large is not None
         self.assertGreater(large.notional_usd, small.notional_usd * 1.8)
@@ -318,7 +319,7 @@ class PartialTakeProfitTest(unittest.IsolatedAsyncioTestCase):
     async def _open(self):
         return await self.executor.open_from_signal(
             make_signal(price=100.0, atr=0.5),
-            equity=1000.0, available=1000.0, margin_used=0.0, open_positions=0,
+
         )
 
     def _enable(self, *, roi: float = 50.0, fraction: float = 0.5) -> None:

@@ -150,7 +150,7 @@ class ApiTest(unittest.TestCase):
             async def clear_credentials(self, vid):
                 await self.get(vid).keystore.clear()
 
-            async def restart(self, vid):
+            def request_restart(self, vid):
                 return True
 
         cls.manager = FakeManager()
@@ -287,6 +287,105 @@ class ApiTest(unittest.TestCase):
             payload = json.loads(ws.receive_text())
             self.assertEqual(payload.get("type"), "state")
             self.assertIn("account", payload["state"])
+
+    def test_token_protects_read_and_write_routes(self):
+        token = "audit-private-token"
+        self.cfg.set("web.api_token", token)
+        try:
+            for path in ("/api/state", "/api/settings", "/api/logs", "/api/trades.csv",
+                         "/api/venues", "/api/v/binance/state", "/api/v/kucoin/settings"):
+                with self.subTest(path=path):
+                    self.assertEqual(self.client.get(path).status_code, 401)
+                    self.assertEqual(self.client.get(path, headers={"X-API-Token": "wrong"}).status_code, 401)
+                    response = self.client.get(path, headers={"X-API-Token": token})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertNotIn(token, response.text)
+            self.assertEqual(self.client.post("/api/control/flatten").status_code, 401)
+            self.assertEqual(self.client.get("/api/health").status_code, 200)
+            self.assertEqual(self.client.get("/").status_code, 200)
+        finally:
+            self.cfg.reset(["web.api_token"])
+
+    def test_token_update_is_not_echoed_or_logged(self):
+        from unittest.mock import patch
+        token = "new-audit-private-token"
+        try:
+            with patch("app.web.server.log.info") as log:
+                response = self.client.put("/api/settings", json={"web.api_token": token})
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn(token, response.text)
+            self.assertNotIn(token, str(log.call_args_list))
+            settings = self.client.get("/api/settings", headers={"X-API-Token": token})
+            self.assertEqual(settings.json()["effective"]["web.api_token"], "***")
+        finally:
+            self.cfg.reset(["web.api_token"])
+
+    def test_websocket_requires_token(self):
+        from starlette.websockets import WebSocketDisconnect
+        token = "audit-private-token"
+        self.cfg.set("web.api_token", token)
+        try:
+            with self.assertRaises(WebSocketDisconnect):
+                with self.client.websocket_connect("/ws/binance") as ws:
+                    ws.receive_json()
+            with self.client.websocket_connect("/ws/binance", headers={"X-API-Token": token}) as ws:
+                self.assertEqual(ws.receive_json()["venue"], "binance")
+        finally:
+            self.cfg.reset(["web.api_token"])
+
+    def test_history_pagination_is_bounded(self):
+        for endpoint in ("trades", "signals", "orders", "equity"):
+            for limit in (-1, 0, 10000000):
+                with self.subTest(endpoint=endpoint, limit=limit):
+                    self.assertEqual(self.client.get(f"/api/{endpoint}?limit={limit}").status_code, 422)
+        self.assertEqual(self.client.get("/api/trades?offset=-1").status_code, 422)
+
+    def test_invalid_reset_payload_does_not_erase_settings(self):
+        before = self.cfg.as_dict()
+        for payload in ({}, {"keys": "risk.leverage"}, "risk.leverage", 2, [None]):
+            with self.subTest(payload=payload):
+                response = self.client.post("/api/settings/reset", json=payload)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(self.cfg.as_dict(), before)
+        response = self.client.post("/api/settings/reset", json=[])
+        self.assertEqual(response.json()["keys"], [])
+        self.assertEqual(self.cfg.as_dict(), before)
+
+    def test_invalid_partial_reset_returns_validation_error(self):
+        self.cfg.set_many({"strategy.ao_fast": 40, "strategy.ao_slow": 50})
+        try:
+            response = self.client.post("/api/settings/reset", json=["strategy.ao_slow"])
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(self.cfg.get("strategy.ao_slow"), 50)
+        finally:
+            self.cfg.reset(["strategy.ao_fast", "strategy.ao_slow"])
+
+    def test_paper_reset_rejects_actual_live_broker_despite_paper_config(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        broker = SimpleNamespace(mode="live", starting_equity=1000.)
+        with patch.object(self.manager.primary.engine, "broker", broker):
+            response = self.client.post("/api/control/paper-reset", json={"equity": 20})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(broker.starting_equity, 1000.)
+
+    def test_paper_reset_rejects_invalid_equity_before_mutation(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        broker = SimpleNamespace(mode="paper", starting_equity=1000.)
+        with patch.object(self.manager.primary.engine, "broker", broker):
+            for equity in (0, -10, "nan", "inf", "oops", None):
+                with self.subTest(equity=equity):
+                    response = self.client.post("/api/control/paper-reset", json={"equity": equity})
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertEqual(broker.starting_equity, 1000.)
+
+    def test_restart_rejection_is_not_reported_as_success(self):
+        from unittest.mock import patch
+        with patch.object(self.manager, "request_restart", return_value=False):
+            for endpoint in ("/api/control/restart", "/api/v/binance/control/restart"):
+                response = self.client.post(endpoint)
+                self.assertEqual(response.status_code, 503, response.text)
 
 
 if __name__ == "__main__":

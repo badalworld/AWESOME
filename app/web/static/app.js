@@ -31,6 +31,8 @@ const state = {
   credVenue: null,       // venue being edited in the credentials card
   venueScope: false,     // write config as venues.<id>.* overrides
   ws: null,
+  reconnectTimer: null,
+  venueEpoch: 0,       // discard late responses, including A → B → A switches
   token: localStorage.getItem('ao.token') || '',   // web.api_token (if configured)
   health: null,
 };
@@ -129,8 +131,10 @@ function renderVenueBar() {
  *  websocket frame — poll them for the active venue and feed them back into the
  *  renderer so the dashboard always shows *that venue's* trades. */
 async function pollExtras() {
+  const epoch = state.venueEpoch;
   try {
     const [t, e] = await Promise.all([vapi('/trades?limit=200'), vapi('/equity?limit=400')]);
+    if (epoch !== state.venueEpoch) return;
     state.trades = t.trades || [];
     state.equityCurve = e.curve || [];
     if (state.lastState) {
@@ -144,6 +148,9 @@ async function pollExtras() {
 async function switchVenue(id) {
   if (!id || id === state.venue) return;
   state.venue = id;
+  const epoch = ++state.venueEpoch;
+  disconnectWS();
+  state.lastState = null;
   state.logLines = [];
   state.logSeq = 0;
   localStorage.setItem('ao.venue', id);
@@ -151,11 +158,12 @@ async function switchVenue(id) {
   if (brand) brand.textContent = venueLabel(id);
   renderVenueTabs();
   renderVenueBar();
-  if (state.ws) { try { state.ws.close(); } catch (e) {} }
   state.trades = [];              // never show the previous venue's trades
   state.equityCurve = [];
   try { await loadSettings(); } catch (e) {}
-  try { renderAll(await vapi('/state')); } catch (e) {}
+  if (epoch !== state.venueEpoch) return;
+  await pollState();
+  if (epoch !== state.venueEpoch) return;
   connectWS();
   pollExtras();
 }
@@ -656,7 +664,6 @@ const FIELD_GROUPS = {
     ['risk.max_margin_usd', 'Max margin per trade ($, 0 = off)', 'number', 1],
     ['stoploss.atr_multiplier', 'ATR multiplier (SL)', 'number', 0.1],
     ['stoploss.atr_period', 'ATR period', 'number', 1],
-    ['stoploss.use_mark_price_trigger', 'Trigger on mark price', 'bool'],
     ['stoploss.local_watchdog', 'Local SL watchdog', 'bool'],
     ['stoploss.watchdog_grace_bps', 'Watchdog grace (bps)', 'number', 1],
     ['takeprofit.tp_roi_pct', 'Take profit (ROI %)', 'number', 5],
@@ -670,7 +677,6 @@ const FIELD_GROUPS = {
     ['trailing.trail_stop_step_roi', 'Trail stop step ROI (%)', 'number', 1],
     ['trailing.ratchet_only', 'Ratchet only (never loosen)', 'bool'],
     ['trailing.step_only_updates', 'Update only on new step', 'bool'],
-    ['trailing.use_mark_price_for_peak', 'Peak ROI from mark price', 'bool'],
     ['trailing.min_move_bps', 'Min stop move (bps)', 'number', 1],
   ],
   strategyForm: [
@@ -838,7 +844,9 @@ async function resetGroup(formId, keys, label) {
 }
 
 async function loadSettings() {
+  const epoch = state.venueEpoch;
   const data = await vapi('/settings');
+  if (epoch !== state.venueEpoch) return;
   state.config = data.config;
   state.credentials = data.credentials;
   state.effective = data.effective || {};
@@ -899,8 +907,10 @@ function renderCredState() {
 
 /* ------------------------------ logs ------------------------------ */
 async function pollLogs() {
+  const epoch = state.venueEpoch;
   try {
     const res = await vapi('/logs?after=' + state.logSeq + '&limit=200');
+    if (epoch !== state.venueEpoch) return;
     if (res.logs && res.logs.length) {
       res.logs.forEach(l => {
         state.logSeq = Math.max(state.logSeq, l.seq);
@@ -950,31 +960,49 @@ function renderAll(payload) {
   renderPlan(payload);
 }
 
+async function pollState() {
+  const epoch = state.venueEpoch;
+  try {
+    const payload = await vapi('/state');
+    if (epoch === state.venueEpoch) renderAll(payload);
+  } catch (e) { /* keep last known */ }
+}
+
+function disconnectWS() {
+  clearTimeout(state.reconnectTimer);
+  state.reconnectTimer = null;
+  const old = state.ws;
+  state.ws = null;
+  if (old) {
+    // A deliberate close must not reconnect a superseded socket.
+    old.onopen = old.onmessage = old.onclose = old.onerror = null;
+    old.close();
+  }
+}
+
 function connectWS() {
+  disconnectWS();
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const venue = state.venue;
+  const epoch = state.venueEpoch;
   const q = state.token ? `?token=${encodeURIComponent(state.token)}` : '';
   const ws = new WebSocket(`${proto}://${location.host}/ws/${venue}${q}`);
   state.ws = ws;
-  let alive = false;
-  ws.onopen = () => { alive = true; };
   ws.onmessage = ev => {
+    if (state.ws !== ws || epoch !== state.venueEpoch) return;
     try { renderAll(JSON.parse(ev.data)); } catch (e) { console.warn(e); }
   };
   ws.onclose = () => {
-    alive = false;
-    setTimeout(async () => {
-      // fall back to polling while the socket is down
-      try { renderAll(await vapi('/state')); } catch (e) {}
-      connectWS();
+    if (state.ws !== ws || epoch !== state.venueEpoch) return;
+    state.ws = null;
+    state.reconnectTimer = setTimeout(async () => {
+      state.reconnectTimer = null;
+      if (epoch !== state.venueEpoch) return;
+      await pollState();
+      if (epoch === state.venueEpoch && !state.ws) connectWS();
     }, 2000);
   };
   ws.onerror = () => ws.close();
-  setInterval(async () => {
-    if (!alive) {
-      try { renderAll(await vapi('/state')); } catch (e) {}
-    }
-  }, 5000);
 }
 
 /* ------------------------------ wiring ------------------------------ */
@@ -1136,6 +1164,6 @@ window.addEventListener('resize', () => { if (state.lastState) renderAll(state.l
   setInterval(pollLogs, 3000);
   setInterval(pollVenues, 5000);
   setInterval(pollExtras, 5000);
-  try { renderAll(await vapi('/state')); } catch (e) {}
+  await pollState();
   pollExtras();
 })();

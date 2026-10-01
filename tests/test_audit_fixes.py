@@ -134,7 +134,7 @@ class GuardDecisionTest(unittest.TestCase):
         guard = RiskGuard(cfg, db)
         decision = asyncio.run(guard.can_open(
             symbol="SOL_USDT", equity=1000.0, open_positions=0, margin_used=790.0,
-            available=210.0, sizing_notional=300.0,
+            available=210.0, sizing_margin=30.0,
         ))
         self.assertFalse(decision.allowed)
         self.assertIn("margin utilisation", decision.reason)
@@ -330,8 +330,10 @@ class ExecutorFillPlumbingTest(unittest.TestCase):
             ex.notify_order_push({"client_id": "ao-1", "status": ORDER_OPEN, "filled_qty": 0})
             self.assertFalse(fut.done())                       # resting order: ignored
             ex.notify_order_push({"client_id": "ao-1", "status": ORDER_PARTIAL, "filled_qty": 2})
+            self.assertFalse(fut.done())  # active partials can still grow
+            ex.notify_order_push({"client_id": "ao-1", "status": ORDER_FILLED, "filled_qty": 4})
             self.assertTrue(fut.done())
-            self.assertEqual(fut.result()["filled_qty"], 2)
+            self.assertEqual(fut.result()["filled_qty"], 4)
 
         asyncio.run(scenario())
         db.close()

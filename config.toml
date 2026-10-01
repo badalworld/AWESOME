@@ -5,11 +5,9 @@
 # =============================================================================
 
 [app]
-name = "AWESOME-AO-BOT"
 mode = "paper"              # "paper" (simulated fills, real market data) | "live" (real orders)
 data_dir = "data"
 log_level = "INFO"
-timezone = "UTC"
 
 # -----------------------------------------------------------------------------
 #  VENUES — three independent exchanges, one strategy.
@@ -52,7 +50,8 @@ taker_fee = 0.0006
 maker_fee = 0.0002
 
 [exchange]
-name = "mexc"                # legacy single-venue keys: used as the global fallback
+# Set leverage before entry (cached per symbol/side).
+set_leverage_on_entry = true
 rest_base = "https://api.mexc.com"
 ws_url = "wss://contract.mexc.com/edge"
 recv_window_ms = 5000        # MEXC allows up to 60000; 5000 is plenty for low latency
@@ -69,7 +68,6 @@ paper_data_source = "auto"   # auto | live | synthetic  (paper mode market data)
 # placed. The only orders that ever rest on the exchange are the protective
 # trigger orders described under [stoploss]/[trailing].
 time_sync_interval_s = 300   # re-sync clock offset vs exchange server
-latency_telemetry = true
 
 [account]
 # Starting balance. The dashboard's "Reset paper account" button uses this too.
@@ -78,18 +76,15 @@ latency_telemetry = true
 # whose smallest possible order is bigger than that are filtered out of the
 # universe automatically (universe.only_affordable_orders).
 paper_starting_equity = 20.0
-quote_asset = "USDT"
-# Per-symbol leverage is set on the exchange before the first entry of that symbol.
-set_leverage_on_entry = true
 
 # -----------------------------------------------------------------------------
 #  RISK / SIZING  (user-requested: 8% of equity per trade, 10x leverage, max 10)
 # -----------------------------------------------------------------------------
 [risk]
+# One managed position per symbol; sizing always compounds from running equity.
 equity_per_trade_pct = 8.0      # margin per trade = current equity * 8%
 leverage = 10                   # 10x -> ROI = price_move% * leverage
 max_open_positions = 10         # maximum concurrent positions
-max_positions_per_symbol = 1
 max_total_margin_pct = 80.0     # never have more than 80% of equity as margin
 max_daily_loss_pct = 25.0       # halt new entries after -25% day
 max_drawdown_halt_pct = 40.0    # kill-switch: halt bot at -40% from equity peak
@@ -97,16 +92,15 @@ cooldown_after_loss_min = 30    # minutes to avoid a symbol after a losing trade
 cooldown_after_win_min = 0
 min_notional_usd = 5.0          # exchange minimum order notional guard
 max_margin_usd = 0.0            # hard cap on margin per trade (0 = no cap)
-risk_recalc_interval_s = 5      # mark-to-market cadence for sizing/risk gates
 
 # -----------------------------------------------------------------------------
 #  STOP LOSS  (user-requested: ATR x 3)
 # -----------------------------------------------------------------------------
 [stoploss]
+# Exchange triggers always use mark price; this is not a runtime toggle.
 mode = "auto"                   # auto | attached | separate  (exchange-side protection)
 atr_multiplier = 3.0
 atr_period = 14
-use_mark_price_trigger = true   # trigger on fair/mark price (liquidation-safe, wick-proof)
 local_watchdog = true           # bot-side immediate market close if price breaches SL
 watchdog_grace_bps = 3          # tolerance before watchdog fires (bps through the stop)
 min_sl_roi_pct = 5.0            # never place an SL tighter than this ROI%
@@ -139,6 +133,7 @@ partial_tp_fraction = 0.5       # fraction of the *position* closed there
 #   stop = floor((peak - START)/STEP)*STEP + INITIAL_STOP
 # -----------------------------------------------------------------------------
 [trailing]
+# Mark-price peaks and SQLite persistence are always enabled.
 enabled = true
 trail_start_roi = 30.0          # TRAIL_START_ROI
 trail_initial_stop_roi = 20.0   # TRAIL_INITIAL_STOP_ROI
@@ -146,9 +141,6 @@ trail_step_roi = 10.0           # TRAIL_STEP_ROI
 trail_stop_step_roi = 10.0      # TRAIL_STOP_STEP_ROI
 ratchet_only = true             # stop only ever moves in the profit direction
 step_only_updates = true        # avoid excessive order modifications
-use_mark_price_for_peak = true  # track peak ROI with mark price / tick high-low
-persist_state = true            # survive restarts (SQLite)
-replace_stop_on_step = false    # false -> modify existing plan order (fewer API calls)
 min_move_bps = 2                # ignore stop moves smaller than this (tick noise)
 
 # -----------------------------------------------------------------------------
@@ -258,7 +250,6 @@ whitelist = []                  # if set (non-empty) -> only these are considere
 # (no starting_equity key -> the bot uses the account/paper equity at start)
 equity_target = 10000.0
 days = 7
-compounding = true              # size every trade from *current* equity
 monte_carlo_runs = 20000
 
 # -----------------------------------------------------------------------------

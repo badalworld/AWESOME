@@ -561,13 +561,13 @@ class TestRiskGuard(unittest.IsolatedAsyncioTestCase):
 
     async def test_gates(self):
         ok = await self.guard.can_open(symbol="X_USDT", equity=1000, open_positions=0, margin_used=0,
-                                      available=900, sizing_notional=800)
+                                      available=900, sizing_margin=80.0)
         self.assertTrue(ok.allowed)
         full = await self.guard.can_open(symbol="X_USDT", equity=1000, open_positions=10, margin_used=0,
-                                        available=900, sizing_notional=800)
+                                        available=900, sizing_margin=80.0)
         self.assertFalse(full.allowed)
         dup = await self.guard.can_open(symbol="X_USDT", equity=1000, open_positions=1, margin_used=0,
-                                       available=900, sizing_notional=800, symbol_open=True)
+                                       available=900, sizing_margin=80.0, symbol_open=True)
         self.assertFalse(dup.allowed)
 
     async def test_drawdown_halt(self):
@@ -578,7 +578,7 @@ class TestRiskGuard(unittest.IsolatedAsyncioTestCase):
     async def test_cooldown_after_loss(self):
         await self.guard.register_close("X_USDT", -5.0)
         d = await self.guard.can_open(symbol="X_USDT", equity=1000, open_positions=0, margin_used=0,
-                                     available=900, sizing_notional=800)
+                                     available=900, sizing_margin=80.0)
         self.assertFalse(d.allowed)
         self.assertIn("cooldown", d.reason)
 

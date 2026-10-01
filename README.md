@@ -361,6 +361,14 @@ router. Any key can be overridden per venue with `[venues.<id>]` blocks in `conf
 
 ## Going live safely
 
+**Current status:** keep paper mode pending the unresolved order-lifecycle fixes
+in the [code-hygiene audit](docs/CODE_HYGIENE_AUDIT_2026-10-02.md). The cleanup pass
+passes 224 Python and 8 JavaScript tests; this is not live-exchange certification. Uncertain entries now
+leave a persisted incident that blocks further entries and risk resume; this is
+a safety barrier, not automatic reconciliation. If an older dashboard
+was publicly reachable, rotate its dashboard API token (a settings-response
+exposure was fixed in this pass).
+
 1. Run paper mode for at least a few days and read the **Signals** tab: are the filters rejecting
    things you would also reject? Tune until the accepted signals look right to you.
 2. Check the **Compounding plan** tab: what does the Monte-Carlo say about *your* parameters?
@@ -403,7 +411,8 @@ from being overwritten; add `--force` if you really want to regenerate it in pla
 ## Testing
 
 ```bash
-python3 tests/run_all.py            # 151 tests, ~22 s, no network needed
+python3 tests/run_all.py            # 224 tests, ~23 s, no network needed
+node --test tests/test_dashboard.js # 8 offline dashboard lifecycle tests
 python3 -m unittest tests.test_core         # maths, indicators, strategy, filters, analytics
 python3 -m unittest tests.test_integration  # trade lifecycle on a deterministic market
 python3 -m unittest tests.test_engine       # the orchestrator on the offline synthetic feed

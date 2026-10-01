@@ -105,7 +105,7 @@ async def main_async(args: argparse.Namespace) -> None:
         await server.serve()
     finally:
         watcher.cancel()
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(asyncio.CancelledError):
             await watcher
         await manager.stop_all()
         manager.close()

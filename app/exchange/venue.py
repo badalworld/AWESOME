@@ -186,7 +186,7 @@ def normalize_order_status(*, filled_qty: float, total_qty: float = 0.0,
     state = (raw_status or "").strip().upper()
     if state in ("FILLED", "FULLY_FILLED", "DEAL", "SETTLED", "COMPLETED", "DONE", "SUCCESS"):
         return ORDER_FILLED
-    if state in ("CANCELED", "CANCELLED", "PARTIALLY_FILLED_CANCELED", "EXPIRED"):
+    if canceled or state in ("CANCELED", "CANCELLED", "PARTIALLY_FILLED_CANCELED", "EXPIRED"):
         return ORDER_CANCELED
     if state in ("REJECTED", "FAILED", "ERROR"):
         return ORDER_REJECTED
@@ -194,14 +194,12 @@ def normalize_order_status(*, filled_qty: float, total_qty: float = 0.0,
         # MEXC reports state 1/2 as OPEN/PARTIAL, Binance as NEW/PARTIALLY_FILLED;
         # both are resting orders whose fill is tracked by filled_qty below.
         if total_qty and filled_qty:
-            return ORDER_FILLED if filled_qty >= total_qty * 0.999 else ORDER_PARTIAL
+            return ORDER_FILLED if filled_qty >= total_qty else ORDER_PARTIAL
         return ORDER_OPEN
     if total_qty and filled_qty:
-        if filled_qty >= total_qty * 0.999:
+        if filled_qty >= total_qty:
             return ORDER_FILLED
         return ORDER_PARTIAL
-    if canceled:
-        return ORDER_CANCELED
     if is_active is False and filled_qty:
         return ORDER_FILLED
     if is_active is True:

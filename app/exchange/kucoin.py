@@ -534,7 +534,7 @@ class KuCoinClient(BaseHTTPVenueClient):
             "closeOrder": False,
             "stop": "down" if is_long else "up",
             "stopPrice": str(self._round_price(symbol, trigger_price)),
-            "stopPriceType": "MP",          # mark price trigger (matches stoploss.use_mark_price_trigger)
+            "stopPriceType": "MP",          # mark price trigger
             "marginMode": "ISOLATED",
             "positionSide": "BOTH",
         }

@@ -67,8 +67,20 @@ def size_position(
     to a one-lot minimum can otherwise silently multiply the intended risk (a
     $20 account must not accidentally take a $100 position).
     """
-    if equity <= 0 or price <= 0:
-        return Sizing(ok=False, reason="no equity/price")
+    inputs = (equity, price, equity_pct, leverage, min_notional_usd, max_margin_overshoot)
+    if (not all(math.isfinite(v) for v in inputs)
+            or (available is not None and not math.isfinite(available))
+            or (max_margin_usd is not None and not math.isfinite(max_margin_usd))):
+        return Sizing(ok=False, reason="non-finite sizing input")
+    if equity <= 0 or price <= 0 or equity_pct <= 0 or leverage < 1:
+        return Sizing(ok=False, reason="invalid equity/price/risk/leverage")
+    if available is not None and available <= 0:
+        return Sizing(ok=False, reason="no available balance")
+    if spec and (not all(math.isfinite(v) for v in (
+            spec.contract_size, spec.vol_unit, spec.min_vol, spec.max_vol, spec.min_notional))
+            or spec.contract_size <= 0 or spec.vol_unit <= 0
+            or spec.min_vol < 0 or spec.max_vol < 0 or spec.min_notional < 0):
+        return Sizing(ok=False, reason="invalid contract specification")
     margin = equity * equity_pct / 100.0
     if available is not None and available > 0:
         margin = min(margin, available * 0.95)     # keep a buffer for fees
@@ -337,6 +349,9 @@ class RiskGuard:
 
     # -- equity tracking ------------------------------------------------- #
     async def update_equity(self, equity: float) -> None:
+        if not math.isfinite(equity):
+            await self.halt("non-finite account equity")
+            return
         today = time.strftime("%Y-%m-%d", time.gmtime())
         changed = False
         if today != self.day:
@@ -406,9 +421,15 @@ class RiskGuard:
     # -- entry gate ------------------------------------------------------ #
     async def can_open(
         self, *, symbol: str, equity: float, open_positions: int,
-        margin_used: float, available: float, sizing_notional: float,
+        margin_used: float, available: float, sizing_margin: float,
         symbol_open: bool = False,
     ) -> GuardDecision:
+        if not all(math.isfinite(v) for v in (equity, margin_used, available, sizing_margin)):
+            return GuardDecision(False, "non-finite risk snapshot")
+        if equity <= 0 or margin_used < 0 or sizing_margin <= 0:
+            return GuardDecision(False, "invalid equity/margin")
+        if sizing_margin > available:
+            return GuardDecision(False, "insufficient available balance")
         if self.halted:
             return GuardDecision(False, f"trading halted: {self.halt_reason}")
         max_open = int(self.cfg.get("risk.max_open_positions", 10))
@@ -421,7 +442,7 @@ class RiskGuard:
             return GuardDecision(False, f"cooldown active for {symbol} ({cooldown/60:.1f} min left)")
         max_margin_pct = float(self.cfg.get("risk.max_total_margin_pct", 80.0))
         if equity > 0:
-            projected = (margin_used + sizing_notional / max(1, int(self.cfg.get("risk.leverage", 10)))) / equity * 100.0
+            projected = (margin_used + sizing_margin) / equity * 100.0
             if projected > max_margin_pct:
                 return GuardDecision(
                     False,

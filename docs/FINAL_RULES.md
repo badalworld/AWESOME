@@ -1,8 +1,9 @@
 # Final TP / trail / SL rules — stated against reality
 
-**Status: frozen for live trading.** Values below are what the code in this repo
-actually does, and what `tools/rule_sim.py` measures them to do on a martingale
-(drift-free) price walk. Nothing here is aspirational.
+**Status: rule defaults retained; live readiness NOT certified.** See the
+[code-hygiene audit](CODE_HYGIENE_AUDIT_2026-10-02.md) for unresolved order-lifecycle
+blockers. Simulator figures below describe synthetic paths, not measured live
+strategy performance.
 
 Read this together with [`EDGE_AND_EXPECTANCY.md`](EDGE_AND_EXPECTANCY.md)
 (win-probability model) and [`AUDIT_2026-10.md`](AUDIT_2026-10.md) (pre-live
@@ -19,7 +20,7 @@ audit: market-only execution, 151 tests).
 | Trailing initial stop | **+20 % ROI** | `TRAIL_INITIAL_STOP_ROI = 20` → `trailing.trail_initial_stop_roi` | idem |
 | Ratchet step | every **+10 %** of peak ROI, stop moves **+10 %**; monotonic, never loosened | `TRAIL_STEP_ROI = 10`, `TRAIL_STOP_STEP_ROI = 10` | idem — `stop_ROI = 20 + floor((peak_ROI − 30)/10)·10`, peak tracked on mark price, state persisted in the per-venue DB |
 | Stop-loss | **3 × ATR** of the 5-minute chart, placed as the venue's trigger-**at-market** reduce-only stop | `ATR_MULTIPLIER = 3.0` → `stoploss.atr_multiplier` | entry order carries `stopLossPrice` (MEXC `priceProtect:1`) / plan stop / `STOP_MARKET` |
-| Sizing | **8 % of *running* equity** per trade, **10×** leverage, **max 10** concurrent, total margin ≤ **80 %** of current equity | `risk.equity_per_trade_pct`, `risk.leverage`, `risk.max_open_positions`, `risk.max_total_margin_pct` | `app/risk/manager.py:size_position` (line 50), `can_open` (line 407) |
+| Sizing | **8 % of *running* equity** per trade, **10×** leverage, **max 10** concurrent, total margin ≤ **80 %** of current equity | `risk.equity_per_trade_pct`, `risk.leverage`, `risk.max_open_positions`, `risk.max_total_margin_pct` | `app/risk/manager.py:size_position`, `RiskGuard.can_open` |
 
 At the calibration used everywhere in the docs (ATR = 1.2 % of price on the 5 m
 chart) the stop is 3.6 % of price = **36 % ROI on margin**, i.e. a **−2.88 % of
@@ -98,9 +99,8 @@ they are the reason the recommendation is "widen the trail", not "the TP is wron
   measured alternative is inside the noise band, and 30/20 is the one covered by
   the 151-test suite. **Do not re-tune these numbers on the simulator** — it
   cannot resolve differences below ~1 % ROI. Only realised trades can.
-* The 3 × ATR stop is the only rule that is load-bearing for survival: it caps
-  the per-trade loss at ≈ 3.6 % of equity, which is what keeps a 10-position
-  book from becoming a coin flip.
+* The 3 × ATR stop is the only rule that is load-bearing for survival: its nominal loss at the 1.2%-ATR calibration is ≈ 2.88% of equity before costs.
+  A trigger-market stop does not guarantee that loss cap.
 
 ## 4. If you want the geometry with the lowest bar (optional, one line)
 
@@ -127,8 +127,9 @@ list from `tools/edge_report.py` adjudicate after ≥ 30 closed trades.
 * **Concurrency dominates the tail.** 10 positions × 8 % margin at 10× = 80 % of
   equity deployed as margin, i.e. **8× equity of notional**. A correlated
   alt-coin flush of −8 % against the book is ≈ **−64 % of equity** before the
-  kill-switches can react. The 40 % drawdown halt and 25 % daily-loss halt are
-  what stand between that and a terminal day. Keep them on.
+  protective exits fill. The 40 % drawdown halt and 25 % daily-loss halt block
+  further entries; they do not guarantee an existing book is liquidated at those
+  thresholds. Keep them on, but do not treat them as portfolio-loss caps.
 * **The stop is trigger-at-market, not a guaranteed price.** It is the only
   resting order the bot is allowed to leave (market-only policy). A gap through
   the trigger fills at the next available market price — the −36 % ROI figure is
@@ -140,40 +141,31 @@ list from `tools/edge_report.py` adjudicate after ≥ 30 closed trades.
 
 ## 6. Compounding is verified (8 % of *running* equity, 10 trades, 10×)
 
-The sizing path is live-equity driven end to end:
+The sizing path reads the broker's current account under the per-venue entry lock:
 
 ```
-app/engine.py:587   →  executor.open_from_signal(signal, equity=account.equity,
-                                                  available=…, margin_used=…, open_positions=…)
-app/trade/executor.py:186   (line 206) size_position(equity, …,
-                            equity_pct = risk.equity_per_trade_pct (8 %),
-                            leverage   = min(10, spec.max_leverage), available=…)
-app/risk/manager.py:50      margin = equity × 8 %,  notional = margin × leverage
-app/risk/manager.py:407     can_open(): ≤ 10 concurrent, one position per symbol,
-                            per-symbol cooldown, and margin_used + notional/leverage
-                            ≤ 80 % of the *current* equity
+TradingEngine._try_open(signal)
+  → Executor.open_from_signal(signal)
+    → under entry lock: broker.account(), broker.positions()
+    → combine exchange exposure with locally managed exposure
+    → RiskGuard.update_equity(current equity)
+    → size_position(current equity, current available funds, contract leverage)
+    → RiskGuard.can_open(actual sizing_margin, exposure count, used margin)
 ```
 
-* `account.equity` is refreshed every `persistence.equity_snapshot_sec` (30 s, and
-  again at every fill) by the engine's equity loop (`app/engine.py:_equity_loop`),
-  so the 8 % is taken from the **running** equity — profits from closed trades
-  increase the next position's size and losses shrink it. Compounding confirmed
-  positive: there is no code path that sizes off the starting balance.
-* The margin for all concurrent trades is drawn from that same running equity:
-  `can_open()` projects `margin_used + notional/leverage` against
-  `max_total_margin_pct = 80 %` of the *current* equity, so the 10th position is
-  sized against what the first nine left available.
-* Fees are paid out of the same running equity (per-venue taker fees on entry and
-  exit), so the compounding maths in `analytics/compound.py` already includes
-  them.
+The equity loop still supplies dashboard snapshots, but those cached values are
+no longer the entry sizing source. Profits increase the next size; losses shrink
+it. Contract rounding, exchange minimums, available funds and existing sizing
+overshoot rules can change actual margin from the nominal 8%. The gate projects
+current used margin plus the actual proposed margin against the 80% cap and
+counts unmanaged exchange positions too. Fees and unrealized P&L affect the
+broker-reported running equity. Concurrent entries are serialized per venue;
+independent venues do not share balances or margin headroom.
 
 ## 7. Verdict
 
-**Go for live trading, with this caveat in writing:** the execution layer is
-audited and market-only, the stop/TP/trail paths are tested (151 tests,
-`tools/rule_sim.py` re-uses the same rule code), and compounding is verified on
-running equity. But the *edge* is not in these numbers — at zero drift every
-geometry measures ≈ 0 % per trade, and the shipped one needs a **> 54 % win
-rate** to break even. Expect the strategy's outcome to be decided by how well
-the AO-divergence signal actually predicts the next 4 hours, not by the TP or
-trail settings on this page.
+**Keep paper mode pending the order-lifecycle fixes in the
+[latest audit](CODE_HYGIENE_AUDIT_2026-10-02.md).** This supersedes the earlier
+unconditional go-live recommendation. Tests validate specified code behavior, not
+real-exchange acceptance or profitability. No measured live win rate is available;
+the Monte Carlo figures in this document cannot establish an AO-divergence edge.

@@ -11,6 +11,7 @@ Design goals
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import threading
@@ -47,7 +48,6 @@ VALIDATORS: Dict[str, Any] = {
     "risk.equity_per_trade_pct": _num(0.5, 100),
     "risk.leverage": _num(1, 200),
     "risk.max_open_positions": _num(1, 50),
-    "risk.max_positions_per_symbol": _num(1, 5),
     "risk.max_total_margin_pct": _num(5, 100),
     "risk.max_daily_loss_pct": _num(1, 100),
     "risk.max_drawdown_halt_pct": _num(1, 100),
@@ -55,12 +55,10 @@ VALIDATORS: Dict[str, Any] = {
     "risk.cooldown_after_win_min": _num(0, 1440),
     "risk.min_notional_usd": _num(0.1, 1_000_000),
     "risk.max_margin_usd": _num(0, 100_000_000),
-    "risk.risk_recalc_interval_s": _num(1, 300),
     # stoploss
     "stoploss.mode": ("enum", ["auto", "attached", "separate"]),
     "stoploss.atr_multiplier": _num(0.2, 20),
     "stoploss.atr_period": _num(2, 100),
-    "stoploss.use_mark_price_trigger": ("bool",),
     "stoploss.local_watchdog": ("bool",),
     "stoploss.watchdog_grace_bps": _num(0, 100),
     "stoploss.min_sl_roi_pct": _num(0.5, 1000),
@@ -82,9 +80,6 @@ VALIDATORS: Dict[str, Any] = {
     "trailing.trail_stop_step_roi": _num(0.1, 10000),
     "trailing.ratchet_only": ("bool",),
     "trailing.step_only_updates": ("bool",),
-    "trailing.use_mark_price_for_peak": ("bool",),
-    "trailing.persist_state": ("bool",),
-    "trailing.replace_stop_on_step": ("bool",),
     "trailing.min_move_bps": _num(0, 200),
     # strategy
     "strategy.timeframe": ("enum", ["Min1", "Min5", "Min15", "Min30", "Min60"]),
@@ -122,7 +117,6 @@ VALIDATORS: Dict[str, Any] = {
     # target
     "target.equity_target": _num(10, 1_000_000_000),
     "target.days": _num(1, 365),
-    "target.compounding": ("bool",),
     "target.monte_carlo_runs": _num(1000, 200000),
     # web
     "web.port": _num(1, 65535),
@@ -232,8 +226,14 @@ def _coerce(key: str, value: Any, spec: Any) -> Any:
         if isinstance(value, bool):
             return value
         if isinstance(value, str):
-            return value.strip().lower() in ("1", "true", "yes", "on")
-        return bool(value)
+            normalized = value.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
+                return True
+            if normalized in ("0", "false", "no", "off"):
+                return False
+        elif isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        raise ValueError(f"{key}: expected a boolean")
     if kind == "number":
         try:
             num = float(value)
@@ -242,7 +242,11 @@ def _coerce(key: str, value: Any, spec: Any) -> Any:
         lo, hi = spec[1], spec[2]
         if not (lo <= num <= hi):
             raise ValueError(f"{key}: {num} out of range [{lo}, {hi}]")
-        return int(num) if num.is_integer() and isinstance(spec, tuple) and _is_int_like(key) else num
+        if _is_int_like(key):
+            if not num.is_integer():
+                raise ValueError(f"{key}: expected a whole number")
+            return int(num)
+        return num
     if kind == "enum":
         for allowed in spec[1]:
             if value == allowed or str(value).lower() == str(allowed).lower():
@@ -260,14 +264,13 @@ def _coerce(key: str, value: Any, spec: Any) -> Any:
 
 
 _INT_KEYS = {
-    "risk.max_open_positions", "risk.max_positions_per_symbol", "risk.leverage",
+    "risk.max_open_positions", "risk.leverage",
     "exchange.recv_window_ms", "stoploss.atr_period", "strategy.ao_fast",
     "strategy.ao_slow", "strategy.pivot_k", "strategy.lookback_bars",
     "strategy.min_pivot_gap", "strategy.max_pivot_gap", "strategy.trigger_lookback",
     "strategy.signal_cooldown_bars", "strategy.max_signals_per_cycle",
     "strategy.signal_expiry_bars", "universe.max_symbols", "universe.refresh_sec",
     "target.monte_carlo_runs", "web.port", "persistence.equity_snapshot_sec",
-    "risk.risk_recalc_interval_s",
 }
 
 
@@ -352,25 +355,31 @@ class Config:
 
     def set(self, dotted: str, value: Any) -> Any:
         """Validate + persist a single override. Returns the coerced value."""
-        coerced = _coerce_and_validate(dotted, value)
-        with self._lock:
-            # semantic cross-checks
-            if dotted == "strategy.ao_fast" and coerced >= self.get("strategy.ao_slow", 34):
-                raise ValueError("strategy.ao_fast must be < strategy.ao_slow")
-            if dotted == "strategy.ao_slow" and coerced <= self.get("strategy.ao_fast", 5):
-                raise ValueError("strategy.ao_slow must be > strategy.ao_fast")
-            if dotted == "universe.min_atr_pct" and coerced > self.get("universe.max_atr_pct", 6.0):
-                raise ValueError("universe.min_atr_pct must be <= universe.max_atr_pct")
-            if dotted.startswith("filters.volatility.min_atr_pct") and coerced > self.get("filters.volatility.max_atr_pct", 4.0):
-                raise ValueError("min_atr_pct must be <= max_atr_pct")
-            node = self._overrides
-            parts = dotted.split(".")
-            for part in parts[:-1]:
-                node = node.setdefault(part, {})
-            node[parts[-1]] = coerced
-            self._data = _deep_merge(self._base, self._overrides)
-        self.save_overrides()
-        return coerced
+        return self.set_many({dotted: value})[dotted]
+
+    @staticmethod
+    def _validate_relations(data: Dict[str, Any]) -> None:
+        """Validate the proposed *whole* book, including venue overrides."""
+        def get(node, dotted, default):
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
+
+        checks = (
+            ("strategy.ao_fast", 5, "strategy.ao_slow", 34, True),
+            ("universe.min_atr_pct", 0, "universe.max_atr_pct", 6, False),
+            ("filters.volatility.min_atr_pct", 0, "filters.volatility.max_atr_pct", 4, False),
+        )
+        books = [("global", data)] + [
+            (vid, _deep_merge(data, data.get("venues", {}).get(vid, {}))) for vid in VENUES
+        ]
+        for label, book in books:
+            for lo, lo_default, hi, hi_default, strict in checks:
+                left, right = get(book, lo, lo_default), get(book, hi, hi_default)
+                if left > right or (strict and left == right):
+                    raise ValueError(f"{label}: {lo} must be {'<' if strict else '<='} {hi}")
 
     def set_many(self, patch: Dict[str, Any]) -> Dict[str, Any]:
         """Atomically apply many dotted keys; all-or-nothing."""
@@ -378,24 +387,36 @@ class Config:
         for k, v in patch.items():
             coerced[k] = _coerce_and_validate(k, v)   # raises before anything is written
         with self._lock:
+            proposed = copy.deepcopy(self._overrides)
             for k, v in coerced.items():
                 parts = k.split(".")
-                node = self._overrides
+                node = proposed
                 for part in parts[:-1]:
                     node = node.setdefault(part, {})
                 node[parts[-1]] = v
-            self._data = _deep_merge(self._base, self._overrides)
-        self.save_overrides()
+            data = _deep_merge(self._base, proposed)
+            self._validate_relations(data)
+            self._apply_overrides(proposed, data)
+
         return coerced
+
+    def _apply_overrides(self, overrides: Dict[str, Any], data: Dict[str, Any]) -> None:
+        """Publish and persist under the caller's lock, restoring on write failure."""
+        old_overrides, old_data = self._overrides, self._data
+        self._overrides, self._data = overrides, data
+        try:
+            self.save_overrides()
+        except OSError:
+            self._overrides, self._data = old_overrides, old_data
+            raise
 
     def reset(self, keys: Optional[Iterable[str]] = None) -> None:
         with self._lock:
-            if keys is None:
-                self._overrides = {}
-            else:
+            proposed = {} if keys is None else copy.deepcopy(self._overrides)
+            if keys is not None:
                 for k in keys:
                     parts = k.split(".")
-                    node: Any = self._overrides
+                    node: Any = proposed
                     stack = []
                     ok = True
                     for part in parts[:-1]:
@@ -410,8 +431,9 @@ class Config:
                         for parent, part in reversed(stack):
                             if isinstance(parent.get(part), dict) and not parent[part]:
                                 parent.pop(part, None)
-            self._data = _deep_merge(self._base, self._overrides)
-        self.save_overrides()
+            data = _deep_merge(self._base, proposed)
+            self._validate_relations(data)
+            self._apply_overrides(proposed, data)
 
     # -- convenience ------------------------------------------------------- #
     @property
@@ -424,9 +446,12 @@ class Config:
 
     def public_dict(self) -> Dict[str, Any]:
         """Config view for the dashboard (secrets stripped)."""
-        data = self.as_dict()
-        data.setdefault("web", {})["api_token"] = "***" if self.get("web.api_token") else ""
-        return data
+        def redact(node):
+            if not isinstance(node, dict):
+                return node
+            return {key: ("***" if value else "") if key == "api_token" else redact(value)
+                    for key, value in node.items()}
+        return redact(self.as_dict())
 
 
 class VenueConfig:
@@ -502,10 +527,6 @@ class VenueConfig:
     @property
     def mode(self) -> str:
         return str(self.get("app.mode", "paper"))
-
-    def venue_dict(self) -> Dict[str, Any]:
-        data = self._cfg.get(f"venues.{self.venue_id}", {})
-        return dict(data) if isinstance(data, dict) else {}
 
 
 def load(path: Optional[Path] = None) -> Config:

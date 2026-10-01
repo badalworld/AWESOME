@@ -26,8 +26,9 @@ class Clock:
         self._rtt_ms = 0.0
 
     def update(self, server_ms: float, rtt_ms: float) -> None:
-        # Assume symmetric latency: server time corresponds to the midpoint.
-        self._offset_ms = server_ms - (time.time() * 1000.0 + rtt_ms / 2.0)
+        # Called at response receipt: the request midpoint is RTT/2 *before*
+        # now, not after it. Assume symmetric network latency.
+        self._offset_ms = server_ms - (time.time() * 1000.0 - rtt_ms / 2.0)
         self._rtt_ms = rtt_ms
         self._synced_at = time.time()
 
@@ -51,12 +52,6 @@ class Clock:
 # --------------------------------------------------------------------------- #
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
-
-
-def round_to_step(value: float, step: float) -> float:
-    if step <= 0:
-        return value
-    return round(round(value / step, 9)) * step
 
 
 def safe_div(a: float, b: float, default: float = 0.0) -> float:

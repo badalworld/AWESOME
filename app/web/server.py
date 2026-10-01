@@ -15,13 +15,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import secrets
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..config import VALIDATORS, Config
@@ -37,7 +39,7 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
     # The dashboard is same-origin, so CORS is off by default. A wildcard with
     # credentials is both invalid per spec and a needless attack surface for a
     # control panel that can place orders; list explicit origins to enable it.
-    _origins = [str(o) for o in (cfg.get("web.allow_origins", "") or "").split(",") if str(o).strip()]
+    _origins = [o.strip() for o in (cfg.get("web.allow_origins", "") or "").split(",") if o.strip()]
     if _origins and "*" not in _origins:
         app.add_middleware(
             CORSMiddleware,
@@ -61,15 +63,27 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
         if not token:
             return
         provided = request.headers.get("X-API-Token") or request.query_params.get("token")
-        if provided != token:
+        if not secrets.compare_digest((provided or "").encode(), token.encode()):
             raise HTTPException(status_code=401, detail="invalid or missing API token")
+
+    @app.middleware("http")
+    async def protect_api(request: Request, call_next):
+        # Account data, logs, settings and CSV are as sensitive as controls.
+        # Keep health public so the dashboard can discover auth requirements.
+        if request.url.path.startswith("/api/") and request.url.path != "/api/health" and request.method != "OPTIONS":
+            try:
+                _check_auth(request)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return await call_next(request)
 
     def _settings_payload(ctx: VenueContext) -> Dict[str, Any]:
         """Global config + this venue's effective (scoped) values."""
         effective: Dict[str, Any] = {}
         for key in VALIDATORS:
-            effective[key] = ctx.cfg.get(key)
-        venue_block = dict(cfg.get(f"venues.{ctx.id}", {}) or {})
+            value = ctx.cfg.get(key)
+            effective[key] = ("***" if value else "") if key.endswith("api_token") else value
+        venue_block = dict(cfg.public_dict().get("venues", {}).get(ctx.id, {}) or {})
         return {
             "venue": {
                 "id": ctx.id, "label": ctx.spec.label, "docs": ctx.spec.docs,
@@ -126,10 +140,10 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
         engine = _ctx(venue or request.query_params.get("venue")).engine
         return {"positions": engine.executor.live_positions(engine.marks) if engine.executor else []}
 
-    async def trades(request: Request, venue: Optional[str] = None, limit: int = 200, offset: int = 0,
+    async def trades(request: Request, venue: Optional[str] = None, limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0),
                      status: Optional[str] = None, symbol: Optional[str] = None) -> Dict[str, Any]:
         db = _ctx(venue or request.query_params.get("venue")).db
-        rows = await db.get_trades(limit=min(limit, 1000), offset=offset, status=status, symbol=symbol)
+        rows = await db.get_trades(limit=limit, offset=offset, status=status, symbol=symbol)
         return {"trades": rows, "count": len(rows), "total": await db.count_trades()}
 
     async def trades_csv(request: Request, venue: Optional[str] = None) -> PlainTextResponse:
@@ -146,10 +160,10 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
             headers={"Content-Disposition": f"attachment; filename={ctx.id}-trades.csv"},
         )
 
-    async def signals(request: Request, venue: Optional[str] = None, limit: int = 100,
+    async def signals(request: Request, venue: Optional[str] = None, limit: int = Query(100, ge=1, le=500),
                       status: Optional[str] = None) -> Dict[str, Any]:
         db = _ctx(venue or request.query_params.get("venue")).db
-        rows = await db.get_signals(limit=min(limit, 500), status=status)
+        rows = await db.get_signals(limit=limit, status=status)
         for row in rows:
             for field in ("filters", "features"):
                 if isinstance(row.get(field), str):
@@ -165,7 +179,7 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
     async def compound(request: Request, venue: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
         return await _ctx(venue or request.query_params.get("venue")).engine.compound_report(force=force)
 
-    async def equity(request: Request, venue: Optional[str] = None, limit: int = 600) -> Dict[str, Any]:
+    async def equity(request: Request, venue: Optional[str] = None, limit: int = Query(600, ge=1, le=5000)) -> Dict[str, Any]:
         return {"curve": await _ctx(venue or request.query_params.get("venue")).engine.equity_curve(limit)}
 
     async def universe(request: Request, venue: Optional[str] = None) -> Dict[str, Any]:
@@ -183,7 +197,7 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
         engine = _ctx(venue or request.query_params.get("venue")).engine
         return {"logs": engine.ring_log.tail(limit=limit, after_seq=after)}
 
-    async def orders(request: Request, venue: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
+    async def orders(request: Request, venue: Optional[str] = None, limit: int = Query(100, ge=1, le=1000)) -> Dict[str, Any]:
         db = _ctx(venue or request.query_params.get("venue")).db
         return {"orders": await db.recent_orders(limit=limit), "latency": await db.latency_stats()}
 
@@ -201,33 +215,35 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
         ``venues.binance.risk.leverage`` changes only Binance. The dashboard's
         scope selector is what decides which form to send.
         """
-        _check_auth(request)
         ctx = _ctx(venue or request.query_params.get("venue"))
         try:
             applied = cfg.set_many(patch)
         except (ValueError, KeyError) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        log.info("[%s] settings updated: %s", ctx.id, ", ".join(f"{k}={v}" for k, v in applied.items()))
+        log.info("[%s] settings updated: %s", ctx.id, ", ".join(applied))
         restart_required = any(
             k.startswith(("exchange.", "app.mode", "account.", "venues.")) for k in applied
         )
-        return {"applied": applied, "restart_required": restart_required, "venue": ctx.id}
+        return {"applied": {k: ("***" if v else "") if k.endswith("api_token") else v
+                            for k, v in applied.items()},
+                "restart_required": restart_required, "venue": ctx.id}
 
     async def reset_settings(request: Request, venue: Optional[str] = None,
                              payload: Any = Body(default=None)) -> Dict[str, Any]:
-        _check_auth(request)
         keys: Optional[List[str]] = None
-        if isinstance(payload, list):
-            keys = [str(k) for k in payload]
-        elif isinstance(payload, dict):
-            raw = payload.get("keys")
-            keys = [str(k) for k in raw] if isinstance(raw, list) else None
-        cfg.reset(keys)
-        return {"reset": True, "keys": keys or "all"}
+        if payload is not None:
+            raw = payload.get("keys") if isinstance(payload, dict) else payload
+            if not isinstance(raw, list) or not all(isinstance(k, str) for k in raw):
+                raise HTTPException(status_code=400, detail="expected a list of setting keys, or null to reset all")
+            keys = raw
+        try:
+            cfg.reset(keys)
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"reset": True, "keys": "all" if keys is None else keys}
 
     async def save_credentials(request: Request, venue: Optional[str] = None,
                                payload: Dict[str, str] = Body(...)) -> Dict[str, Any]:
-        _check_auth(request)
         ctx = _ctx(venue or request.query_params.get("venue"))
         api_key = (payload.get("api_key") or "").strip()
         api_secret = (payload.get("api_secret") or "").strip()
@@ -242,13 +258,11 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc))
 
     async def delete_credentials(request: Request, venue: Optional[str] = None) -> Dict[str, Any]:
-        _check_auth(request)
         ctx = _ctx(venue or request.query_params.get("venue"))
         await manager.clear_credentials(ctx.id)
         return {"cleared": True, "venue": ctx.id}
 
     async def test_credentials(request: Request, venue: Optional[str] = None) -> Dict[str, Any]:
-        _check_auth(request)
         ctx = _ctx(venue or request.query_params.get("venue"))
         creds = ctx.keystore.snapshot()
         if not creds:
@@ -260,19 +274,16 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
     # ------------------------------------------------------------------ #
     async def control_trading(request: Request, venue: Optional[str] = None,
                               payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        _check_auth(request)
         ctx = _ctx(venue or request.query_params.get("venue"))
         enabled = bool(payload.get("enabled", True))
         return {"venue": ctx.id, "trading_enabled": await ctx.engine.set_trading_enabled(enabled)}
 
     async def control_flatten(request: Request, venue: Optional[str] = None) -> Dict[str, Any]:
-        _check_auth(request)
         ctx = _ctx(venue or request.query_params.get("venue"))
         return {"venue": ctx.id, "closed": await ctx.engine.flatten_all("manual_flatten")}
 
     async def control_close(request: Request, venue: Optional[str] = None,
                             payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        _check_auth(request)
         ctx = _ctx(venue or request.query_params.get("venue"))
         symbol = str(payload.get("symbol") or "")
         if not symbol:
@@ -280,30 +291,39 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
         return {"venue": ctx.id, "result": await ctx.engine.close_symbol(symbol, "manual_close")}
 
     async def control_resume(request: Request, venue: Optional[str] = None) -> Dict[str, Any]:
-        _check_auth(request)
         ctx = _ctx(venue or request.query_params.get("venue"))
         return {"venue": ctx.id, "resumed": await ctx.engine.resume_risk_halt()}
 
     async def control_restart(request: Request, venue: Optional[str] = None) -> Dict[str, Any]:
-        _check_auth(request)
         if venue or request.query_params.get("venue"):
             ctx = _ctx(venue or request.query_params.get("venue"))
-            asyncio.create_task(manager.restart(ctx.id))
+            if not manager.request_restart(ctx.id):
+                raise HTTPException(status_code=503, detail="shutdown in progress; restart not accepted")
             return {"venue": ctx.id, "restarting": True}
-        for ctx in manager.all():
-            asyncio.create_task(manager.restart(ctx.id))
-        return {"restarting": True, "venues": [c.id for c in manager.all()]}
+        requested = {ctx.id: manager.request_restart(ctx.id) for ctx in manager.all()}
+        if not any(requested.values()):
+            raise HTTPException(status_code=503, detail="shutdown in progress; restart not accepted")
+        return {"restarting": True, "venues": list(requested),
+                "requested": requested}
 
     async def control_paper_reset(request: Request, venue: Optional[str] = None,
                                   payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        _check_auth(request)
         ctx = _ctx(venue or request.query_params.get("venue"))
         if ctx.cfg.mode != "paper":
             raise HTTPException(status_code=400, detail="only available in paper mode")
-        equity = float(payload.get("equity") or ctx.cfg.get("account.paper_starting_equity", 1000.0))
         broker = ctx.engine.broker
         if broker is None:
             raise HTTPException(status_code=400, detail="broker not initialised")
+        # A settings mode change does not replace a running live broker until
+        # restart. Never let a paper-only control mutate that broker or its DB.
+        if broker.mode != "paper":
+            raise HTTPException(status_code=400, detail="running broker is not in paper mode")
+        try:
+            equity = float(payload.get("equity", ctx.cfg.get("account.paper_starting_equity", 20.0)))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="equity must be a positive finite number")
+        if not math.isfinite(equity) or equity <= 0:
+            raise HTTPException(status_code=400, detail="equity must be a positive finite number")
         broker.starting_equity = equity
         broker.realized = 0.0
         broker.fees_paid = 0.0
@@ -364,7 +384,7 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
         if token:
             provided = (websocket.query_params.get("token")
                         or websocket.headers.get("x-api-token") or "")
-            if provided != token:
+            if not secrets.compare_digest(provided.encode(), token.encode()):
                 await websocket.close(code=1008, reason="invalid or missing API token")
                 return
         try:

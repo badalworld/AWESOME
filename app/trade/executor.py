@@ -6,12 +6,11 @@ Lifecycle of one trade
 1. **Size** — 8% of *current* equity as margin, 10x leverage (compounding).
 2. **Gate** — portfolio guard (max 10 open, margin cap, daily loss, cooldown).
 3. **Leverage** — set per-symbol leverage on the exchange (cached).
-4. **Entry** — market (default) or IOC limit with a slippage cap, tagged with an
-   idempotency key so retries can never double-fill.
-5. **Protect** — ATR x3 stop + fixed +200% ROI target, preferably attached to the
-   entry order itself so protection exists the instant the fill happens.
+4. **Entry** — market-only, tagged with a client order identifier.
+5. **Protect** — ATR x3 trigger-market stop (attached when supported); the
+   +200% ROI target is monitored locally and closed at market.
 6. **Manage** — on every mark-price tick: peak ROI -> stepped trailing stop
-   (single-call stop modification, never cancel/replace), plus a local watchdog
+   (venue-specific modification/replacement), plus a local watchdog
    that market-closes immediately if price breaches the stop.
 7. **Close** — market or exchange-side trigger, PnL booked, cooldown applied,
    state persisted for restart.
@@ -28,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from ..exchange.base import DEFAULT_TAKER_FEE, LONG, ContractSpec, OrderResult, Position
-from ..exchange.venue import ORDER_FILLED, ORDER_PARTIAL
+from ..exchange.venue import ORDER_CANCELED, ORDER_FILLED, ORDER_REJECTED
 from ..risk.manager import (
     RiskGuard,
     build_plan,
@@ -140,10 +139,8 @@ class Executor:
             fut = self.pending_fills.get(ext)
             if fut and not fut.done():
                 status = str(data.get("status") or "")
-                if status == ORDER_FILLED:
-                    fut.set_result(data)
-                elif status in (ORDER_PARTIAL,) and data.get("filled_qty"):
-                    fut.set_result(data)      # partial: use what actually filled
+                if status in (ORDER_FILLED, ORDER_CANCELED, ORDER_REJECTED):
+                    fut.set_result(data)  # an active partial fill is not final
         except Exception:  # noqa: BLE001
             pass
 
@@ -152,9 +149,11 @@ class Executor:
     ) -> Optional[Dict[str, Any]]:
         """Wait for the entry fill: WS push first (fastest), REST poll as backup."""
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
-        if external_oid:
-            self.pending_fills[external_oid] = fut
+        fut = self.pending_fills.get(external_oid)
+        if fut is None:
+            fut = loop.create_future()
+            if external_oid:
+                self.pending_fills[external_oid] = fut
         try:
             deadline = time.monotonic() + timeout
             client = getattr(self.broker, "client", None)
@@ -171,7 +170,7 @@ class Executor:
                         info = await client.order_status(
                             symbol, order_id=order_id or "", client_id=external_oid or "",
                         )
-                        if info and info.get("status") in (ORDER_FILLED, ORDER_PARTIAL):
+                        if info and info.get("status") in (ORDER_FILLED, ORDER_CANCELED, ORDER_REJECTED):
                             return info
                     except Exception:  # noqa: BLE001
                         pass
@@ -179,24 +178,135 @@ class Executor:
             return None
         finally:
             self.pending_fills.pop(external_oid, None)
+            if not fut.done():
+                fut.cancel()
+
+    # ------------------------------------------------------------------ #
+    #  durable entry intent / incident barrier
+    # ------------------------------------------------------------------ #
+    async def pending_entry(self) -> Optional[Dict[str, Any]]:
+        raw = await self.db.kv_get("execution.pending_entry")
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict) or not data.get("client_id"):
+                raise ValueError("invalid entry intent")
+            return data
+        except (ValueError, TypeError):
+            return {"phase": "corrupt", "reason": "entry journal needs operator reconciliation"}
+
+    async def _save_entry(self, intent: Dict[str, Any], **changes) -> None:
+        intent.update(changes, updated_at=time.time())
+        await self.db.kv_set_json("execution.pending_entry", intent)
+
+    def _valid_protection(self, handle) -> bool:
+        if not isinstance(handle, dict):
+            return False
+        try:
+            price = float(handle.get("stop_price") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(price) or price <= 0:
+            return False
+        kind = handle.get("kind")
+        if kind == "paper":
+            return self.broker.mode == "paper"
+        if kind == "plan":
+            return bool(handle.get("stop_order_id"))
+        if kind == "attached":
+            return bool(handle.get("tpsl_id"))
+        return False
+
+    async def _fail_entry(self, intent: Dict[str, Any], reason: str) -> None:
+        """Latch the venue and retain evidence; never equate ACK with flat.
+
+        Only an authoritative terminal fill supplies the emergency-close size.
+        Unknown/late fills require operator reconciliation using the client ID.
+        Persistence errors must not prevent the best-effort emergency exit.
+        """
+        self.last_error = f"entry incident {intent['client_id']}: {reason}"
+        self.guard.halted = True
+        self.guard.halt_reason = self.last_error
+        log.error(self.last_error)
+        try:
+            await self._save_entry(intent, phase="incident", reason=reason)
+            await self.guard.halt(self.last_error)
+        except Exception:
+            log.exception("could not persist entry incident; original intent remains authoritative")
+        qty = intent.get("filled_qty", 0.0)
+        # Once protection was established, do not submit another close because a
+        # later bookkeeping write failed. Preserve the stop and require recovery.
+        if qty > 0 and not intent.get("protection"):
+            try:
+                await self._save_entry(intent, emergency_close="requested")
+            except Exception:
+                log.exception("could not journal emergency close request")
+            outcome = "unknown"
+            try:
+                result = await self.broker.close_position(
+                    intent["symbol"], intent["side"], qty, reason="entry_incident")
+                still_open = await self._still_open(intent["symbol"])
+                outcome = "flat_observed" if not still_open else "not_confirmed_flat"
+                intent["emergency_close_ack"] = bool(result.ok)
+            except Exception:
+                log.exception("emergency entry close failed; reconciliation required")
+            try:
+                await self._save_entry(intent, emergency_close=outcome)
+            except Exception:
+                log.exception("could not persist emergency-close outcome")
+        self._emit("entry_incident", dict(intent))
 
     # ------------------------------------------------------------------ #
     #  open
     # ------------------------------------------------------------------ #
-    async def open_from_signal(self, signal, *, equity: float, available: float,
-                               margin_used: float, open_positions: int) -> Optional[ManagedPosition]:
+    async def open_from_signal(self, signal) -> Optional[ManagedPosition]:
+        """Refresh the risk book *inside* the per-venue entry lock.
+
+        Caller-supplied snapshots can become stale while another entry fills.
+        Local positions supplement exchange snapshots during propagation lag.
+        """
         cfg = self.cfg
         async with self._lock:
             symbol = signal.symbol
+            if await self.pending_entry() is not None:
+                await self.guard.halt("unresolved entry journal; operator reconciliation required")
+                await self._mark_signal(signal, "rejected", self.guard.halt_reason)
+                return None
             if symbol in self.positions:
                 log.info("skip %s: already managing a position", symbol)
                 return None
 
+            account = await self.broker.account()
+            exchange_positions = [p for p in await self.broker.positions() if p.hold_vol > 0]
+            equity = account.equity
+            if (not all(math.isfinite(v) for v in (equity, account.available, signal.price, signal.atr))
+                    or signal.price <= 0 or signal.atr <= 0
+                    or any(not math.isfinite(p.im) or p.im < 0 for p in exchange_positions)):
+                await self._mark_signal(signal, "rejected", "invalid account or signal data")
+                return None
+            margins: Dict[str, float] = {}
+            for position in exchange_positions:
+                margins[position.symbol] = margins.get(position.symbol, 0.0) + position.im
+            exchange_symbols = set(margins)
+            for managed in self.positions.values():
+                margins[managed.symbol] = max(margins.get(managed.symbol, 0.0), managed.margin_usd)
+            margin_used = sum(margins.values())
+            open_positions = len(exchange_positions) + len(set(self.positions) - exchange_symbols)
+            available = min(account.available, equity - margin_used)
+            await self.guard.update_equity(equity)
+
             contracts = await self.broker.contracts()
             spec: Optional[ContractSpec] = contracts.get(symbol)
+            if spec is None:
+                await self._mark_signal(signal, "rejected", "missing contract specification")
+                return None
             leverage = int(cfg.get("risk.leverage", 10))
-            if spec and spec.max_leverage and leverage > spec.max_leverage:
+            if spec.max_leverage and leverage > spec.max_leverage:
                 leverage = spec.max_leverage
+            if leverage < spec.min_leverage:
+                await self._mark_signal(signal, "rejected", "leverage below contract minimum")
+                return None
 
             sizing = size_position(
                 equity, signal.price, spec,
@@ -214,14 +324,14 @@ class Executor:
             decision = await self.guard.can_open(
                 symbol=symbol, equity=equity, open_positions=open_positions,
                 margin_used=margin_used, available=available,
-                sizing_notional=sizing.notional_usd, symbol_open=symbol in self.positions,
+                sizing_margin=sizing.margin_usd, symbol_open=symbol in margins,
             )
             if not decision.allowed:
                 log.info("skip %s: %s", symbol, decision.reason)
                 await self._mark_signal(signal, "rejected", decision.reason)
                 return None
 
-            contract_size = spec.contract_size if spec else 1.0
+            contract_size = spec.contract_size
             plan = build_plan(
                 side=signal.side, entry_price=signal.price, atr=signal.atr,
                 sizing=sizing, contract_size=contract_size, cfg=cfg,
@@ -230,7 +340,9 @@ class Executor:
             # 1) leverage (cached per symbol; hedge mode needs it per side)
             if bool(cfg.get("exchange.set_leverage_on_entry", True)):
                 position_type = 1 if signal.side == LONG else 2
-                await self.broker.set_leverage(symbol, leverage, position_type)
+                if not await self.broker.set_leverage(symbol, leverage, position_type):
+                    await self._mark_signal(signal, "rejected", "could not set requested leverage")
+                    return None
 
             # 2) entry (with attached protection when the venue supports it)
             trade_uid = f"ao-{symbol}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
@@ -239,157 +351,184 @@ class Executor:
             if not price_hint or price_hint <= 0:
                 price_hint = (tk.mark() if tk else signal.price) or signal.price
 
-            entry_started = time.perf_counter()
-            result: OrderResult = await self.broker.open_position(
-                symbol=symbol, side=signal.side, qty=sizing.qty, leverage=leverage,
-                price_hint=price_hint, client_id=trade_uid,
-                sl_price=plan.sl_price,
-            )
-            entry_latency = (time.perf_counter() - entry_started) * 1000.0
-            await self._record_order(symbol, "entry", signal.side, plan.entry_price or price_hint,
-                                     sizing.qty, result, entry_latency, signal.side)
-            if not result.ok:
-                log.warning("entry failed for %s: %s", symbol, result.error)
-                await self._mark_signal(signal, "rejected", f"entry order failed: {result.error}")
+            intent = {
+                "client_id": trade_uid, "symbol": symbol, "side": signal.side,
+                "requested_qty": sizing.qty, "reference_price": signal.price,
+                "leverage": leverage, "sl_price": plan.sl_price,
+                "signal_id": signal.signal_id, "phase": "prepared", "created_at": time.time(),
+            }
+            # Persist BEFORE submission. Failure here must prevent any order.
+            await self._save_entry(intent)
+            self.pending_fills[trade_uid] = asyncio.get_running_loop().create_future()
+            try:
+                return await self._execute_entry(signal, sizing, plan, leverage,
+                                                 contract_size, trade_uid, price_hint, intent)
+            except asyncio.CancelledError:
+                await self._fail_entry(intent, "entry interrupted; reconcile before resuming")
+                raise
+            except Exception as exc:
+                await self._fail_entry(intent, f"entry lifecycle failed ({type(exc).__name__})")
                 return None
+            finally:
+                fut = self.pending_fills.pop(trade_uid, None)
+                if fut is not None and not fut.done():
+                    fut.cancel()
 
-            # 3) confirm fill
-            fill = None
-            if str(result.status or "").lower() != ORDER_FILLED or not result.price:
-                fill = await self._await_fill(symbol, result.order_id or "", trade_uid)
-            entry_price = plan.entry_price
-            filled_qty = sizing.qty
-            if fill:
-                entry_price = float(fill.get("avg_price") or entry_price) or entry_price
-                filled_qty = float(fill.get("filled_qty") or filled_qty) or filled_qty
-            elif result.price:
-                entry_price = result.price
-                filled_qty = result.filled_vol or filled_qty
-            if entry_price <= 0:
-                entry_price = price_hint
-            if filled_qty <= 0:
-                filled_qty = sizing.qty
+    async def _execute_entry(self, signal, sizing, plan, leverage: int,
+                             contract_size: float, trade_uid: str, price_hint: float,
+                             intent: Dict[str, Any]) -> Optional[ManagedPosition]:
+        symbol = signal.symbol
+        cfg = self.cfg
+        entry_started = time.perf_counter()
+        result: OrderResult = await self.broker.open_position(
+            symbol=symbol, side=signal.side, qty=sizing.qty, leverage=leverage,
+            price_hint=price_hint, client_id=trade_uid,
+            sl_price=plan.sl_price,
+        )
+        entry_latency = (time.perf_counter() - entry_started) * 1000.0
+        # Capture authoritative terminal quantity in memory before any post-fill
+        # disk write can fail. Never derive this from the requested order size.
+        if str(result.status or "").lower() in (ORDER_FILLED, ORDER_CANCELED):
+            qty = float(result.filled_vol or 0.0)
+            if math.isfinite(qty) and qty > 0:
+                intent["filled_qty"] = qty
+        await self._save_entry(intent, phase="acknowledged", order_id=result.order_id or "",
+                               status=result.status, acknowledged=bool(result.ok))
+        if not result.ok:
+            # Adapters currently conflate transport failures and rejections.
+            # Either can follow a submission that reached the venue.
+            await self._fail_entry(intent, "submission not confirmed; reconcile by client ID")
+            return None
 
-            # recompute the plan on the *actual* entry price
-            plan = build_plan(
-                side=signal.side, entry_price=entry_price, atr=signal.atr,
-                sizing=sizing, contract_size=contract_size, cfg=cfg,
-            )
-            # a partial fill must be risked (and protected) at its real size,
-            # never at the size we asked for
-            actual_notional = filled_qty * contract_size * entry_price
-            plan.margin_usd = actual_notional / max(1, leverage)
-            plan.notional_usd = actual_notional
+        # 3) confirm fill
+        fill = {"status": str(result.status or "").lower(),
+                "avg_price": result.price, "filled_qty": result.filled_vol}
+        terminal = (ORDER_FILLED, ORDER_CANCELED, ORDER_REJECTED)
+        if fill["status"] not in terminal:
+            fill = await self._await_fill(symbol, result.order_id or "", trade_uid)
+        if not fill or fill.get("status") not in terminal:
+            await self._fail_entry(intent, "entry fill not final; requested quantity is not a fill")
+            return None
+        entry_price = float(fill.get("avg_price") or 0.0)
+        filled_qty = float(fill.get("filled_qty") or 0.0)
+        if not all(math.isfinite(v) and v > 0 for v in (entry_price, filled_qty)):
+            await self._fail_entry(intent, "terminal entry has no valid positive fill quantity/price")
+            return None
+        await self._save_entry(intent, phase="filled", filled_qty=filled_qty,
+                               entry_price=entry_price, status=fill["status"])
 
-            # 4) protection: attach-aware
-            #    "attached" -> the entry order already carries SL/TP legs; we only
-            #    look up their id so trailing can modify them in one call.
-            #    otherwise -> place standalone stop + reduce-only TP now.
-            raw = result.raw if isinstance(result.raw, dict) else {}
-            protection_kind = raw.get("protection")
-            if protection_kind == "attached":
-                handle = await self.broker.arm_protection(
-                    symbol=symbol, side=signal.side, qty=filled_qty,
-                    sl_price=plan.sl_price,
-                    entry_order_id=result.order_id or "",
-                )
-            else:
-                handle = await self.broker.arm_protection(
-                    symbol=symbol, side=signal.side, qty=filled_qty,
-                    sl_price=plan.sl_price,
-                    entry_order_id="",
-                )
-            protection_ok = bool(handle) and (
-                handle.get("kind") in ("attached", "plan", "paper")
-                or handle.get("stop_price")
-            )
-            if not protection_ok:
-                # Never hold an unprotected leveraged position: flatten immediately.
-                log.error("protection could not be established for %s -> closing entry", symbol)
-                await self.broker.close_position(symbol, signal.side, filled_qty, reason="no_protection")
-                await self._mark_signal(signal, "rejected", "could not place stop-loss; position flattened")
-                return None
+        # recompute the plan on the *actual* entry price
+        plan = build_plan(
+            side=signal.side, entry_price=entry_price, atr=signal.atr,
+            sizing=sizing, contract_size=contract_size, cfg=cfg,
+        )
+        # a partial fill must be risked (and protected) at its real size,
+        # never at the size we asked for
+        actual_notional = filled_qty * contract_size * entry_price
+        plan.margin_usd = actual_notional / max(1, leverage)
+        plan.notional_usd = actual_notional
 
-            now = time.time()
-            managed = ManagedPosition(
-                trade_id=0,
-                trade_uid=trade_uid,
-                symbol=symbol,
-                side=signal.side,
-                qty=filled_qty,
-                contract_size=contract_size,
-                entry_price=entry_price,
-                leverage=leverage,
-                margin_usd=plan.margin_usd,
-                initial_margin_usd=plan.margin_usd,
-                notional_usd=filled_qty * contract_size * entry_price,
-                atr=signal.atr,
-                sl_price=plan.sl_price,
-                sl_roi_pct=plan.sl_roi_pct,
-                tp_price=plan.tp_price,
-                tp_roi_pct=plan.tp_roi_pct,
-                opened_at=now,
-                entry_order_id=result.order_id or "",
-                protection=handle,
-                stop_price=plan.sl_price,
-                stop_roi_pct=None,          # None => initial SL still in force
-                signal_id=signal.signal_id,
-                notes={
-                    "score": signal.score,
-                    "atr_pct": signal.atr_pct,
-                    "divergence": signal.divergence.to_dict(),
-                    "filters": signal.report.to_dict(),
-                    "entry_latency_ms": round(entry_latency, 2),
-                    "protection_kind": handle.get("kind", "unknown"),
-                },
-            )
-            trade_id = await self.db.insert_trade({
-                "trade_uid": trade_uid,
-                "symbol": symbol,
-                "side": signal.side,
-                "status": "OPEN",
-                "qty": filled_qty,
-                "contract_size": contract_size,
-                "entry_price": entry_price,
-                "leverage": leverage,
-                "margin_usd": plan.margin_usd,
-                "notional_usd": managed.notional_usd,
-                "sl_price": plan.sl_price,
-                "tp_price": plan.tp_price,
-                "sl_roi_pct": plan.sl_roi_pct,
-                "tp_roi_pct": plan.tp_roi_pct,
-                "peak_roi_pct": 0.0,
-                "trail_active": 0,
-                "stop_price": plan.sl_price,
-                "stop_order_id": str(handle.get("stop_order_id") or handle.get("tpsl_id") or ""),
-                "tp_order_id": str(handle.get("tp_order_id") or ""),
-                "entry_order_id": result.order_id or "",
-                "atr": signal.atr,
-                "realized_pnl": 0.0,
-                "fees_usd": 0.0,
-                "signal_id": signal.signal_id,
-                "opened_at": now,
-                "meta": json.dumps(managed.notes, default=str),
-            })
-            managed.trade_id = trade_id
-            self.positions[symbol] = managed
-            await self._persist(managed)
-            await self._mark_signal(signal, "executed", "position opened", trade_id)
-            log.info(
-                "OPEN %s %s qty=%.8g @ %.8g | SL %.8g (%.1f%% ROI) | TP %.8g (%.0f%% ROI) | margin $%.2f | %dms",
-                signal.side, symbol, filled_qty, entry_price, plan.sl_price, plan.sl_roi_pct,
-                plan.tp_price, plan.tp_roi_pct, plan.margin_usd, entry_latency,
-            )
-            self._emit("position_opened", managed.to_state())
-            return managed
+        # 4) Establish the trigger-market stop, adopting the attached SL
+        #    when present. TP is local; no resting TP order is submitted.
+        raw = result.raw if isinstance(result.raw, dict) else {}
+        protection_kind = raw.get("protection")
+        handle = await self.broker.arm_protection(
+            symbol=symbol, side=signal.side, qty=filled_qty,
+            sl_price=plan.sl_price,
+            entry_order_id=(result.order_id or "") if protection_kind == "attached" else "",
+        )
+        protection_ok = self._valid_protection(handle)
+        if not protection_ok:
+            await self._fail_entry(intent, "could not establish stop-loss")
+            return None
+        await self._save_entry(intent, phase="protected", protection=handle)
+
+        await self._record_order(symbol, "entry", signal.side, plan.entry_price or price_hint,
+                                 sizing.qty, result, entry_latency, signal.side)
+
+        now = time.time()
+        managed = ManagedPosition(
+            trade_id=0,
+            trade_uid=trade_uid,
+            symbol=symbol,
+            side=signal.side,
+            qty=filled_qty,
+            contract_size=contract_size,
+            entry_price=entry_price,
+            leverage=leverage,
+            margin_usd=plan.margin_usd,
+            initial_margin_usd=plan.margin_usd,
+            notional_usd=filled_qty * contract_size * entry_price,
+            atr=signal.atr,
+            sl_price=plan.sl_price,
+            sl_roi_pct=plan.sl_roi_pct,
+            tp_price=plan.tp_price,
+            tp_roi_pct=plan.tp_roi_pct,
+            opened_at=now,
+            entry_order_id=result.order_id or "",
+            protection=handle,
+            stop_price=plan.sl_price,
+            stop_roi_pct=None,          # None => initial SL still in force
+            signal_id=signal.signal_id,
+            notes={
+                "score": signal.score,
+                "atr_pct": signal.atr_pct,
+                "divergence": signal.divergence.to_dict(),
+                "filters": signal.report.to_dict(),
+                "entry_latency_ms": round(entry_latency, 2),
+                "protection_kind": handle.get("kind", "unknown"),
+            },
+        )
+        trade_id = await self.db.insert_trade({
+            "trade_uid": trade_uid,
+            "symbol": symbol,
+            "side": signal.side,
+            "status": "OPEN",
+            "qty": filled_qty,
+            "contract_size": contract_size,
+            "entry_price": entry_price,
+            "leverage": leverage,
+            "margin_usd": plan.margin_usd,
+            "notional_usd": managed.notional_usd,
+            "sl_price": plan.sl_price,
+            "tp_price": plan.tp_price,
+            "sl_roi_pct": plan.sl_roi_pct,
+            "tp_roi_pct": plan.tp_roi_pct,
+            "peak_roi_pct": 0.0,
+            "trail_active": 0,
+            "stop_price": plan.sl_price,
+            "stop_order_id": str(handle.get("stop_order_id") or handle.get("tpsl_id") or ""),
+            "tp_order_id": str(handle.get("tp_order_id") or ""),
+            "entry_order_id": result.order_id or "",
+            "atr": signal.atr,
+            "realized_pnl": 0.0,
+            "fees_usd": 0.0,
+            "signal_id": signal.signal_id,
+            "opened_at": now,
+            "meta": json.dumps(managed.notes, default=str),
+        })
+        managed.trade_id = trade_id
+        self.positions[symbol] = managed
+        await self._persist(managed)
+        await self._mark_signal(signal, "executed", "position opened", trade_id)
+        await self.db.kv_delete("execution.pending_entry")
+        log.info(
+            "OPEN %s %s qty=%.8g @ %.8g | SL %.8g (%.1f%% ROI) | TP %.8g (%.0f%% ROI) | margin $%.2f | %dms",
+            signal.side, symbol, filled_qty, entry_price, plan.sl_price, plan.sl_roi_pct,
+            plan.tp_price, plan.tp_roi_pct, plan.margin_usd, entry_latency,
+        )
+        self._emit("position_opened", managed.to_state())
+        return managed
 
     # ------------------------------------------------------------------ #
     #  manage
     # ------------------------------------------------------------------ #
     async def handle_tick(self, symbol: str, mark: float) -> None:
+        if not math.isfinite(mark) or mark <= 0:
+            return
         self.marks_cache[symbol] = mark
         pos = self.positions.get(symbol)
-        if pos is None or pos.closed or mark <= 0 or symbol in self._closing:
+        if pos is None or pos.closed or symbol in self._closing:
             return
         try:
             roi = pos.roi_at(mark)
@@ -415,10 +554,8 @@ class Executor:
                     return
 
             # ---- optional partial take-profit (opt-in, off by default) ------- #
-            # Banks a fraction of the position at a nearer ROI so the trade stops
-            # being a coin flip (see docs/WIN_PROBABILITY.md: the median trail
-            # exit is smaller than the 3xATR stop). Off by default, so the
-            # shipped behaviour is unchanged.
+            # Banks a fraction at a nearer ROI. This changes the distribution
+            # of exits, not the signal's predictive edge. Off by default.
             if not pos.partial_done and bool(cfg.get("takeprofit.partial_tp_enabled", False)):
                 partial_roi = float(cfg.get("takeprofit.partial_tp_roi_pct", 50.0))
                 if roi >= partial_roi:
@@ -599,6 +736,10 @@ class Executor:
             fallback_price = price or self._last_known_price(pos)
             if result.ok:
                 exit_price = await self._confirm_exit_price(pos, result, fallback_price)
+                if await self._still_open(pos.symbol):
+                    self.last_error = f"close not confirmed flat for {pos.symbol}; retaining stop and position"
+                    log.error(self.last_error)
+                    return {}
                 await self.broker.release_stop(symbol=pos.symbol, handle=pos.protection)
                 await self._record_order(pos.symbol, "close", pos.side, exit_price, pos.qty,
                                          result, latency, reason)
@@ -617,9 +758,13 @@ class Executor:
             await asyncio.sleep(0.15)
             retry = await self.broker.close_position(pos.symbol, pos.side, pos.qty,
                                                      reason=reason + ":retry")
-            latency += (time.perf_counter() - started) * 1000.0
+            latency = (time.perf_counter() - started) * 1000.0
             if retry.ok:
-                exit_price = retry.price or fallback_price or pos.entry_price
+                exit_price = await self._confirm_exit_price(pos, retry, fallback_price)
+                if await self._still_open(pos.symbol):
+                    self.last_error = f"retry close not confirmed flat for {pos.symbol}; retaining stop and position"
+                    log.error(self.last_error)
+                    return {}
                 await self.broker.release_stop(symbol=pos.symbol, handle=pos.protection)
                 await self._record_order(pos.symbol, "close", pos.side, exit_price, pos.qty,
                                          retry, latency, reason + ":retry")
@@ -650,7 +795,7 @@ class Executor:
                     info = None
                 if info and info.get("avg_price"):
                     return float(info["avg_price"])
-                if info and info.get("status") in (ORDER_FILLED, ORDER_PARTIAL):
+                if info and info.get("status") in (ORDER_FILLED, ORDER_CANCELED, ORDER_REJECTED):
                     break
                 await asyncio.sleep(0.15)
         return fallback or self._estimate_exchange_exit(pos, fallback)
@@ -797,6 +942,8 @@ class Executor:
 
     async def restore(self) -> None:
         """Rebuild in-memory state after a restart and repair any drift."""
+        if await self.pending_entry() is not None:
+            await self.guard.halt("unresolved entry journal on restart; operator reconciliation required")
         open_trades = await self.db.get_open_trades()
         exchange_positions: Dict[str, Position] = {p.symbol: p for p in await self.broker.positions()}
         contracts = await self.broker.contracts()

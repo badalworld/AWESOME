@@ -151,7 +151,7 @@ class EngineTest(_EngineHarness, unittest.IsolatedAsyncioTestCase):
             divergence=div,
         )
         pos = await executor.open_from_signal(
-            signal, equity=1000.0, available=1000.0, margin_used=0.0, open_positions=0,
+            signal,
         )
         if pos is None:
             self.skipTest(f"paper broker declined the demo order: {executor.last_error}")

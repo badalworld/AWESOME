@@ -57,6 +57,9 @@ class VenueManager:
         self.venues_dir.mkdir(parents=True, exist_ok=True)
         self._legacy_db = cfg.resolve(str(cfg.get("persistence.db_path", "data/bot.db")))
         self.ctx: Dict[str, VenueContext] = {}
+        self._restart_tasks: Dict[str, asyncio.Task] = {}
+        self._shutting_down = False
+        self._shutdown_task: Optional[asyncio.Task] = None
         self._build()
 
     # ------------------------------------------------------------------ #
@@ -115,6 +118,8 @@ class VenueManager:
     # ------------------------------------------------------------------ #
     async def start_all(self) -> Dict[str, str]:
         """Start every enabled venue. One failure never blocks the others."""
+        self._shutting_down = False
+        self._shutdown_task = None
         results: Dict[str, str] = {}
         for ctx in self.all():
             if not ctx.enabled:
@@ -132,6 +137,17 @@ class VenueManager:
         return results
 
     async def stop_all(self) -> None:
+        self._shutting_down = True
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(self._stop_all(), name="stop-all-venues")
+        # The server watcher may be canceled while shutdown is in progress.
+        # Keep cleanup owned and awaitable by the server's finally block.
+        await asyncio.shield(self._shutdown_task)
+
+    async def _stop_all(self) -> None:
+        # Drain accepted lifecycle operations before clients/databases close.
+        # Never cancel a restart midway through restoring exchange protection.
+        await asyncio.gather(*list(self._restart_tasks.values()), return_exceptions=True)
         for ctx in self.all():
             try:
                 await ctx.engine.stop()
@@ -145,12 +161,30 @@ class VenueManager:
             except Exception:  # noqa: BLE001
                 pass
 
+    def request_restart(self, venue_id: str) -> bool:
+        """Own/coalesce dashboard restart tasks; reject requests during shutdown."""
+        ctx = self.get(venue_id)
+        if self._shutting_down:
+            return False
+        existing = self._restart_tasks.get(ctx.id)
+        if existing is not None and not existing.done():
+            return True
+        task = asyncio.create_task(self.restart(ctx.id), name=f"restart-{ctx.id}")
+        self._restart_tasks[ctx.id] = task
+
+        def finished(done):
+            if self._restart_tasks.get(ctx.id) is done:
+                self._restart_tasks.pop(ctx.id, None)
+            if not done.cancelled() and done.exception() is not None:
+                log.error("[%s] restart task failed: %s", ctx.id, done.exception())
+
+        task.add_done_callback(finished)
+        return True
+
     async def restart(self, venue_id: str) -> bool:
         ctx = self.get(venue_id)
-        await ctx.engine.stop()
-        await asyncio.sleep(0.3)
         try:
-            await ctx.engine.start()
+            await ctx.engine.restart()
             ctx.start_error = ""
             return True
         except Exception as exc:  # noqa: BLE001
@@ -170,13 +204,6 @@ class VenueManager:
         client = getattr(ctx.engine.broker, "client", None)
         if client is not None:
             client.update_credentials(None, None, None)
-
-    def credentials_view(self, venue_id: str) -> Dict[str, Any]:
-        ctx = self.get(venue_id)
-        data = ctx.keystore.masked()
-        data["venue"] = ctx.id
-        data["label"] = ctx.spec.label
-        return data
 
     # ------------------------------------------------------------------ #
     async def summary(self) -> Dict[str, Any]:

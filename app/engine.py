@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Any, Dict, List, Optional
 
@@ -98,24 +99,49 @@ class TradingEngine:
         self.event_log: List[Dict[str, Any]] = []
         self._tasks: List[asyncio.Task] = []
         self._tick_pending: Dict[str, float] = {}
-        self._tick_busy: set = set()
+        self._tick_tasks: Dict[str, asyncio.Task] = {}
+        self._entry_tasks: set[asyncio.Task] = set()
         self._analysis_queue: asyncio.Queue = asyncio.Queue()
         self._last_analysis: Dict[str, float] = {}
         self._candle_ts: Dict[str, int] = {}
         self._compound_cache: Dict[str, Any] = {}
         self._compound_ts = 0.0
-        self._lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
     #  lifecycle
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
+        async with self._lifecycle_lock:
+            await self._start_safely()
+
+    async def restart(self) -> None:
+        # One lock spans stop AND start: two dashboard requests cannot build
+        # overlapping clients or let shutdown race a half-finished restart.
+        async with self._lifecycle_lock:
+            await self._stop()
+            await self._start_safely()
+
+    async def _start_safely(self) -> None:
+        try:
+            await self._start()
+        except (Exception, asyncio.CancelledError):
+            self.running = False
+            self.status_message = "start failed"
+            if self.broker is not None:
+                try:
+                    await self.broker.stop()
+                except Exception:
+                    log.exception("broker cleanup after failed startup failed")
+            raise
+
+    async def _start(self) -> None:
         if self.running:
             return
         cfg = self.cfg
         log.info("engine starting in %s mode", cfg.mode)
         self._tick_pending.clear()
-        self._tick_busy.clear()
+        self._tick_tasks.clear()
         await self._build_broker()
 
         self.guard = RiskGuard(cfg, self.db)
@@ -149,6 +175,10 @@ class TradingEngine:
         log.info("engine started (%s broker, data source: %s)", self.broker.name, self.market_data_source)
 
     async def stop(self) -> None:
+        async with self._lifecycle_lock:
+            await self._stop()
+
+    async def _stop(self) -> None:
         if not self.running:
             return
         self.running = False
@@ -157,6 +187,11 @@ class TradingEngine:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        # An entry may already have reached the venue. Finish protection and
+        # persistence instead of cancelling it between fill and stop placement.
+        await asyncio.gather(*self._entry_tasks, return_exceptions=True)
+        await asyncio.gather(*self._tick_tasks.values(), return_exceptions=True)
+        self._tick_pending.clear()
         if self.broker:
             await self.broker.stop()
         self.status_message = "stopped"
@@ -186,10 +221,14 @@ class TradingEngine:
                 )
             client = self._make_client(rest_base, creds.api_key, creds.api_secret,
                                        getattr(creds, "passphrase", ""))
-            await client.start()
             try:
+                await client.start()
                 await client.ping()
+            except asyncio.CancelledError:
+                await client.close()
+                raise
             except Exception as exc:  # noqa: BLE001
+                await client.close()
                 raise RuntimeError(
                     f"Cannot reach {spec.label} at {rest_base} ({exc}). Live trading requires "
                     "network access to the exchange (run the bot from a VPS in the same region)."
@@ -201,23 +240,26 @@ class TradingEngine:
                 stop_mode=str(cfg.get("stoploss.mode", "auto")),
                 telemetry=self.telemetry,
             )
-            await broker.start()
             self.broker = broker
+            await broker.start()
             self.market_data_source = "live"
             log.info("[%s] live broker ready (position mode %s)", spec.id, broker.position_mode)
             return
 
         # ---- paper mode ------------------------------------------------ #
         source = str(cfg.get("exchange.paper_data_source", "auto")).lower()
-        public_client = self._make_client(rest_base, None, None, "")
         adapter = None
         if source in ("live", "auto"):
+            public_client = self._make_client(rest_base, None, None, "")
             try:
                 await public_client.start()
                 await asyncio.wait_for(public_client.ping(), timeout=6.0)
                 adapter = VenuePublicMarketAdapter(public_client, self.clock)
                 self.market_data_source = "public"
                 log.info("[%s] paper mode using LIVE public market data (orders are simulated)", spec.id)
+            except asyncio.CancelledError:
+                await public_client.close()
+                raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("[%s] public data unavailable (%s) -> falling back to the synthetic feed",
                             spec.id, exc)
@@ -356,6 +398,8 @@ class TradingEngine:
     #  callbacks from the broker
     # ------------------------------------------------------------------ #
     def _on_tick(self, symbol: str, mark: float, bid: float, ask: float) -> None:
+        if not self.running or not math.isfinite(mark) or mark <= 0:
+            return
         self.marks[symbol] = mark
         tk = self.tickers.get(symbol)
         if tk is not None:
@@ -367,14 +411,18 @@ class TradingEngine:
                 tk.ask = ask
             tk.ts = time.time()
         if self.executor and symbol in self.executor.positions:
+            # Coalescing may discard intermediate prices while REST I/O is in
+            # flight; never discard their peak/trough for the trailing ratchet.
+            pos = self.executor.positions[symbol]
+            roi = pos.roi_at(mark)
+            pos.peak_roi_pct = max(pos.peak_roi_pct, roi)
+            pos.trough_roi_pct = min(pos.trough_roi_pct, roi)
             self._tick_pending[symbol] = mark
-            asyncio.get_running_loop().create_task(self._drain_tick(symbol))
+            if symbol not in self._tick_tasks:
+                self._tick_tasks[symbol] = asyncio.create_task(self._drain_tick(symbol))
 
     async def _drain_tick(self, symbol: str) -> None:
         """Coalesced, per-symbol serialised tick handling (exits first)."""
-        if symbol in self._tick_busy:
-            return
-        self._tick_busy.add(symbol)
         try:
             while True:
                 mark = self._tick_pending.pop(symbol, None)
@@ -383,7 +431,7 @@ class TradingEngine:
                 if self.executor:
                     await self.executor.handle_tick(symbol, mark)
         finally:
-            self._tick_busy.discard(symbol)
+            self._tick_tasks.pop(symbol, None)
 
     def _on_kline(self, symbol: str, interval: str, candle, is_closed: bool) -> None:
         tf = str(self.cfg.get("strategy.timeframe", "Min5"))
@@ -578,20 +626,13 @@ class TradingEngine:
             log.debug("depth fetch failed for %s: %s", symbol, exc)
         return max(1_000.0, (tk.amount24 / 2880.0) if tk else 0.0)
 
-    async def _try_open(self, signal: Signal) -> None:
+    async def _try_open(self, signal: Signal):
         if not self.executor or not self.guard:
             return
-        account = self.last_account or await self.broker.account()
-        positions = await self.broker.positions()
-        margin_used = sum(p.im for p in positions)
-        result = await self.executor.open_from_signal(
-            signal,
-            equity=account.equity,
-            available=account.available,
-            margin_used=margin_used,
-            open_positions=len(self.executor.positions),
-        )
-        return result
+        task = asyncio.create_task(self.executor.open_from_signal(signal))
+        self._entry_tasks.add(task)
+        task.add_done_callback(self._entry_tasks.discard)
+        return await asyncio.shield(task)
 
     # ------------------------------------------------------------------ #
     #  loops
@@ -686,6 +727,10 @@ class TradingEngine:
         return await self.executor.force_close_symbol(symbol, reason=reason)
 
     async def resume_risk_halt(self) -> bool:
+        if self.executor and await self.executor.pending_entry() is not None:
+            if self.guard:
+                await self.guard.halt("unresolved entry journal; operator reconciliation required")
+            return False
         if self.guard:
             await self.guard.resume()
             log.info("risk halt cleared")
@@ -769,6 +814,7 @@ class TradingEngine:
                 "losses": int(trade_stats.get("losses") or 0),
             },
             "positions": positions,
+            "pending_entry": await self.executor.pending_entry() if self.executor else None,
             "risk": self.guard.snapshot(equity) if self.guard else {},
             "stats": trade_stats,
             "target": {

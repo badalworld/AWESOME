@@ -5,16 +5,16 @@ venue-agnostic — it talks to the normalized :class:`VenueClient` /
 :class:`VenueStream` interfaces, so MEXC, Binance and KuCoin share one
 execution state machine (same rules by construction, not by copy-paste).
 
-Execution strategy (market-only, always protected — 2026-10 live audit):
+Execution strategy (market-only; protection requires venue confirmation):
 
-1. ``client.market_order`` with a client id (idempotent retries). When the venue
-   supports *attached* protection (MEXC), the stop-loss leg rides in the same
-   round trip, so the position is never unprotected — not even for one tick.
+1. ``client.market_order`` with a client id. When the venue supports attached
+   protection (MEXC), the stop-loss leg is requested in the same round trip.
+   Order acceptance alone does not establish a final fill or an active stop.
 2. Otherwise (or if the venue rejects the attached leg) the executor arms
    standalone protection immediately: a reduce-only *trigger* stop order on the
    exchange, which is a market order once triggered.
-3. Trailing steps move the stop in a *single* modify call — never
-   cancel/replace, so there is no unprotected window.
+3. Trailing steps use the venue's stop-update implementation: in-place where
+   supported, otherwise replacement protection is placed before cancellation.
 4. **No order of ours ever rests on the book.** Entries and exits (stop-loss,
    trail, +200 % ROI target, manual close) are all market orders; the ROI target
    is enforced locally by the executor, and any legacy resting take-profit
