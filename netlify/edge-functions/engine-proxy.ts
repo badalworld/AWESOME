@@ -2,6 +2,7 @@
 // Set ENGINE_URL in the Netlify UI (Project configuration > Environment variables)
 // to the engine's address, e.g. "http://203.0.113.10:8080" (a bare IP or
 // "IP:port" also works; port defaults to the engine's web.port of 8080).
+// An "IPAddress" variable is accepted as a fallback when ENGINE_URL is unset.
 import type { Config, Context } from "https://edge.netlify.com";
 
 function engineBase(raw: string): URL | null {
@@ -18,7 +19,7 @@ function engineBase(raw: string): URL | null {
 }
 
 export default async (req: Request, _context: Context) => {
-  const base = engineBase(Netlify.env.get("ENGINE_URL") ?? "");
+  const base = engineBase(Netlify.env.get("ENGINE_URL") || Netlify.env.get("IPAddress") || "");
   if (!base) {
     return Response.json(
       { detail: "Engine address not configured: set the ENGINE_URL environment variable to your server's IP (e.g. http://203.0.113.10:8080)." },
