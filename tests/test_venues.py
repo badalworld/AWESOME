@@ -216,7 +216,18 @@ class _CaptureKuCoin(KuCoinClient):
 
     async def _request(self, method: str, path: str, **kw: Any) -> Any:  # type: ignore[override]
         self.calls.append({"method": method, "path": path, **kw})
-        return self.responses.pop(0) if self.responses else {"orderId": "oid-1"}
+        if self.responses:
+            return self.responses.pop(0)
+        if method == "GET" and path.startswith("/api/v1/orders/"):
+            # fill lookup performed straight after a placement
+            return {"dealSize": 42, "size": 42, "isActive": False, "avgDealPrice": "60000.5"}
+        return {"orderId": "oid-1"}
+
+    def last_body(self, path: str = "/api/v1/orders") -> Dict[str, Any]:
+        for call in reversed(self.calls):
+            if call["method"] == "POST" and call["path"] == path:
+                return call["body"]
+        raise AssertionError(f"no POST {path} recorded")
 
 
 class KuCoinOrderMappingTest(unittest.TestCase):
@@ -230,7 +241,7 @@ class KuCoinOrderMappingTest(unittest.TestCase):
 
     def test_long_entry_leverage_and_size(self):
         asyncio.run(self.c.market_order("XBTUSDTM", side=LONG, qty=42, reduce_only=False, leverage=10))
-        body = self.c.calls[-1]["body"]
+        body = self.c.last_body()
         self.assertEqual(body["side"], "buy")
         self.assertEqual(body["size"], 42)
         self.assertEqual(body["leverage"], "10")
@@ -239,7 +250,7 @@ class KuCoinOrderMappingTest(unittest.TestCase):
 
     def test_long_stop_is_reduce_only_down_trigger(self):
         asyncio.run(self.c.stop_order("XBTUSDTM", side=LONG, qty=42, trigger_price=59000.55))
-        body = self.c.calls[-1]["body"]
+        body = self.c.last_body()
         self.assertEqual(body["side"], "sell")
         self.assertEqual(body["stop"], "down")          # long stop fires when price falls
         self.assertEqual(body["stopPriceType"], "MP")   # mark price trigger
@@ -248,7 +259,7 @@ class KuCoinOrderMappingTest(unittest.TestCase):
 
     def test_short_stop_is_up_trigger(self):
         asyncio.run(self.c.stop_order("XBTUSDTM", side=SHORT, qty=5, trigger_price=70000.0))
-        body = self.c.calls[-1]["body"]
+        body = self.c.last_body()
         self.assertEqual((body["side"], body["stop"]), ("buy", "up"))
 
     def test_stop_replace_cancels_old_after_new(self):

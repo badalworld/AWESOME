@@ -534,3 +534,21 @@ select.input { cursor: pointer; }
 .scope-bar .switch { display: flex; gap: 8px; align-items: center; cursor: pointer; }
 .scope-bar code { font-size: 11px; opacity: .85; }
 .badge-warn { background: rgba(251, 191, 36, .16); border-color: rgba(251, 191, 36, .45); color: #fcd34d; }
+
+/* --- live-safety banner ------------------------------------------------- */
+.safety-banner {
+  margin: 0 0 10px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(248, 113, 113, 0.55);
+  background: linear-gradient(90deg, rgba(248, 113, 113, 0.18), rgba(248, 113, 113, 0.05));
+  color: #fecaca;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.safety-banner code {
+  background: rgba(0, 0, 0, 0.35);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+#safetyBanner.hidden { display: none; }

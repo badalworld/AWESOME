@@ -53,7 +53,7 @@ from .base import (
     Position,
     Ticker,
 )
-from .venue import HEDGE, VENUES, VenueClient
+from .venue import HEDGE, VENUES, VenueClient, normalize_order_status
 
 log = logging.getLogger("mexc")
 
@@ -529,6 +529,15 @@ class MeXCClient:
         params = {"symbol": symbol} if symbol else None
         payload = await self._request(
             "GET", "/api/v1/private/stoporder/open_orders", params=params, signed=True, lane="query"
+        )
+        data = payload.get("data") or []
+        return list(data)
+
+    async def plan_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """Open *standalone* trigger orders (our separate SL legs) for a symbol."""
+        payload = await self._request(
+            "GET", "/api/v1/private/planorder/list/orders",
+            params={"symbol": symbol}, signed=True, lane="query",
         )
         data = payload.get("data") or []
         return list(data)
@@ -1203,6 +1212,92 @@ class MexcVenueClient(VenueClient):
                     "tp_price": float(row.get("takeProfitPrice") or 0),
                 }
         return None
+
+    async def order_status(self, symbol: str, *, order_id: str = "",
+                           client_id: str = "") -> Optional[Dict[str, Any]]:
+        """MEXC dialect: ``state`` 1..5, ``dealVol``/``dealAvgPrice``."""
+        row: Optional[Dict[str, Any]] = None
+        try:
+            if client_id:
+                row = await self.raw.order_by_external_id(symbol, client_id)
+            if row is None and order_id:
+                row = await self.raw.order_by_id(str(order_id))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[mexc] order_status(%s) failed: %s", symbol, exc)
+            return None
+        if not isinstance(row, dict):
+            return None
+        state = int(row.get("state", 0) or 0)
+        filled = float(row.get("dealVol") or 0.0)
+        total = float(row.get("vol") or 0.0)
+        # MEXC: 1 unplaced/trigger, 2 uncompleted, 3 completed, 4 canceled, 5 invalid
+        raw_status = {1: "OPEN", 2: "PARTIAL", 3: "FILLED", 4: "CANCELED", 5: "REJECTED"}.get(state, "")
+        return {
+            "status": normalize_order_status(filled_qty=filled, total_qty=total, raw_status=raw_status),
+            "filled_qty": filled,
+            "avg_price": float(row.get("dealAvgPrice") or row.get("price") or 0.0),
+            "raw": row,
+        }
+
+    async def open_protection(self, symbol: str, side: str = "") -> Optional[Dict[str, Any]]:
+        """Adopt existing protective legs instead of placing duplicates."""
+        out: Dict[str, Any] = {}
+        known = True
+        try:
+            rows = await self.raw.plan_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[mexc] open plan-order query failed for %s: %s", symbol, exc)
+            known = False
+            rows = []
+        for row in rows:
+            if int(row.get("state", 1) or 1) in (1, 2) and float(row.get("triggerPrice") or 0):
+                out["kind"] = "plan"
+                out["stop_order_id"] = str(row.get("id") or row.get("orderId") or "")
+                out["stop_price"] = float(row.get("triggerPrice") or 0)
+                break
+        try:
+            tpsl = await self.raw.tpsl_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[mexc] open tpsl query failed for %s: %s", symbol, exc)
+            known = False
+            tpsl = []
+        for row in tpsl:
+            if int(row.get("state", 1) or 1) != 1:
+                continue
+            stop = float(row.get("stopLossPrice") or 0)
+            tp = float(row.get("takeProfitPrice") or 0)
+            if stop or tp:
+                out.setdefault("kind", "attached")
+                out["tpsl_id"] = row.get("id")
+                out["entry_order_id"] = str(row.get("orderId") or "")
+                if stop:
+                    out["stop_price"] = stop
+                if tp:
+                    out["tp_price"] = tp
+                break
+        if not known and not out:
+            return None
+        return out
+
+    def normalize_order_push(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """MEXC order push -> {"client_id", "status", "filled_qty", "avg_price"}."""
+        if not isinstance(data, dict):
+            return None
+        client_id = str(data.get("externalOid") or "")
+        if not client_id:
+            return None
+        state = int(data.get("state", 0) or 0)
+        filled = float(data.get("dealVol") or 0.0)
+        total = float(data.get("vol") or 0.0)
+        raw_status = {1: "OPEN", 2: "PARTIAL", 3: "FILLED", 4: "CANCELED", 5: "REJECTED"}.get(state, "")
+        return {
+            "client_id": client_id,
+            "status": normalize_order_status(filled_qty=filled, total_qty=total, raw_status=raw_status),
+            "filled_qty": filled,
+            "avg_price": float(data.get("dealAvgPrice") or 0.0),
+            "order_id": str(data.get("orderId") or ""),
+            "raw": data,
+        }
 
     def diagnostics(self) -> Dict[str, Any]:
         data = dict(self.raw.diagnostics())

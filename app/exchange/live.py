@@ -98,8 +98,11 @@ class LiveBroker(Broker):
         self._cb_kline = on_kline
         self._cb_tick = on_tick
         self._cb_order = on_order
+        # NOTE: the stream must always keep pointing at the broker's normalizing
+        # handler — wiring the raw consumer callback straight into the socket
+        # would hand venue-specific payloads to the executor.
         if self.ws:
-            self.ws.on_order = on_order
+            self.ws.on_order = self._on_order_push
 
     def _on_kline(self, symbol: str, interval: str, candle: Candle, is_closed: bool) -> None:
         if self._cb_kline:
@@ -121,8 +124,16 @@ class LiveBroker(Broker):
             self._cb_tick(symbol, mark, bid, ask)
 
     def _on_order_push(self, data: Dict[str, Any]) -> None:
+        """Normalize the venue's private order push before it reaches the executor."""
+        normalized = None
+        try:
+            normalizer = getattr(self.client, "normalize_order_push", None)
+            if normalizer is not None:
+                normalized = normalizer(data)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[%s] order push normalize failed: %s", self.spec.id, exc)
         if self._cb_order:
-            self._cb_order(data)
+            self._cb_order(normalized or data)
 
     # ------------------------------------------------------------------ #
     #  market data
@@ -281,8 +292,14 @@ class LiveBroker(Broker):
     async def arm_protection(
         self, *, symbol: str, side: str, qty: float, sl_price: Optional[float],
         tp_price: Optional[float], entry_order_id: str = "",
+        adopt: bool = False,
     ) -> Dict[str, Any]:
-        """Create exchange-side protection when it was not attached at entry."""
+        """Create exchange-side protection when it was not attached at entry.
+
+        With ``adopt=True`` (restart / repair path) the exchange is queried
+        first: existing resting legs are *adopted* instead of duplicated, which
+        is what keeps a restart from stacking up stops and targets.
+        """
         handle: Dict[str, Any] = {
             "kind": "none", "entry_order_id": entry_order_id, "symbol": symbol, "side": side,
         }
@@ -292,6 +309,24 @@ class LiveBroker(Broker):
                 handle.update(found)
                 handle["side"] = side
                 return handle
+        if adopt:
+            try:
+                existing = await self.client.open_protection(symbol, side)
+            except Exception as exc:  # noqa: BLE001
+                existing = None
+                log.warning("[%s] protection lookup failed for %s: %s", self.spec.id, symbol, exc)
+            if existing:
+                adopted = dict(existing)
+                adopted.setdefault("kind", "plan")
+                adopted["side"] = side
+                adopted["adopted"] = True
+                if not adopted.get("stop_price") and sl_price:
+                    adopted["stop_price"] = sl_price
+                if not adopted.get("tp_price") and tp_price:
+                    adopted["tp_price"] = tp_price
+                log.info("[%s] adopted existing protection on %s (%s)",
+                         self.spec.id, symbol, adopted.get("kind"))
+                return adopted
 
         if sl_price:
             res = await self.client.stop_order(
@@ -331,21 +366,47 @@ class LiveBroker(Broker):
             return False
 
     async def release_stop(self, *, symbol: str, handle: Dict[str, Any]) -> bool:
-        """Remove exchange-side protection (used when the local watchdog already flattened)."""
-        kind = (handle or {}).get("kind")
-        try:
-            if kind == "attached" and handle.get("entry_order_id"):
-                return await self.client.modify_stop(
+        """Remove *all* exchange-side protection after the position is flat.
+
+        Every leg is cancelled independently and none of them short-circuits the
+        others: a resting reduce-only TP left behind would otherwise fire into the
+        *next* position opened on the same symbol.
+        """
+        handle = handle or {}
+        kind = handle.get("kind")
+        ok = False
+        if kind == "attached" and handle.get("entry_order_id"):
+            try:
+                ok = await self.client.modify_stop(
                     symbol, order_id=str(handle["entry_order_id"]), kind="attached",
                     new_price=0.0, qty=0.0, side=str(handle.get("side") or LONG), handle=handle,
-                )
-            if kind == "plan" and handle.get("stop_order_id"):
-                return await self.client.cancel_stop(symbol, order_id=str(handle["stop_order_id"]), kind="plan")
-            if handle.get("tp_order_id"):
-                return await self.client.cancel_order_ids(symbol, [str(handle["tp_order_id"])])
-        except Exception as exc:  # noqa: BLE001
-            log.debug("release_stop(%s) failed: %s", symbol, exc)
-        return False
+                ) or ok
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] could not clear attached stop on %s: %s", self.spec.id, symbol, exc)
+        elif handle.get("stop_order_id"):
+            stop_id = str(handle.get("stop_order_id"))
+            try:
+                if kind == "attached":
+                    ok = await self.client.modify_stop(
+                        symbol, order_id=stop_id, kind="attached", new_price=0.0, qty=0.0,
+                        side=str(handle.get("side") or LONG), handle=handle,
+                    ) or ok
+                else:
+                    ok = await self.client.cancel_stop(symbol, order_id=stop_id, kind="plan") or ok
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] could not cancel stop %s on %s: %s", self.spec.id, stop_id, symbol, exc)
+        elif handle.get("tpsl_id"):
+            stop_id = str(handle.get("tpsl_id"))
+            try:
+                ok = await self.client.cancel_stop(symbol, order_id=stop_id, kind="attached") or ok
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] could not cancel tpsl %s on %s: %s", self.spec.id, stop_id, symbol, exc)
+        if handle.get("tp_order_id"):
+            try:
+                ok = await self.client.cancel_order_ids(symbol, [str(handle["tp_order_id"])]) or ok
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] could not cancel resting TP on %s: %s", self.spec.id, symbol, exc)
+        return ok
 
     async def sync_time(self) -> None:
         await self.client.sync_time()

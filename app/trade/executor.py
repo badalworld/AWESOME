@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from ..exchange.base import DEFAULT_TAKER_FEE, LONG, ContractSpec, OrderResult, Position
+from ..exchange.venue import ORDER_FILLED, ORDER_PARTIAL
 from ..risk.manager import (
     RiskGuard,
     build_plan,
@@ -116,12 +117,25 @@ class Executor:
     #  order-push / fill plumbing
     # ------------------------------------------------------------------ #
     def notify_order_push(self, data: Dict[str, Any]) -> None:
-        """Called from the broker when the exchange pushes an order update."""
+        """Called from the broker when the exchange pushes an order update.
+
+        The broker normalizes every venue dialect into
+        ``{client_id, status, filled_qty, avg_price}`` before calling this, so the
+        executor never has to know which exchange produced the update.
+        """
         try:
-            ext = str(data.get("externalOid") or "")
+            if not isinstance(data, dict):
+                return
+            ext = str(data.get("client_id") or data.get("externalOid") or "")
+            if not ext:
+                return
             fut = self.pending_fills.get(ext)
             if fut and not fut.done():
-                fut.set_result(data)
+                status = str(data.get("status") or "")
+                if status == ORDER_FILLED:
+                    fut.set_result(data)
+                elif status in (ORDER_PARTIAL,) and data.get("filled_qty"):
+                    fut.set_result(data)      # partial: use what actually filled
         except Exception:  # noqa: BLE001
             pass
 
@@ -135,25 +149,24 @@ class Executor:
             self.pending_fills[external_oid] = fut
         try:
             deadline = time.monotonic() + timeout
+            client = getattr(self.broker, "client", None)
             while time.monotonic() < deadline:
                 wait_for = min(0.35, max(0.05, deadline - time.monotonic()))
                 try:
                     return await asyncio.wait_for(asyncio.shield(fut), timeout=wait_for)
                 except asyncio.TimeoutError:
                     pass
-                # REST backup (works even if the private WS is down)
-                try:
-                    if external_oid:
-                        order = await self.broker.client.order_by_external_id(symbol, external_oid) \
-                            if hasattr(self.broker, "client") else None
-                    else:
-                        order = None
-                    if order is None and order_id and hasattr(self.broker, "client"):
-                        order = await self.broker.client.order_by_id(order_id)
-                    if order and int(order.get("state", 0)) == 3:
-                        return order
-                except Exception:  # noqa: BLE001
-                    pass
+                # REST backup (works even if the private WS is down); the venue
+                # adapter normalizes its own dialect here.
+                if client is not None:
+                    try:
+                        info = await client.order_status(
+                            symbol, order_id=order_id or "", client_id=external_oid or "",
+                        )
+                        if info and info.get("status") in (ORDER_FILLED, ORDER_PARTIAL):
+                            return info
+                    except Exception:  # noqa: BLE001
+                        pass
                 await asyncio.sleep(0.08)
             return None
         finally:
@@ -234,13 +247,13 @@ class Executor:
 
             # 3) confirm fill
             fill = None
-            if result.status != "filled":
+            if str(result.status or "").lower() != ORDER_FILLED or not result.price:
                 fill = await self._await_fill(symbol, result.order_id or "", trade_uid)
             entry_price = plan.entry_price
             filled_qty = sizing.qty
             if fill:
-                entry_price = float(fill.get("dealAvgPrice") or fill.get("price") or entry_price)
-                filled_qty = float(fill.get("dealVol") or filled_qty) or filled_qty
+                entry_price = float(fill.get("avg_price") or entry_price) or entry_price
+                filled_qty = float(fill.get("filled_qty") or filled_qty) or filled_qty
             elif result.price:
                 entry_price = result.price
                 filled_qty = result.filled_vol or filled_qty
@@ -254,6 +267,11 @@ class Executor:
                 side=signal.side, entry_price=entry_price, atr=signal.atr,
                 sizing=sizing, contract_size=contract_size, cfg=cfg,
             )
+            # a partial fill must be risked (and protected) at its real size,
+            # never at the size we asked for
+            actual_notional = filled_qty * contract_size * entry_price
+            plan.margin_usd = actual_notional / max(1, leverage)
+            plan.notional_usd = actual_notional
 
             # 4) protection: attach-aware
             #    "attached" -> the entry order already carries SL/TP legs; we only
@@ -481,7 +499,7 @@ class Executor:
             latency = (time.perf_counter() - started) * 1000.0
             fallback_price = price or self._last_known_price(pos)
             if result.ok:
-                exit_price = result.price or fallback_price or pos.entry_price
+                exit_price = await self._confirm_exit_price(pos, result, fallback_price)
                 await self.broker.release_stop(symbol=pos.symbol, handle=pos.protection)
                 await self._record_order(pos.symbol, "close", pos.side, exit_price, pos.qty,
                                          result, latency, reason)
@@ -512,6 +530,31 @@ class Executor:
             return {}
         finally:
             self._closing.discard(pos.symbol)
+
+    async def _confirm_exit_price(self, pos: ManagedPosition, result: OrderResult,
+                                  fallback: Optional[float]) -> float:
+        """Real fill price of a close, or the best available estimate.
+
+        Booking a close at the *hint* price would silently fabricate P&L, so the
+        order is polled briefly when the venue's response does not carry a fill.
+        """
+        if result.price:
+            return result.price
+        client = getattr(self.broker, "client", None)
+        order_id = getattr(result, "order_id", None)
+        if client is not None and order_id:
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                try:
+                    info = await client.order_status(pos.symbol, order_id=str(order_id))
+                except Exception:  # noqa: BLE001
+                    info = None
+                if info and info.get("avg_price"):
+                    return float(info["avg_price"])
+                if info and info.get("status") in (ORDER_FILLED, ORDER_PARTIAL):
+                    break
+                await asyncio.sleep(0.15)
+        return fallback or self._estimate_exchange_exit(pos, fallback)
 
     def _last_known_price(self, pos: ManagedPosition) -> Optional[float]:
         return self.marks_cache.get(pos.symbol)
@@ -658,10 +701,17 @@ class Executor:
                 if exit_price:
                     pnl = (exit_price - row["entry_price"]) * row["qty"] * row.get("contract_size", 1) \
                         * (1 if row["side"] == LONG else -1)
+                try:
+                    meta = json.loads(row.get("meta") or "{}")
+                except Exception:  # noqa: BLE001
+                    meta = {}
+                meta["pnl_unknown"] = not bool(exit_price)
+                meta["closed_while_offline"] = True
                 await self.db.update_trade(row["id"], {
                     "status": "CLOSED", "closed_at": time.time(),
                     "exit_reason": "closed_while_offline", "realized_pnl": pnl,
                     "exit_price": exit_price or row["entry_price"],
+                    "meta": json.dumps(meta, default=str),
                 })
                 await self.db.kv_delete(self._state_key(symbol))
                 log.warning("trade %s (%s) was closed while the bot was offline", row["id"], symbol)
@@ -675,6 +725,7 @@ class Executor:
                     sl_price=managed.stop_price or managed.sl_price,
                     tp_price=managed.tp_price,
                     entry_order_id=managed.entry_order_id,
+                    adopt=True,
                 )
                 managed.protection = handle or managed.protection
             except Exception as exc:  # noqa: BLE001
@@ -718,6 +769,7 @@ class Executor:
             })
             handle = await self.broker.arm_protection(
                 symbol=symbol, side=live.side, qty=live.hold_vol, sl_price=sl, tp_price=tp,
+                adopt=True,
             )
             self.positions[symbol] = ManagedPosition(
                 trade_id=trade_id, trade_uid=uid, symbol=symbol, side=live.side,

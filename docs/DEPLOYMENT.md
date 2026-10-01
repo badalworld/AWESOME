@@ -15,7 +15,7 @@ git clone <your-repo> awesome && cd awesome
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp config.toml config.toml.bak      # keep the reference defaults
-python3 tests/run_all.py            # 98 tests must pass before you trust it
+python3 tests/run_all.py            # 122 tests must pass before you trust it
 python3 run.py --port 8080
 ```
 
@@ -102,8 +102,21 @@ journalctl -u awesome-bot -f
 | Restart engine | dashboard *Restart engine* (or `systemctl restart`) |
 | Reset paper account | dashboard Settings → *Reset paper account* |
 | Rotate API keys | dashboard Settings → *Clear*, then enter new keys, then *Test* |
+| Reset the dashboard token | clear the browser's `ao.token` (or change `web.api_token` and restart) |
 | Inspect why a trade was skipped | Signals tab (stores the full rejection list) |
 | Tune parameters | Settings tab (validated, hot-applied, persisted) |
+
+## 6b. Hardening checklist (from the 2026-10 audit)
+
+| Item | Why | Where |
+|---|---|---|
+| Set `web.api_token` | live start is **refused** without it while the dashboard is bound to a public address; with it, every REST call needs `X-API-Token` and the WS needs `?token=` (the dashboard asks once) | `config.toml` → `[web]` |
+| IP-restrict the API keys | a leaked key can then only be used from your VPS | venue key settings |
+| Keep the halts on | 40 % drawdown / 25 % daily loss are the only thing between a bad day and a blown account | `[risk]` |
+| Expect affordability rejections on a small book | the venue's smallest order can exceed 8 % of a $20 account; such symbols are filtered out of the universe and rejected with a reason in the Signals tab | `universe.only_affordable_orders` |
+| Never run two instances on one account | both would manage the same positions | — |
+
+See [`AUDIT_2026-10.md`](AUDIT_2026-10.md) for the full findings list.
 
 ## 7. Known limitations
 

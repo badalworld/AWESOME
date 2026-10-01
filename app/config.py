@@ -116,6 +116,7 @@ VALIDATORS: Dict[str, Any] = {
     "universe.min_max_leverage": _num(1, 200),
     "universe.blacklist": ("list",),
     "universe.whitelist": ("list",),
+    "universe.only_affordable_orders": ("bool",),
     # target
     "target.equity_target": _num(10, 1_000_000_000),
     "target.days": _num(1, 365),
@@ -124,6 +125,8 @@ VALIDATORS: Dict[str, Any] = {
     # web
     "web.port": _num(1, 65535),
     "web.api_token": ("str",),
+    "web.allow_insecure_live": ("bool",),
+    "web.host": ("str",),
     "persistence.equity_snapshot_sec": _num(5, 3600),
 }
 

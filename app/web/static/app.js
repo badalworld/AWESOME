@@ -20,7 +20,16 @@ const state = {
   credVenue: null,       // venue being edited in the credentials card
   venueScope: false,     // write config as venues.<id>.* overrides
   ws: null,
+  token: localStorage.getItem('ao.token') || '',   // web.api_token (if configured)
+  health: null,
 };
+
+/** Remember the dashboard token (asked once, then reused for REST + WS). */
+function setToken(token) {
+  state.token = token || '';
+  if (state.token) localStorage.setItem('ao.token', state.token);
+  else localStorage.removeItem('ao.token');
+}
 
 /* ------------------------------ venues ------------------------------ */
 function venueById(id) { return state.venues.find(v => v.id === id) || { id, label: id, needs_passphrase: false }; }
@@ -64,6 +73,28 @@ async function pollVenues() {
     renderVenueTabs();
     renderVenueBar();
   } catch (e) { /* keep last known */ }
+  try {
+    state.health = await api('/api/health');
+    renderSafetyBanner();
+  } catch (e) { /* keep last known */ }
+}
+
+/** Loud banner when real money is armed behind an unauthenticated dashboard. */
+function renderSafetyBanner() {
+  const host = $('#safetyBanner');
+  if (!host) return;
+  const h = state.health || {};
+  const live = (h.live_venues || []);
+  const msgs = [];
+  if (h.insecure_live) {
+    msgs.push(`⚠️ LIVE trading is armed on ${live.join(', ')} while this dashboard has no API token ` +
+              `— anyone who can reach this port can trade the account. Set <code>web.api_token</code>.`);
+  }
+  if (live.length && h.auth_required) {
+    msgs.push(`LIVE on ${live.join(', ')} — orders are real money.`);
+  }
+  host.innerHTML = msgs.map(m => `<div class="safety-banner">${m}</div>`).join('');
+  host.classList.toggle('hidden', msgs.length === 0);
 }
 
 function renderVenueBar() {
@@ -136,11 +167,17 @@ function toast(msg, kind = '', ms = 4200) {
   el._t = setTimeout(() => el.classList.add('hidden'), ms);
 }
 
-async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  });
+async function api(path, opts = {}, retry = true) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (state.token) headers['X-API-Token'] = state.token;
+  const res = await fetch(path, { headers, ...opts });
+  if (res.status === 401 && retry) {
+    const entered = prompt('This dashboard requires an API token (web.api_token):', state.token || '');
+    if (entered !== null) {
+      setToken(entered.trim());
+      return api(path, opts, false);
+    }
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail || detail; } catch (e) {}
@@ -845,7 +882,8 @@ function renderAll(payload) {
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const venue = state.venue;
-  const ws = new WebSocket(`${proto}://${location.host}/ws/${venue}`);
+  const q = state.token ? `?token=${encodeURIComponent(state.token)}` : '';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/${venue}${q}`);
   state.ws = ws;
   let alive = false;
   ws.onopen = () => { alive = true; };

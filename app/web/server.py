@@ -34,13 +34,18 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
     app = FastAPI(title="AO Divergence Multi-Venue Futures Bot", version="2.0.0", docs_url="/api/docs")
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[str(o) for o in (cfg.get("web.allow_origins", "*"),)],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # The dashboard is same-origin, so CORS is off by default. A wildcard with
+    # credentials is both invalid per spec and a needless attack surface for a
+    # control panel that can place orders; list explicit origins to enable it.
+    _origins = [str(o) for o in (cfg.get("web.allow_origins", "") or "").split(",") if str(o).strip()]
+    if _origins and "*" not in _origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     # ------------------------------------------------------------------ #
     #  helpers
@@ -88,6 +93,7 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
     # ------------------------------------------------------------------ #
     @app.get("/api/health")
     async def health() -> Dict[str, Any]:
+        live_venues = [c.id for c in manager.all() if c.cfg.mode == "live" and c.enabled]
         return {
             "ok": True,
             "venues": [
@@ -95,6 +101,10 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
                 for c in manager.all()
             ],
             "primary": manager.primary.id,
+            "auth_required": bool(str(cfg.get("web.api_token", "") or "")),
+            "live_venues": live_venues,
+            "insecure_live": bool(live_venues) and not bool(str(cfg.get("web.api_token", "") or ""))
+            and not bool(cfg.get("web.allow_insecure_live", False)),
             "ts": time.time(),
         }
 
@@ -301,6 +311,10 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
         broker._protection.clear()
         await ctx.db.kv_set_json("paper.equity", equity)
         await ctx.db.exec("DELETE FROM trades WHERE status='OPEN'")
+        # a deliberate balance change must re-anchor the risk baselines, otherwise
+        # shrinking the book reads as a catastrophic drawdown and halts trading
+        if ctx.engine.guard is not None:
+            await ctx.engine.guard.rebaseline(equity)
         return {"reset": True, "equity": equity, "venue": ctx.id}
 
     # ------------------------------------------------------------------ #
@@ -340,6 +354,13 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
     # ------------------------------------------------------------------ #
     async def ws_endpoint(websocket: WebSocket, venue: Optional[str] = None) -> None:
         await websocket.accept()
+        token = str(cfg.get("web.api_token", "") or "")
+        if token:
+            provided = (websocket.query_params.get("token")
+                        or websocket.headers.get("x-api-token") or "")
+            if provided != token:
+                await websocket.close(code=1008, reason="invalid or missing API token")
+                return
         try:
             ctx = _ctx(venue or websocket.query_params.get("venue"))
         except HTTPException:

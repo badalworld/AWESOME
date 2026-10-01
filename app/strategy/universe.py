@@ -103,6 +103,20 @@ class UniverseScanner:
         candidates: List[UniverseEntry] = []
         rejected: List[Dict[str, Any]] = []
 
+        # Small accounts: a symbol whose *smallest possible order* is bigger than
+        # the per-trade budget can never be traded — drop it from the watchlist
+        # instead of letting the executor reject every signal for it.
+        affordable_notional = 0.0
+        if bool(ucfg.get("only_affordable_orders", True)):
+            try:
+                account = await self.broker.account()
+                equity = float(getattr(account, "equity", 0.0) or 0.0)
+                pct = float(self.cfg.get("risk.equity_per_trade_pct", 8.0))
+                lev = float(self.cfg.get("risk.leverage", 10))
+                affordable_notional = equity * pct / 100.0 * lev * 1.30
+            except Exception:  # noqa: BLE001
+                affordable_notional = 0.0
+
         for symbol, spec in contracts.items():
             tk = tickers.get(symbol)
             if tk is None or tk.last <= 0:
@@ -133,6 +147,16 @@ class UniverseScanner:
             if tk.spread_bps > 60:      # absolute sanity cap, real gate later
                 rejected.append({"symbol": symbol, "reason": f"spread {tk.spread_bps:.1f}bps"})
                 continue
+            if affordable_notional > 0:
+                min_order_notional = float(spec.min_vol or 1.0) * spec.contract_size * tk.last
+                if min_order_notional > affordable_notional:
+                    rejected.append({
+                        "symbol": symbol,
+                        "reason": (f"minimum order {spec.min_vol:g} contracts ≈ "
+                                   f"${min_order_notional:,.0f} notional > per-trade budget "
+                                   f"${affordable_notional:,.0f}"),
+                    })
+                    continue
 
             range24 = safe_div(tk.high24 - tk.low24, tk.last, 0.0) * 100.0
             oi_usd = tk.hold_vol * spec.contract_size * tk.last

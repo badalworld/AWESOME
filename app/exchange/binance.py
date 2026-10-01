@@ -54,6 +54,7 @@ from .venue import (
     VenueSpec,
     VenueStream,
     hmac_sha256_hex,
+    normalize_order_status,
 )
 
 log = logging.getLogger("binance")
@@ -408,7 +409,7 @@ class BinanceClient(BaseHTTPVenueClient):
             ok=True,
             order_id=str(payload.get("orderId")) if payload.get("orderId") else None,
             price=avg, filled_vol=filled,
-            status=str(payload.get("status") or "submitted"),
+            status=str(payload.get("status") or "submitted").lower(),
             latency_ms=latency,
             raw={"request": body, "response": payload},
         )
@@ -514,6 +515,81 @@ class BinanceClient(BaseHTTPVenueClient):
         except Exception as exc:  # noqa: BLE001
             log.warning("[binance] cancel %s on %s failed: %s", order_ids, symbol, exc)
             return False
+
+    def normalize_order_push(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """ORDER_TRADE_UPDATE -> canonical order update."""
+        if not isinstance(data, dict):
+            return None
+        order = data.get("o") if isinstance(data.get("o"), dict) else data
+        client_id = str(order.get("c") or order.get("clientOrderId") or "")
+        if not client_id:
+            return None
+        filled = float(order.get("z") or order.get("cumQty") or 0.0)
+        total = float(order.get("q") or order.get("origQty") or 0.0)
+        return {
+            "client_id": client_id,
+            "status": normalize_order_status(filled_qty=filled, total_qty=total,
+                                             raw_status=str(order.get("X") or order.get("status") or "")),
+            "filled_qty": filled,
+            "avg_price": float(order.get("ap") or order.get("avgPrice") or 0.0),
+            "order_id": str(order.get("i") or order.get("orderId") or ""),
+            "raw": data,
+        }
+
+    async def order_status(self, symbol: str, *, order_id: str = "",
+                           client_id: str = "") -> Optional[Dict[str, Any]]:
+        """Binance dialect: ``status`` + ``executedQty`` + ``avgPrice``."""
+        params: Dict[str, Any] = {"symbol": symbol}
+        if order_id:
+            params["orderId"] = order_id
+        elif client_id:
+            params["origClientOrderId"] = client_id
+        else:
+            return None
+        try:
+            row = await self._request("GET", "/fapi/v1/order", params=params, signed=True, lane="query")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[binance] order_status(%s) failed: %s", symbol, exc)
+            return None
+        if not isinstance(row, dict):
+            return None
+        filled = float(row.get("executedQty") or 0.0)
+        total = float(row.get("origQty") or 0.0)
+        return {
+            "status": normalize_order_status(filled_qty=filled, total_qty=total,
+                                             raw_status=str(row.get("status") or "")),
+            "filled_qty": filled,
+            "avg_price": float(row.get("avgPrice") or 0.0),
+            "raw": row,
+        }
+
+    async def open_protection(self, symbol: str, side: str = "") -> Optional[Dict[str, Any]]:
+        """Adopt resting STOP_MARKET/TAKE_PROFIT legs instead of duplicating them."""
+        try:
+            rows = await self.open_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[binance] open-order query failed for %s: %s", symbol, exc)
+            return None
+        out: Dict[str, Any] = {}
+        for row in rows or []:
+            otype = str(row.get("type") or "").upper()
+            price = float(row.get("stopPrice") or 0.0)
+            if otype.startswith("STOP") or otype == "TRAILING_STOP_MARKET":
+                if price or row.get("closePosition"):
+                    out.setdefault("kind", "plan")
+                    out["stop_order_id"] = str(row.get("orderId") or "")
+                    out["stop_price"] = price
+            elif otype.startswith("TAKE_PROFIT"):
+                out.setdefault("kind", "plan")
+                out["tp_order_id"] = str(row.get("orderId") or "")
+                out["tp_price"] = price
+            elif otype == "LIMIT" and (row.get("reduceOnly") is True):
+                tp = float(row.get("price") or 0.0)
+                if tp:
+                    out.setdefault("kind", "plan")
+                    out["tp_order_id"] = str(row.get("orderId") or "")
+                    out["tp_price"] = tp
+        return out
 
     async def open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         params = {"symbol": symbol} if symbol else None

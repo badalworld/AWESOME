@@ -110,6 +110,8 @@ class TradingEngine:
             return
         cfg = self.cfg
         log.info("engine starting in %s mode", cfg.mode)
+        self._tick_pending.clear()
+        self._tick_busy.clear()
         await self._build_broker()
 
         self.guard = RiskGuard(cfg, self.db)
@@ -167,6 +169,7 @@ class TradingEngine:
         have_creds = bool(creds and creds.complete(spec.needs_passphrase))
 
         if mode == "live":
+            self._assert_live_safety()
             if not have_creds:
                 raise RuntimeError(
                     f"Live mode on {spec.label} requires API credentials. Open the dashboard -> "
@@ -244,6 +247,27 @@ class TradingEngine:
         if stored_equity:
             self.broker.starting_equity = float(stored_equity)
             log.info("[%s] paper equity restored: $%.2f", spec.id, self.broker.starting_equity)
+
+    def _assert_live_safety(self) -> None:
+        """Refuse to arm real money behind an unauthenticated dashboard.
+
+        Live trading with an API token-less control panel that listens on a
+        non-loopback address means anyone who can reach the port can flatten the
+        account. That combination is blocked unless the operator explicitly opts
+        out with ``web.allow_insecure_live = true``.
+        """
+        token = str(self.cfg.get("web.api_token", "") or "")
+        host = str(self.cfg.get("web.host", "0.0.0.0") or "0.0.0.0").strip().lower()
+        allow = bool(self.cfg.get("web.allow_insecure_live", False))
+        local_only = host in ("127.0.0.1", "localhost", "::1")
+        if not token and not local_only and not allow:
+            raise RuntimeError(
+                f"Refusing to start {self.spec.label} in LIVE mode: the dashboard has no "
+                f"web.api_token and is bound to {host}, so anyone who can reach the port could "
+                "trade your account. Set web.api_token (recommended), or bind the dashboard to "
+                "127.0.0.1 behind an authenticated reverse proxy, or set "
+                "web.allow_insecure_live = true to override."
+            )
 
     # -- venue factories ------------------------------------------------- #
     def _make_client(self, rest_base: str, api_key, api_secret, passphrase):

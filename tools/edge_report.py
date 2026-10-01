@@ -5,8 +5,10 @@ Runs Monte-Carlo projections with the repository's own analytics engine
 (``app/analytics/compound.py``) under several assumptions about the per-trade
 ROI distribution, and writes ``docs/EDGE_AND_EXPECTANCY.md``.
 
-    python3 tools/edge_report.py            # write the markdown report
-    python3 tools/edge_report.py --print    # also dump the raw numbers
+    python3 tools/edge_report.py                      # write the markdown report
+    python3 tools/edge_report.py --print               # also dump the raw numbers
+    python3 tools/edge_report.py --start 20            # small-account scenario
+    python3 tools/edge_report.py --start 20 --target 60 --days 30
 
 The *parametric* model is the one the dashboard uses (winner -> TP, loser -> SL).
 The *trailing-realistic* model is the honest one for this strategy: most winners
@@ -26,7 +28,7 @@ import math
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -91,8 +93,9 @@ def trailing_realistic_rois(win_rate: float, sl_roi: float, n: int = 400,
 
 
 def bootstrap(rois: Sequence[float], fee_margin_pct: float, trades: int = 56,
-              runs: int = RUNS, seed: int = SEED, start: float = START_EQUITY) -> Dict[str, float]:
+              runs: int = RUNS, seed: int = SEED, start: Optional[float] = None) -> Dict[str, float]:
     """Compound ``trades`` sampled ROIs on 8 %-of-equity margin; equity floor 20 %."""
+    start = START_EQUITY if start is None else start      # read at call time, not import time
     rnd = random.Random(seed)
     finals: List[float] = []
     up = 0
@@ -161,6 +164,41 @@ def breakeven_win_rate_realistic(sl_roi: float, fee: float, tp_roi: float = TP_R
 #  Report
 # --------------------------------------------------------------------------- #
 
+def growth_ladder(start: float, win_rate: float = 0.45, sl_roi: float = SL_ROI_TYPICAL,
+                  trades_per_day: float = TRADES_PER_DAY) -> List[Dict[str, float]]:
+    """Median/percentile outcome for several horizons and targets.
+
+    Answers the only question that matters for a small account: *what can this
+    actually turn into?*
+    """
+    rois = trailing_realistic_rois(win_rate, sl_roi)
+    rows: List[Dict[str, float]] = []
+    for days, target in ((7, start * 1.5), (30, start * 3.0), (90, start * 6.0),
+                         (30, 1_000.0), (90, 10_000.0), (365, 10_000.0)):
+        trades = int(round(trades_per_day * days))
+        res = bootstrap(rois, FEE_MARGIN_PCT["MEXC"], trades=trades, start=start)
+        rows.append({
+            "days": days, "target": target, "trades": trades,
+            **{k: v for k, v in res.items() if k != "prob_ruin_pct"},
+            "p_reach_target_pct": _p_reach(start, target, rois, trades),
+        })
+    return rows
+
+
+def _p_reach(start: float, target: float, rois: Sequence[float], trades: int,
+             runs: int = 4000, seed: int = SEED) -> float:
+    rnd = random.Random(seed)
+    hit = 0
+    for _ in range(runs):
+        eq = start
+        for _ in range(trades):
+            eq *= 1.0 + (EQUITY_PCT / 100.0) * ((rnd.choice(rois) - FEE_MARGIN_PCT["MEXC"]) / 100.0)
+            if eq >= target:
+                hit += 1
+                break
+    return round(100.0 * hit / runs, 2)
+
+
 def build() -> Dict[str, object]:
     parametric = {}
     for wr in WIN_RATES:
@@ -225,6 +263,8 @@ def build() -> Dict[str, object]:
         },
         "target_math": {
             "required_daily_growth_pct": round(daily_required(required_daily), 2),
+            "required_multiple": round(TARGET_EQUITY / START_EQUITY, 1),
+            "growth_ladder": None,
             "equity_gain_per_tp_pct": per_tp_gain,
             "equity_loss_per_sl_pct": round(-EQUITY_PCT * SL_ROI_TYPICAL / 100.0, 2),
             "clean_tp_hits_needed": round(n_tp, 1),
@@ -257,7 +297,13 @@ def render(data: Dict[str, object]) -> str:
     add("")
     add("## 1. The target, in arithmetic")
     add("")
-    add(f"* $1,000 → $10,000 in 7 days = **{tm['required_daily_growth_pct']:.1f} %/day** compounded.")
+    add(f"* ${a['start_equity']:,.0f} → ${a['target_equity']:,.0f} in {a['days']:g} days = "
+        f"**{tm['required_daily_growth_pct']:.1f} %/day** compounded "
+        f"({tm['required_multiple']:.0f}x total).")
+    if tm["required_daily_growth_pct"] > 25:
+        add(f"* ⚠️ Anything above ~10 %/day *sustained* is outside what a 5m divergence strategy can "
+            f"produce; +{tm['required_daily_growth_pct']:.0f} %/day means the plan itself is the "
+            f"problem, not the settings.")
     add(f"* One full take-profit at +{a['tp_roi_pct']:.0f} % ROI on {a['equity_pct_per_trade']:.0f} % "
         f"margin at {a['leverage']}x = **+{tm['equity_gain_per_tp_pct']:.1f} % equity**.")
     add(f"* A stopped-out trade at ~{a['sl_roi_typical_pct']:.0f} % ROI = "
@@ -265,6 +311,24 @@ def render(data: Dict[str, object]) -> str:
         "~10x, plus slippage/fees).")
     add(f"* So the target needs **≈ {tm['clean_tp_hits_needed']:.0f} clean TP hits in a row with zero "
         "losses**, or a far larger number of trailing-stop wins.")
+    add("")
+    add("### What a small account can realistically do")
+    add("")
+    add("| Horizon | Trades | Target | P(reach target) | Median equity | P(profit) | 5th pct | 95th pct |")
+    add("|---|---|---|---|---|---|---|---|")
+    for row in tm["growth_ladder"]:              # type: ignore[index]
+        add(f"| {row['days']} d | {row['trades']} | ${row['target']:,.0f} | "
+            f"**{row['p_reach_target_pct']:.1f} %** | ${row['median']:,.2f} | "
+            f"{row['prob_profit_pct']:.0f} % | ${row['p05']:,.2f} | ${row['p95']:,.2f} |")
+    add("")
+    add("_Model: 45 % post-ladder win rate, 8 trades/day, 8 % margin at 10x, MEXC fees, and the "
+        "same trailing-realistic ROI distribution as section 3 (position-concurrency limits are "
+        "not modelled — with $20 the guard caps you at ~10 concurrent trades anyway)._")
+    add("")
+    add("Read it as: the strategy can compound a small account, slowly, with a real chance of the "
+        "account going nowhere or down over short windows. It cannot turn $20 into $10,000 in a "
+        "week — no settings, no leverage and no bot can, because that requires the market to hand "
+        "you a 500x in 7 days.")
     add("")
     add("### What a trailing-stop win is actually worth")
     add("")
@@ -334,12 +398,14 @@ def render(data: Dict[str, object]) -> str:
         f"**{breakeven['sl45|MEXC']:.1f} % (MEXC, ~45 % ROI stop)**, right at the top of the "
         "plausible band for 5m divergence entries: every filter you keep enabled is what buys the "
         "few points of win rate above break-even.")
-    add("2. **$1,000 → $10,000 in 7 days is not a realistic plan.** It needs +39 %/day, which "
-        "requires either a >100 % win rate under trailing-realistic exits or ~16 consecutive clean "
-        "TP hits with no losses; the honest probability is **well under 1 %**, and even the "
-        "parametric model only reaches double digits if you assume a 40–45 % win rate with the full "
-        "+200 % TP filling on almost every winner. Treat the 7-day target as a stress metric, not a "
-        "goal; the compound calculator in the dashboard is there to show exactly this.")
+    add(f"2. **${a['start_equity']:,.0f} → ${a['target_equity']:,.0f} in {a['days']:g} days is not a "
+        f"realistic plan.** It needs +{tm['required_daily_growth_pct']:.0f} %/day "
+        f"({tm['required_multiple']:.0f}x in {a['days']:g} days), which requires either a >100 % win "
+        f"rate under trailing-realistic exits or ~{tm['clean_tp_hits_needed']:.0f} consecutive clean "
+        "TP hits with no losses; the honest probability is **under 1 %**, and the parametric "
+        "reaches double digits only if you assume a 40–45 % win rate with the full +200 % TP filling "
+        "on almost every winner. Treat that target as a stress metric, not a goal — the growth "
+        "ladder in section 1 shows what the same edge does over 7/30/90/365 days instead.")
     add("3. **The real lever is how much of each winner you capture** — i.e. the trailing geometry. "
         "Wider trail steps move break-even down by 8–17 points (table above). The +200 % fixed TP is "
         "nearly irrelevant under the ladder because almost nothing survives that far, so do not "
@@ -361,10 +427,11 @@ def render(data: Dict[str, object]) -> str:
     add("| P(trade booked positive **after** the ladder) | ~45–55 % | any trade that prints +30 % ROI "
         "then retraces is closed at ≥ +20 % ROI, so the ladder converts some \"would-be losers\" "
         "into small winners |")
-    add("| P(profitable after 50–60 trades) | ~50–60 % | section 3 — and only if the live win rate "
-        "lands at or above the break-even line |")
-    add("| P(10× in 7 days) | **< 1 %** (≈0 % under trailing-realistic exits) | sections 2–3; "
-        "requires ~16 clean TP hits or a >100 % win rate |")
+    add(f"| P(profitable after 50–60 trades) | ~50–60 % | section 3 — and only if the live win rate "
+        f"lands at or above the {breakeven['sl45|MEXC']:.0f} % break-even line |")
+    add(f"| P({tm['required_multiple']:.0f}x in {a['days']:g} days) | **< 1 %** (≈0 % under "
+        f"trailing-realistic exits) | sections 2–3; requires ~{tm['clean_tp_hits_needed']:.0f} clean "
+        "TP hits or a >100 % win rate |")
     add("")
     add("> These are model outputs from the assumptions above, not measurements of your account. "
         "The only numbers worth trusting are the ones your own trades produce: run the bot in "
@@ -376,12 +443,18 @@ def render(data: Dict[str, object]) -> str:
 
 
 def main() -> int:
+    global START_EQUITY, TARGET_EQUITY, DAYS
     ap = argparse.ArgumentParser(description="Expectancy report for the AO bot")
     ap.add_argument("--print", action="store_true", help="also print the raw JSON")
+    ap.add_argument("--start", type=float, default=START_EQUITY, help="starting equity ($)")
+    ap.add_argument("--target", type=float, default=TARGET_EQUITY, help="target equity ($)")
+    ap.add_argument("--days", type=float, default=DAYS, help="horizon in days")
     ap.add_argument("--out", default=str(ROOT / "docs" / "EDGE_AND_EXPECTANCY.md"))
     args = ap.parse_args()
 
+    START_EQUITY, TARGET_EQUITY, DAYS = args.start, args.target, args.days
     data = build()
+    data["target_math"]["growth_ladder"] = growth_ladder(START_EQUITY)   # type: ignore[index]
     md = render(data)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

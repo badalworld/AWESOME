@@ -510,7 +510,7 @@ class PaperBroker(Broker):
     # -- protection ----------------------------------------------------- #
     async def arm_protection(
         self, *, symbol: str, side: str, qty: float, sl_price: Optional[float],
-        tp_price: Optional[float], entry_order_id: str = "",
+        tp_price: Optional[float], entry_order_id: str = "", adopt: bool = False,
     ) -> Dict[str, Any]:
         handle = self._protection.get(symbol) or {"kind": "paper", "symbol": symbol}
         if sl_price is not None:

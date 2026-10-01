@@ -57,6 +57,7 @@ from .venue import (
     BaseHTTPVenueClient,
     VenueStream,
     hmac_sha256_b64,
+    normalize_order_status,
 )
 
 log = logging.getLogger("kucoin")
@@ -381,10 +382,118 @@ class KuCoinClient(BaseHTTPVenueClient):
         order_id = None
         if isinstance(data, dict):
             order_id = data.get("orderId") or data.get("id")
-        return OrderResult(
+        result = OrderResult(
             ok=True, order_id=str(order_id) if order_id else None,
             latency_ms=latency, status="submitted", raw={"request": body, "response": data},
         )
+        # KuCoin answers a placement with just the id: pull the fill so the
+        # executor books the *real* price instead of the pre-trade hint.
+        wants_fill = str(body.get("type") or "").lower() == "market" and "stop" not in body
+        if order_id and wants_fill:
+            fill = await self._poll_fill(str(order_id), client_id=str(body.get("clientOid") or ""))
+            if fill:
+                result.filled_vol = float(fill.get("filled_qty") or 0.0)
+                result.price = float(fill.get("avg_price") or 0.0)
+                result.status = str(fill.get("status") or "open")
+        return result
+
+    async def _poll_fill(self, order_id: str, *, client_id: str = "", tries: int = 4,
+                         delay: float = 0.25) -> Optional[Dict[str, Any]]:
+        """Short poll for a fresh order's fill state (market orders fill instantly)."""
+        for attempt in range(max(1, tries)):
+            info = await self.order_status("", order_id=order_id, client_id=client_id)
+            if info and (info.get("filled_qty") or info.get("status") in ("filled", "canceled")):
+                return info
+            if attempt + 1 < tries:
+                await asyncio.sleep(delay)
+        return None
+
+    def normalize_order_push(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """/contractMarket/tradeOrders -> canonical order update."""
+        if not isinstance(data, dict):
+            return None
+        client_id = str(data.get("clientOid") or "")
+        if not client_id:
+            return None
+        filled = float(data.get("dealSize") or data.get("filledSize") or 0.0)
+        total = float(data.get("size") or 0.0)
+        return {
+            "client_id": client_id,
+            "status": normalize_order_status(filled_qty=filled, total_qty=total,
+                                             raw_status=str(data.get("status") or "")),
+            "filled_qty": filled,
+            "avg_price": float(data.get("avgDealPrice") or data.get("avgPrice") or 0.0),
+            "order_id": str(data.get("orderId") or ""),
+            "raw": data,
+        }
+
+    async def order_status(self, symbol: str, *, order_id: str = "",
+                           client_id: str = "") -> Optional[Dict[str, Any]]:
+        """KuCoin dialect: ``isActive``/``dealSize``/``avgDealPrice``."""
+        try:
+            if order_id:
+                row = await self._request("GET", f"/api/v1/orders/{order_id}", signed=True, lane="query")
+            elif client_id:
+                row = await self._request("GET", "/api/v1/orders/byClientOid",
+                                          params={"clientOid": client_id}, signed=True, lane="query")
+            else:
+                return None
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[kucoin] order_status(%s) failed: %s", order_id or client_id, exc)
+            return None
+        if not isinstance(row, dict):
+            return None
+        filled = float(row.get("dealSize") or row.get("filledSize") or 0.0)
+        total = float(row.get("size") or 0.0)
+        is_active = row.get("isActive")
+        return {
+            "status": normalize_order_status(
+                filled_qty=filled, total_qty=total, raw_status=str(row.get("status") or ""),
+                is_active=bool(is_active) if is_active is not None else None,
+                canceled=bool(row.get("cancelExist")),
+            ),
+            "filled_qty": filled,
+            "avg_price": float(row.get("avgDealPrice") or 0.0),
+            "raw": row,
+        }
+
+    async def open_protection(self, symbol: str, side: str = "") -> Optional[Dict[str, Any]]:
+        """Adopt resting stop / reduce-only limit legs instead of duplicating them."""
+        out: Dict[str, Any] = {}
+        known = True
+        try:
+            stops = await self.stop_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[kucoin] stop-order query failed for %s: %s", symbol, exc)
+            known = False
+            stops = []
+        for row in stops or []:
+            if str(row.get("status") or "").lower() in ("done", "cancelled", "canceled"):
+                continue
+            price = float(row.get("stopPrice") or 0.0)
+            if price:
+                out.setdefault("kind", "plan")
+                out["stop_order_id"] = str(row.get("id") or "")
+                out["stop_price"] = price
+                break
+        try:
+            open_orders = await self.open_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[kucoin] open-order query failed for %s: %s", symbol, exc)
+            known = False
+            open_orders = []
+        for row in open_orders or []:
+            if not row.get("reduceOnly"):
+                continue
+            price = float(row.get("price") or 0.0)
+            if price:
+                out.setdefault("kind", "plan")
+                out["tp_order_id"] = str(row.get("id") or "")
+                out["tp_price"] = price
+                break
+        if not known and not out:
+            return None
+        return out
 
     def _side(self, side: str, reduce_only: bool) -> str:
         is_long = side == LONG

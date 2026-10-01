@@ -170,6 +170,39 @@ def style_base(style: str, symbol: str) -> str:
     return s.split("USDT")[0]
 
 
+# Canonical order states.  Venues map their own dialect onto these.
+ORDER_FILLED = "filled"
+ORDER_PARTIAL = "partial"
+ORDER_OPEN = "open"
+ORDER_CANCELED = "canceled"
+ORDER_REJECTED = "rejected"
+ORDER_UNKNOWN = "unknown"
+
+
+def normalize_order_status(*, filled_qty: float, total_qty: float = 0.0,
+                           raw_status: str = "", is_active: Optional[bool] = None,
+                           canceled: bool = False) -> str:
+    """Collapse a venue-specific order state into the canonical vocabulary."""
+    state = (raw_status or "").strip().upper()
+    if state in ("FILLED", "FULLY_FILLED", "DEAL", "SETTLED", "COMPLETED", "DONE", "SUCCESS"):
+        return ORDER_FILLED
+    if state in ("CANCELED", "CANCELLED", "PARTIALLY_FILLED_CANCELED", "EXPIRED"):
+        return ORDER_CANCELED
+    if state in ("REJECTED", "FAILED", "ERROR"):
+        return ORDER_REJECTED
+    if total_qty and filled_qty:
+        if filled_qty >= total_qty * 0.999:
+            return ORDER_FILLED
+        return ORDER_PARTIAL
+    if canceled:
+        return ORDER_CANCELED
+    if is_active is False and filled_qty:
+        return ORDER_FILLED
+    if is_active is True:
+        return ORDER_OPEN
+    return ORDER_UNKNOWN
+
+
 class CredentialsRequired(PermissionError):
     """Raised when a signed endpoint is called without usable credentials."""
 
@@ -273,6 +306,31 @@ class VenueClient(ABC):
 
     @abstractmethod
     async def cancel_stop(self, symbol: str, *, order_id: str, kind: str) -> bool: ...
+
+    @abstractmethod
+    async def order_status(self, symbol: str, *, order_id: str = "",
+                           client_id: str = "") -> Optional[Dict[str, Any]]:
+        """Look an order up and return a *normalized* fill report::
+
+            {"status": "filled"|"partial"|"open"|"canceled"|"rejected"|"unknown",
+             "filled_qty": float, "avg_price": float, "raw": {...}}
+
+        Every venue speaks a different dialect here (MEXC ``state`` 1..5,
+        Binance ``status``/``executedQty``/``avgPrice``, KuCoin ``isActive``/
+        ``dealSize``/``avgDealPrice``) — the executor only ever sees this shape,
+        which is what keeps the money path identical on all three exchanges.
+        ``None`` means "could not be determined".
+        """
+
+    @abstractmethod
+    async def open_protection(self, symbol: str, side: str = "") -> Optional[Dict[str, Any]]:
+        """Existing resting protective orders for ``symbol``, or an empty dict.
+
+        Returns ``{"kind", "stop_order_id", "stop_price", "tp_order_id",
+        "tp_price"}`` when the venue reports them, ``{}`` when it answered and
+        there are none, and ``None`` when the query failed (unknown state).
+        Used to *adopt* protection after a restart instead of duplicating it.
+        """
 
     async def cancel_order_ids(self, symbol: str, order_ids: List[str]) -> bool:
         return False
@@ -552,6 +610,8 @@ def dumps_compact(body: Dict[str, Any]) -> str:
 
 
 __all__ = [
+    "normalize_order_status",
+    "ORDER_FILLED",
     "HEDGE", "ONEWAY", "INTERVAL_SECONDS", "VENUES", "VenueSpec", "VenueClientAlias",
     "get_venue", "venue_ids", "symbol_style_name", "style_base",
     "CredentialsRequired", "RateLimiter", "BaseHTTPVenueClient", "VenueStream",

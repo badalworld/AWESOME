@@ -17,11 +17,16 @@ trade history, live performance metrics, an equity curve, universe scanner outpu
 explanations (why a signal was taken or skipped), latency telemetry, and a settings panel
 where you enter a separate API key/secret per venue (plus the KuCoin passphrase).
 
-> ⚠️ **Risk warning.** Leveraged futures trading can lose your entire balance. A $1,000 → $10,000
-> target in 7 days is an extremely aggressive objective: the built-in Monte-Carlo model tells you
-> the *probability* of reaching it with your actual parameters (see the **Compounding plan** tab)
-> — it is a planning tool, not a promise. Always start in **paper mode** and validate with your
-> own data before risking capital. Nothing here is financial advice.
+> ⚠️ **Risk warning.** Leveraged futures trading can lose your entire balance. The shipped
+> configuration runs a **$20 starting balance** with a $10,000 target: at that size the target
+> requires **+143 %/day (500x in a week)**, which the built-in Monte-Carlo model prices at **under
+> 1 %** — see [`docs/EDGE_AND_EXPECTANCY.md`](docs/EDGE_AND_EXPECTANCY.md) for the honest growth
+> ladder (what this edge does over 7/30/90/365 days from $20). Always start in **paper mode** and
+> validate with your own data before risking capital. Nothing here is financial advice.
+>
+> 🛡️ Before going live read the [pre-live audit](docs/AUDIT_2026-10.md) — it lists the defects that
+> were found and fixed on the money path, and the live-readiness checklist (the short version: set
+> `web.api_token`, IP-restrict the API keys, paper-trade first, start tiny).
 
 ---
 
@@ -39,6 +44,8 @@ where you enter a separate API key/secret per venue (plus the KuCoin passphrase)
 - [Configuration](#configuration)
 - [Going live safely](#going-live-safely)
 - [Expectancy & win probability](docs/EDGE_AND_EXPECTANCY.md)
+- [Honest win-probability & feedback](docs/WIN_PROBABILITY.md)
+- [Pre-live audit & checklist](docs/AUDIT_2026-10.md)
 - [Testing](#testing)
 - [Project layout](#project-layout)
 - [FAQ / troubleshooting](#faq--troubleshooting)
@@ -353,8 +360,10 @@ router. Any key can be overridden per venue with `[venues.<id>]` blocks in `conf
 4. Set `web.api_token` in `config.toml` if the dashboard is reachable from anywhere but localhost.
 5. Start live with a small balance; verify one full trade (entry, SL/TP placement, a trailing step,
    exit) before scaling up.
-6. Run the bot on a VPS geographically close to MEXC's matching engine for the best latency, and
-   keep `data/` on persistent storage (it contains your trade history and trailing state).
+6. Run the bot on a VPS geographically close to your venues' matching engines (Binance's
+   USDⓈ-M and KuCoin Futures sit in Tokyo/Singapore, MEXC in Singapore) and keep `data/` on
+   persistent storage (it contains the machine key, trade history and trailing state for all
+   three venues).
 
 ## Expectancy, win probability & the $10k/7d target
 
@@ -373,7 +382,7 @@ for the current numbers. The short version, with the strategy as configured:
 ## Testing
 
 ```bash
-python3 tests/run_all.py -v          # 98 tests, ~16 s, no network needed
+python3 tests/run_all.py            # 122 tests, ~18 s, no network needed
 python3 -m unittest tests.test_core         # maths, indicators, strategy, filters, analytics
 python3 -m unittest tests.test_integration  # trade lifecycle on a deterministic market
 python3 -m unittest tests.test_engine       # the orchestrator on the offline synthetic feed

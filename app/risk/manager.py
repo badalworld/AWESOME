@@ -57,8 +57,16 @@ def size_position(
     available: Optional[float] = None,
     min_notional_usd: float = 5.0,
     max_margin_usd: Optional[float] = None,
+    max_margin_overshoot: float = 1.30,
 ) -> Sizing:
-    """Margin = equity x pct, notional = margin x leverage, qty in contracts."""
+    """Margin = equity x pct, notional = margin x leverage, qty in contracts.
+
+    The returned size is checked against the venue's *real* minimum order
+    (``spec.min_vol`` contracts / ``spec.min_notional`` quote) and the venue's
+    own contract multiplier.  That matters most on small accounts: rounding up
+    to a one-lot minimum can otherwise silently multiply the intended risk (a
+    $20 account must not accidentally take a $100 position).
+    """
     if equity <= 0 or price <= 0:
         return Sizing(ok=False, reason="no equity/price")
     margin = equity * equity_pct / 100.0
@@ -67,16 +75,20 @@ def size_position(
     if max_margin_usd:
         margin = min(margin, max_margin_usd)
     notional = margin * leverage
-    if notional < min_notional_usd:
+    venue_min_notional = max(float(min_notional_usd or 0.0),
+                             float(getattr(spec, "min_notional", 0.0) or 0.0))
+    if notional < venue_min_notional:
         return Sizing(margin_usd=margin, notional_usd=notional, leverage=leverage,
-                      ok=False, reason=f"notional ${notional:.2f} below exchange minimum ${min_notional_usd:.2f}")
+                      ok=False, reason=f"notional ${notional:.2f} below exchange minimum ${venue_min_notional:.2f}")
 
     contract_size = spec.contract_size if spec else 1.0
     vol_unit = spec.vol_unit if spec else 1.0
     raw_qty = notional / (price * contract_size)
     qty = math.floor(raw_qty / vol_unit) * vol_unit if vol_unit > 0 else raw_qty
+    rounded_up = False
     if spec and qty < spec.min_vol:
         qty = spec.min_vol
+        rounded_up = True
     if spec and spec.max_vol and qty > spec.max_vol:
         qty = spec.max_vol
     if qty <= 0:
@@ -85,6 +97,23 @@ def size_position(
 
     effective_notional = qty * contract_size * price
     effective_margin = effective_notional / max(1, leverage)
+    # Small-account guard: the venue minimum must still fit the risk budget.
+    if effective_notional < venue_min_notional:
+        return Sizing(margin_usd=margin, notional_usd=effective_notional, leverage=leverage, ok=False,
+                      reason=(f"smallest order is ${effective_notional:.2f} notional, below the "
+                              f"exchange minimum ${venue_min_notional:.2f}"))
+    if rounded_up and effective_margin > margin * max(1.0, max_margin_overshoot):
+        return Sizing(margin_usd=effective_margin, notional_usd=effective_notional, leverage=leverage,
+                      ok=False,
+                      reason=(f"exchange minimum order ({qty:g} contracts ≈ ${effective_notional:,.2f} "
+                              f"notional, ${effective_margin:,.2f} margin at {leverage}x) exceeds the "
+                              f"${margin:,.2f} risk budget for this trade — raise equity_per_trade_pct, "
+                              f"use a smaller-priced symbol, or add funds"))
+    if available is not None and effective_margin > available:
+        return Sizing(margin_usd=effective_margin, notional_usd=effective_notional, leverage=leverage,
+                      ok=False,
+                      reason=(f"exchange minimum order needs ${effective_margin:,.2f} margin but only "
+                              f"${available:,.2f} is available"))
     return Sizing(
         qty=qty,
         margin_usd=effective_margin,
@@ -273,6 +302,7 @@ def evaluate_trailing(
 class GuardDecision:
     allowed: bool
     reason: str = ""
+    detail: Optional[Dict[str, Any]] = None
 
 
 class RiskGuard:
@@ -334,6 +364,21 @@ class RiskGuard:
             if day_pnl <= -day_limit and not self.halted:
                 await self.halt(f"daily loss {day_pnl:.1f}% <= -{day_limit:.0f}%")
 
+    async def rebaseline(self, equity: float, *, clear_halt: bool = True) -> None:
+        """Re-anchor the risk baselines after a deliberate balance change.
+
+        Used by the paper-account reset (and by any manual re-baseline): without
+        it, shrinking the book from $1000 to $20 reads as a 98 % drawdown and the
+        kill-switch halts every venue.
+        """
+        self.day_start_equity = float(equity)
+        self.equity_peak = float(equity)
+        self.day = time.strftime("%Y-%m-%d", time.gmtime())
+        if clear_halt:
+            self.halted = False
+            self.halt_reason = ""
+        await self._persist()
+
     async def halt(self, reason: str) -> None:
         self.halted = True
         self.halt_reason = reason
@@ -381,7 +426,7 @@ class RiskGuard:
                 return GuardDecision(
                     False,
                     f"margin utilisation would reach {projected:.1f}% > {max_margin_pct:.0f}%",
-                    {"margin_used": margin_used, "equity": equity},
+                    detail={"margin_used": margin_used, "equity": equity},
                 )
         if available <= 0:
             return GuardDecision(False, "no available balance")

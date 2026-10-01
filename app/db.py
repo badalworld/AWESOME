@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -145,6 +146,30 @@ class Database:
     # ------------------------------------------------------------------ #
     #  low level
     # ------------------------------------------------------------------ #
+    _COL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    @classmethod
+    def _safe_cols(cls, names: Sequence[str]) -> List[str]:
+        """Only ever interpolate identifiers we recognise as column names.
+
+        Values are always bound parameters; this closes the (theoretical) hole
+        where a dict key from an external payload could reach the SQL text.
+        """
+        out = []
+        for name in names:
+            if not cls._COL_RE.match(str(name)):
+                raise ValueError(f"unsafe column name: {name!r}")
+            out.append(str(name))
+        return out
+
+    def _insert_sql(self, table: str, cols: Sequence[str]) -> str:
+        safe = self._safe_cols(cols)
+        return (f"INSERT INTO {table} ({','.join(safe)}) "
+                f"VALUES ({','.join('?' * len(safe))})")
+
+    def _update_sql(self, table: str, cols: Sequence[str]) -> str:
+        safe = self._safe_cols(cols)
+        return f"UPDATE {table} SET {','.join(f'{c}=?' for c in safe)} WHERE id=?"
     def _exec(self, sql: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
         with self._lock:
             cur = self._conn.execute(sql, params)
@@ -189,9 +214,7 @@ class Database:
     # ------------------------------------------------------------------ #
     async def insert_trade(self, trade: Dict[str, Any]) -> int:
         cols = list(trade.keys())
-        sql = (
-            f"INSERT INTO trades ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})"
-        )
+        sql = self._insert_sql("trades", cols)
         with self._lock:
             cur = self._conn.execute(sql, [trade[c] for c in cols])
             self._conn.commit()
@@ -201,9 +224,8 @@ class Database:
         if not patch:
             return
         cols = list(patch.keys())
-        sql = f"UPDATE trades SET {','.join(f'{c}=?' for c in cols)} WHERE id=?"
+        sql = self._update_sql("trades", cols)
         await self.exec(sql, [patch[c] for c in cols] + [trade_id])
-
 
     async def get_open_trades(self) -> List[Dict[str, Any]]:
         rows = await self.exec("SELECT * FROM trades WHERE status='OPEN' ORDER BY opened_at")
@@ -272,7 +294,7 @@ class Database:
     # ------------------------------------------------------------------ #
     async def insert_signal(self, sig: Dict[str, Any]) -> int:
         cols = list(sig.keys())
-        sql = f"INSERT INTO signals ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})"
+        sql = self._insert_sql("signals", cols)
         with self._lock:
             cur = self._conn.execute(sql, [sig[c] for c in cols])
             self._conn.commit()
@@ -283,7 +305,7 @@ class Database:
             return
         cols = list(patch.keys())
         await self.exec(
-            f"UPDATE signals SET {','.join(f'{c}=?' for c in cols)} WHERE id=?",
+            self._update_sql("signals", cols),
             [patch[c] for c in cols] + [signal_id],
         )
 
@@ -305,7 +327,7 @@ class Database:
     async def insert_equity(self, snap: Dict[str, Any]) -> None:
         cols = ["ts", "equity", "available", "unrealized", "realized_today", "open_positions", "mode"]
         await self.exec(
-            f"INSERT INTO equity ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+            self._insert_sql("equity", cols),
             [snap.get(c) for c in cols],
         )
 
@@ -327,7 +349,7 @@ class Database:
     async def insert_order(self, order: Dict[str, Any]) -> None:
         cols = list(order.keys())
         await self.exec(
-            f"INSERT INTO orders ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+            self._insert_sql("orders", cols),
             [order[c] for c in cols],
         )
 

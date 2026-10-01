@@ -22,6 +22,9 @@ class _EngineHarness:
         self.cfg = isolated_config(self.tmp / "data")
         # deterministic offline market, no MEXC reachability probing
         self.cfg.set("exchange.paper_data_source", "synthetic")
+        # these tests assert against a $1000 book regardless of the shipped
+        # default (the shipped config targets a small $20 account)
+        self.cfg.set("account.paper_starting_equity", 1000.0)
         self.cfg.set("universe.refresh_sec", 60)
         # relax the discretionary gates so an engineered divergence is actionable;
         # the filters themselves are covered exhaustively in test_core
