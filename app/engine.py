@@ -21,13 +21,13 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .analytics import compound as compound_mod
 from .analytics import metrics as metrics_mod
 from .config import Config
 from .db import Database
-from .exchange.base import LONG, Ticker
+from .exchange.base import Ticker
 from .exchange.live import LiveBroker
 from .exchange.mexc import MeXCClient, MeXCWebSocket
 from .exchange.paper import MeXCPublicMarketAdapter, PaperBroker, SyntheticMarketAdapter
@@ -37,7 +37,7 @@ from .risk.manager import RiskGuard
 from .strategy.signals import Signal, SignalEngine
 from .strategy.universe import UniverseScanner
 from .trade.executor import Executor
-from .utils import Clock, LatencyTracker, RingLogHandler, percentile
+from .utils import Clock, LatencyTracker, RingLogHandler
 
 log = logging.getLogger("engine")
 
@@ -226,6 +226,7 @@ class TradingEngine:
             slippage_bps=1.5,
             price_interval_s=0.2,
             clock=self.clock,
+            telemetry=self.telemetry,
         )
         await self.broker.start()
         self.broker.set_close_callback(self._on_paper_close)
@@ -656,7 +657,6 @@ class TradingEngine:
         if trades:
             span_days = max(1e-4, (time.time() - min(float(t.get("opened_at") or now) for t in trades)) / 86400.0)
             tpd = max(0.5, min(120.0, len(trades) / span_days))
-        sl_roi = float(self.cfg.get("stoploss.atr_multiplier", 3.0)) * 1.0
         # express the *configured* stop in ROI%-space using the average ATR of recent signals
         avg_atr_pct = 0.6
         if self.recent_signals:

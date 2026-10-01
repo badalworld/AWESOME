@@ -23,10 +23,10 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-from ..exchange.base import LONG, ContractSpec, Position
-from ..utils import clamp, price_from_roi, roi_from_price, stop_price_from_roi
+from ..exchange.base import LONG, ContractSpec
+from ..utils import price_from_roi, roi_from_price, stop_price_from_roi
 
 
 # --------------------------------------------------------------------------- #

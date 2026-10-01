@@ -19,10 +19,10 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
-from ..exchange.base import Candle, ContractSpec, Ticker
-from ..utils import percentile, safe_div
+from ..exchange.base import ContractSpec
+from ..utils import safe_div
 from . import indicators as ind
 
 log = logging.getLogger("universe")
@@ -221,6 +221,9 @@ class UniverseScanner:
                     return
                 if len(candles) < 40:
                     return
+                # the venue returns the *in-progress* candle last: its volume and
+                # range are partial, so drop it (same rule the signal engine uses)
+                candles = candles[:-1]
                 highs = [c.h for c in candles]
                 lows = [c.l for c in candles]
                 closes = [c.c for c in candles]

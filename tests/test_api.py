@@ -1,7 +1,6 @@
 """HTTP dashboard API tests (FastAPI TestClient, no network)."""
 from __future__ import annotations
 
-import asyncio
 import json
 import shutil
 import sys

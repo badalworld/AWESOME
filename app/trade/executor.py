@@ -26,10 +26,9 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from ..exchange.base import LONG, SHORT, ContractSpec, OrderResult, Position
+from ..exchange.base import LONG, ContractSpec, OrderResult, Position
 from ..risk.manager import (
     RiskGuard,
-    TradePlan,
     build_plan,
     evaluate_trailing,
     size_position,

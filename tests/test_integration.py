@@ -13,7 +13,6 @@ trading logic) with a controllable market, verifying:
 """
 from __future__ import annotations
 
-import asyncio
 import sys
 import tempfile
 import unittest
@@ -23,7 +22,6 @@ from typing import Dict, List, Optional
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.config import Config
 from tests._util import isolated_config                                        # noqa: E402
 from app.db import Database                                          # noqa: E402
 from app.exchange.base import LONG, SHORT, Candle, ContractSpec, Ticker   # noqa: E402
@@ -33,7 +31,7 @@ from app.strategy.signals import Signal                              # noqa: E40
 from app.strategy.filters import FilterReport                        # noqa: E402
 from app.strategy.divergence import Divergence                       # noqa: E402
 from app.trade.executor import Executor                              # noqa: E402
-from app.utils import price_from_roi, roi_from_price                 # noqa: E402
+from app.utils import price_from_roi                                 # noqa: E402
 
 
 class StaticMarket:

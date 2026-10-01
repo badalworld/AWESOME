@@ -16,11 +16,10 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from ..utils import Clock, round_to_step
+from ..utils import Clock
 from .base import (
     LONG,
     OPEN_ISOLATED,
-    SHORT,
     AccountSnapshot,
     Broker,
     Candle,
@@ -169,8 +168,10 @@ class PaperBroker(Broker):
         position_mode: int = 1,
         open_type: int = OPEN_ISOLATED,
         clock: Optional[Clock] = None,
+        telemetry=None,
     ) -> None:
         self.market = market
+        self.telemetry = telemetry
         self.starting_equity = float(starting_equity)
         self.slippage_bps = slippage_bps
         self.price_interval_s = price_interval_s
@@ -572,6 +573,10 @@ class PaperBroker(Broker):
         return out
 
     def diagnostics(self) -> Dict[str, Any]:
+        """Same shape as the live broker so the dashboard shows real values
+        (rather than dashes) while paper trading."""
+        running = bool(self._task and not self._task.done())
+        latency = self.telemetry.snapshot() if self.telemetry else {}
         return {
             "mode": self.mode,
             "name": self.name,
@@ -580,4 +585,16 @@ class PaperBroker(Broker):
             "realized_pnl": round(self.realized, 6),
             "fees_paid": round(self.fees_paid, 6),
             "subscribed": len(self._subscribed),
+            "credentials": False,
+            "attached_protection": True,      # SL/TP ride with the simulated fill
+            "clock_offset_ms": 0,
+            "clock_rtt_ms": 0,
+            "order_latency_ms": latency,
+            "ws": {
+                "connected": running,
+                "kline_streams": len(self._subscribed),
+                "tick_streams": len(self._subscribed),
+                "reconnects": 0,
+                "source": "paper-price-loop" if running else "stopped",
+            },
         }

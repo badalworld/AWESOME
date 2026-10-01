@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 from ..exchange.base import Candle, Ticker
-from ..utils import percentile, safe_div
+from ..utils import safe_div
 from . import indicators as ind
 
 

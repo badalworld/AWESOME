@@ -14,8 +14,7 @@ import asyncio
 import math
 import random
 import time
-from collections import deque
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .base import Candle, ContractSpec, Ticker
 
@@ -28,6 +27,8 @@ INTERVAL_SECONDS = {
 
 class SyntheticSymbol:
     """One simulated perpetual contract."""
+
+    TREND_BAR_SECONDS = 300.0      # drift is calibrated against a 5m bar
 
     def __init__(
         self,
@@ -71,7 +72,10 @@ class SyntheticSymbol:
         if self._regime_left <= 0:
             # occasional regime shifts: trend + vol multiplier change
             self._regime_left = self.rnd.randint(120, 900)
-            self._trend = self.rnd.gauss(0, 0.35) * self._base_sigma * math.sqrt(dt_seconds) / max(dt_seconds, 1e-9)
+            # drift is expressed per SECOND and sized against a 5-minute bar so
+            # it is independent of the tick length: over one bar the drift is
+            # ~0.25x the bar's diffusion, never multiples of it.
+            self._trend = self.rnd.gauss(0.0, 0.25) * self._base_sigma / math.sqrt(SyntheticSymbol.TREND_BAR_SECONDS)
             vol_mult = self.rnd.choice([0.6, 0.85, 1.0, 1.25, 1.6, 2.0])
             self._sigma = self._base_sigma * vol_mult
         self._regime_left -= 1

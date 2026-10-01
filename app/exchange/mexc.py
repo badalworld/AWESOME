@@ -29,23 +29,16 @@ import hmac
 import json
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
 from ..utils import Clock, LatencyTracker
 from .base import (
     OPEN_ISOLATED,
-    ORDER_IOC,
     ORDER_MARKET,
-    SIDE_CLOSE_LONG,
-    SIDE_CLOSE_SHORT,
-    SIDE_OPEN_LONG,
-    SIDE_OPEN_SHORT,
     Candle,
-    ContractSpec,
     OrderResult,
-    Ticker,
 )
 
 log = logging.getLogger("mexc")

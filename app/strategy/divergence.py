@@ -19,7 +19,7 @@ time.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 from ..exchange.base import Candle
 from ..utils import safe_div
@@ -191,7 +191,6 @@ def _build(
 ) -> Optional[Divergence]:
     n = len(candles)
     last = candles[-1]
-    ao_vals = None
     slope_up = False
     # AO slope from the last two closed candles
     if n >= 2:

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from pathlib import Path
 
 from tests._util import isolated_config, temp_dir
 

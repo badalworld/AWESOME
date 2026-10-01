@@ -6,7 +6,7 @@ import logging
 import math
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Iterable, List, Optional
+from typing import Any, Deque, Dict, Iterable, List
 
 
 # --------------------------------------------------------------------------- #

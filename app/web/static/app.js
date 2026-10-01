@@ -68,9 +68,33 @@ async function api(path, opts = {}) {
 }
 
 /* ------------------------------ charts ------------------------------ */
+const NEON = ['#22d3ee', '#8b5cf6', '#e879f9', '#34d399', '#fbbf24', '#38bdf8'];
+
+/* One shared <defs> block per chart: neon gradients + a soft outer glow. */
+function svgDefs(uid, colors) {
+  const grads = colors.map((c, i) => `
+    <linearGradient id="${uid}-g${i}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="${c}" stop-opacity="0.34"/>
+      <stop offset="55%" stop-color="${c}" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="${c}" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="${uid}-s${i}" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="${c}" stop-opacity="0.55"/>
+      <stop offset="50%" stop-color="${c}" stop-opacity="1"/>
+      <stop offset="100%" stop-color="${c}" stop-opacity="0.75"/>
+    </linearGradient>`).join('');
+  return `<defs>
+    ${grads}
+    <filter id="${uid}-glow" x="-30%" y="-60%" width="160%" height="240%">
+      <feGaussianBlur stdDeviation="3.4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>`;
+}
+
 function lineChart(el, series, opts = {}) {
-  const w = el.clientWidth || 600, h = el.clientHeight || 240;
-  const pad = { l: 52, r: 14, t: 12, b: 22 };
+  const w = el.clientWidth || 600, h = el.clientHeight || 250;
+  const pad = { l: 56, r: 16, t: 14, b: 24 };
   const all = series.flatMap(s => s.data);
   if (!all.length) { el.innerHTML = '<div class="muted" style="padding:24px">no data yet</div>'; return; }
   let min = Math.min(...all), max = Math.max(...all);
@@ -81,48 +105,70 @@ function lineChart(el, series, opts = {}) {
   const X = i => pad.l + (i / (n - 1)) * (w - pad.l - pad.r);
   const Y = v => pad.t + (1 - (v - min) / (max - min)) * (h - pad.t - pad.b);
 
+  const uid = 'c' + Math.random().toString(36).slice(2, 8);
   let g = '';
   for (let i = 0; i <= 4; i++) {
     const y = pad.t + (i / 4) * (h - pad.t - pad.b);
     const val = max - (i / 4) * (max - min);
     g += `<line class="grid-line" x1="${pad.l}" x2="${w - pad.r}" y1="${y}" y2="${y}"/>`;
-    g += `<text class="axis-label" x="6" y="${y + 3}">${fmtNum(val, 2)}</text>`;
+    g += `<text class="axis-label" x="8" y="${y + 3}">${fmtNum(val, 2)}</text>`;
   }
+
   let paths = '';
   series.forEach((s, si) => {
     const d = s.data.map((v, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
-    const color = s.color || '#4f8cff';
+    const color = s.color || NEON[si % NEON.length];
     const dash = s.dash ? 'stroke-dasharray="4 4"' : '';
-    paths += `<path d="${d}" fill="none" stroke="${color}" stroke-width="${s.width || 2}" ${dash}/>`;
-    if (s.fill) {
-      paths += `<path d="${d} L${X(s.data.length - 1).toFixed(1)},${(h - pad.b).toFixed(1)} L${X(0).toFixed(1)},${(h - pad.b).toFixed(1)} Z" fill="${color}" opacity="0.08"/>`;
+    if (s.fill !== false && series.length <= 2) {
+      paths += `<path d="${d} L${X(s.data.length - 1).toFixed(1)},${(h - pad.b).toFixed(1)} L${X(0).toFixed(1)},${(h - pad.b).toFixed(1)} Z"
+        fill="url(#${uid}-g${si})" stroke="none"/>`;
+    }
+    paths += `<path d="${d}" fill="none" stroke="url(#${uid}-s${si})" stroke-width="${s.width || 2}"
+      stroke-linejoin="round" stroke-linecap="round" ${dash} ${s.glow === false ? '' : `filter="url(#${uid}-glow)" opacity="0.95"`}/>`;
+    if (s.marker !== false && series.length === 1 && s.data.length > 1) {
+      const lx = X(s.data.length - 1), ly = Y(s.data[s.data.length - 1]);
+      paths += `<circle cx="${lx}" cy="${ly}" r="4.5" fill="${color}" filter="url(#${uid}-glow)"/>
+                <circle cx="${lx}" cy="${ly}" r="8" fill="${color}" opacity="0.18"/>`;
     }
   });
   const markers = (opts.markers || []).map(m => `<line x1="${X(m.i)}" x2="${X(m.i)}" y1="${pad.t}" y2="${h - pad.b}" stroke="${m.color}" stroke-width="1" stroke-dasharray="3 3"/>`);
-  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${g}${paths}${markers.join('')}</svg>`;
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${svgDefs(uid, series.map((s, i) => s.color || NEON[i % NEON.length]))}${g}${paths}${markers.join('')}</svg>`;
 }
 
 function barChart(el, values, opts = {}) {
-  const w = el.clientWidth || 600, h = el.clientHeight || 240;
-  const pad = { l: 44, r: 12, t: 12, b: 26 };
+  const w = el.clientWidth || 600, h = el.clientHeight || 250;
+  const pad = { l: 48, r: 14, t: 14, b: 28 };
   if (!values.length) { el.innerHTML = '<div class="muted" style="padding:24px">no closed trades yet</div>'; return; }
   const maxAbs = Math.max(1, ...values.map(v => Math.abs(v)));
   const bw = (w - pad.l - pad.r) / values.length;
+  const uid = 'b' + Math.random().toString(36).slice(2, 8);
+  const zero = pad.t + (h - pad.t - pad.b) * 0.5;
   let bars = '';
   values.forEach((v, i) => {
-    const x = pad.l + i * bw + bw * 0.15;
-    const bh = (Math.abs(v) / maxAbs) * (h - pad.t - pad.b) * 0.5;
-    const zero = pad.t + (h - pad.t - pad.b) * 0.5;
+    const x = pad.l + i * bw + bw * 0.16;
+    const bh = Math.max(1.5, (Math.abs(v) / maxAbs) * (h - pad.t - pad.b) * 0.5);
     const y = v >= 0 ? zero - bh : zero;
-    const color = v >= 0 ? 'var(--green)' : 'var(--red)';
-    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${Math.max(1, bh).toFixed(1)}" fill="${color}" opacity="0.85" rx="2"/>`;
+    const grad = v >= 0 ? `${uid}-up` : `${uid}-dn`;
+    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(bw * 0.68).toFixed(1)}" height="${bh.toFixed(1)}"
+      fill="url(#${grad})" rx="3" filter="url(#${uid}-glow)" opacity="0.92"/>`;
   });
-  const zero = pad.t + (h - pad.t - pad.b) * 0.5;
   el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <defs>
+      <linearGradient id="${uid}-up" x1="0" y1="1" x2="0" y2="0">
+        <stop offset="0%" stop-color="#0f766e" stop-opacity="0.55"/><stop offset="100%" stop-color="#34d399"/>
+      </linearGradient>
+      <linearGradient id="${uid}-dn" x1="0" y1="1" x2="0" y2="0">
+        <stop offset="0%" stop-color="#fb7185"/><stop offset="100%" stop-color="#7f1d3a" stop-opacity="0.55"/>
+      </linearGradient>
+      <filter id="${uid}-glow" x="-40%" y="-40%" width="180%" height="180%">
+        <feGaussianBlur stdDeviation="2.6" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+    </defs>
     <line class="grid-line" x1="${pad.l}" x2="${w - pad.r}" y1="${zero}" y2="${zero}"/>
-    <text class="axis-label" x="6" y="${zero + 3}">0%</text>
-    <text class="axis-label" x="2" y="${pad.t + 10}">+${maxAbs.toFixed(0)}%</text>
-    <text class="axis-label" x="2" y="${h - pad.b}">-${maxAbs.toFixed(0)}%</text>
+    <text class="axis-label" x="8" y="${zero + 3}">0%</text>
+    <text class="axis-label" x="4" y="${pad.t + 12}">+${maxAbs.toFixed(0)}%</text>
+    <text class="axis-label" x="4" y="${h - pad.b}">-${maxAbs.toFixed(0)}%</text>
     ${bars}</svg>`;
 }
 
@@ -147,7 +193,7 @@ function renderOverview(d) {
   $('#kLatSub').textContent = lat.count ? `${lat.count} requests · max ${lat.max} ms` : 'no requests yet';
 
   const curve = d.equity.map(p => Number(p.equity));
-  lineChart($('#equityChart'), [{ data: curve.length ? curve : [acct.equity], color: '#4f8cff', fill: true }]);
+  lineChart($('#equityChart'), [{ data: curve.length ? curve : [acct.equity], color: '#22d3ee', fill: true }]);
   $('#curveMeta').textContent = `${curve.length} points · ${fmtPct(d.metrics.curve.return_pct)} · max DD ${d.metrics.curve.max_drawdown_pct}%`;
 
   const rois = (d.trades || []).filter(t => t.status === 'CLOSED').map(t => Number(t.roi_pct || 0)).slice(0, 120).reverse();
@@ -328,7 +374,7 @@ function renderPlan(d) {
   ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
 
   const paths = (sim.sample_paths || []).slice(0, 12).map((p, i) => ({
-    data: p, color: ['#4f8cff', '#7c5cff', '#22c55e', '#f59e0b', '#06b6d4', '#ec4899'][i % 6], width: 1.4,
+    data: p, color: NEON[i % NEON.length], width: 1.5, glow: false, fill: false,
   }));
   if (paths.length) lineChart($('#mcChart'), paths); else $('#mcChart').innerHTML = '<div class="muted" style="padding:24px">no simulation yet</div>';
 
@@ -343,6 +389,44 @@ function renderPlan(d) {
   $('#planDisclaimer').textContent = c.disclaimer || '';
 }
 
+/* ------------------------------ ticker strip ------------------------------ */
+function renderTickerStrip(d) {
+  const el = $('#tickerStrip');
+  if (!el) return;
+  const rows = (d.state.universe || []).slice(0, 12);
+  if (!rows.length) {
+    el.innerHTML = '<div class="ticker-empty">waiting for the first universe scan…</div>';
+    return;
+  }
+  const watch = new Set(d.state.engine?.watchlist || []);
+  el.innerHTML = rows.map(u => {
+    const chg = Number(u.trend_pct || 0);
+    const color = chg > 0 ? 'pos' : (chg < 0 ? 'neg' : 'muted');
+    return `<div class="ticker-item" title="${esc(u.symbol)} · ATR ${u.atr_pct_5m}% · score ${u.score}${watch.has(u.symbol) ? ' · trading' : ''}">
+      <div class="tk-row">
+        <span class="tk-sym">${esc(u.symbol)}${watch.has(u.symbol) ? '<span class="live-dot" style="margin-left:6px"></span>' : ''}</span>
+        <span class="${color}">${fmtPct(chg, 2)}</span>
+      </div>
+      <div class="tk-row"><span>${fmtNum(u.price)}</span><span class="tk-meta">ATR ${Number(u.atr_pct_5m || 0).toFixed(2)}%</span></div>
+    </div>`;
+  }).join('');
+}
+
+/* ------------------------------ heartbeat ------------------------------ */
+function setHeartbeat(engine, connected) {
+  const dot = $('#liveDot'), label = $('#liveText');
+  if (!dot || !label) return;
+  const live = !!(engine.running && connected);
+  dot.className = 'live-dot' + (live ? '' : ' off');
+  label.textContent = live ? (engine.trading_enabled ? 'LIVE' : 'PAUSED') : 'OFFLINE';
+}
+function tickClock() {
+  const el = $('#topClock');
+  if (el) el.textContent = new Date().toISOString().slice(11, 19);
+}
+setInterval(tickClock, 1000);
+tickClock();
+
 /* ------------------------------ header ------------------------------ */
 function renderHeader(d) {
   const engine = d.state.engine, acct = d.state.account;
@@ -354,6 +438,8 @@ function renderHeader(d) {
   const md = engine.market_data || 'unknown';
   db.textContent = md === 'synthetic' ? 'SIMULATED DATA' : (md === 'mexc-public' ? 'MEXC public data' : 'MEXC live');
   db.className = 'badge ' + (md === 'synthetic' ? 'badge-paper' : 'badge-dim');
+
+  setHeartbeat(engine, d.state.broker_diagnostics?.ws?.connected !== false);
 
   const sb = $('#statusBadge');
   const connected = (d.state.broker_diagnostics?.ws?.connected !== false) && engine.running;
@@ -577,6 +663,7 @@ function renderAll(payload) {
   if (!payload) return;
   state.lastState = payload;
   renderHeader(payload);
+  renderTickerStrip(payload);
   renderOverview(payload);
   renderPositions(payload);
   renderTrades(payload);

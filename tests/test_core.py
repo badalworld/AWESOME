@@ -325,13 +325,9 @@ class TestFilters(unittest.TestCase):
         feed = SyntheticFeed(tick_seconds=0.5, seed=3, history_bars=240, htf_history_bars=120)
         candles = feed.klines("SOL_USDT", "Min5", 220)   # data source; label stays generic
         closes = [c.c for c in candles]
-        highs = [c.h for c in candles]
-        lows = [c.l for c in candles]
         if atr_pct:
             scale = atr_pct / 100.0 * closes[-1]
             candles = [Candle(ts=c.ts, o=c.o, h=c.c + scale, l=c.c - scale, c=c.c, v=c.v) for c in candles]
-            highs = [c.h for c in candles]
-            lows = [c.l for c in candles]
         tk = Ticker(symbol=symbol, last=closes[-1], bid=closes[-1] * (1 - spread / 2e4),
                     ask=closes[-1] * (1 + spread / 2e4), amount24=turnover,
                     fair_price=closes[-1], funding_rate=0.0001)
