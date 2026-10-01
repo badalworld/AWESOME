@@ -450,6 +450,8 @@ def main() -> int:
     ap.add_argument("--target", type=float, default=TARGET_EQUITY, help="target equity ($)")
     ap.add_argument("--days", type=float, default=DAYS, help="horizon in days")
     ap.add_argument("--out", default=str(ROOT / "docs" / "EDGE_AND_EXPECTANCY.md"))
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite even a curated document (hand-written sections are lost)")
     args = ap.parse_args()
 
     START_EQUITY, TARGET_EQUITY, DAYS = args.start, args.target, args.days
@@ -457,6 +459,16 @@ def main() -> int:
     data["target_math"]["growth_ladder"] = growth_ladder(START_EQUITY)   # type: ignore[index]
     md = render(data)
     out = Path(args.out)
+    # This file carries hand-written sections (verdict, rule-simulator evidence
+    # imported from FINAL_RULES.md). Refuse to silently wipe them; the sentinel
+    # lives in the header of the curated document.
+    if out.exists() and "<!-- curated:" in out.read_text(encoding="utf-8", errors="ignore") \
+            and not args.force:
+        raise SystemExit(
+            f"refusing to overwrite {out}: it contains hand-written sections.\n"
+            f"  write elsewhere:  --out docs/EDGE_AND_EXPECTANCY.generated.md\n"
+            f"  or overwrite it:  --force"
+        )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(md, encoding="utf-8")
     print(f"wrote {out} ({len(md.splitlines())} lines)")

@@ -45,6 +45,7 @@ where you enter a separate API key/secret per venue (plus the KuCoin passphrase)
 - [Going live safely](#going-live-safely)
 - [Expectancy & win probability](docs/EDGE_AND_EXPECTANCY.md)
 - [Honest win-probability & feedback](docs/WIN_PROBABILITY.md)
+- [Final rules: TP / trail / SL, measured](docs/FINAL_RULES.md)
 - [Pre-live audit & checklist](docs/AUDIT_2026-10.md)
 - [Testing](#testing)
 - [Project layout](#project-layout)
@@ -376,17 +377,28 @@ router. Any key can be overridden per venue with `[venues.<id>]` blocks in `conf
 
 ## Expectancy, win probability & the $10k/7d target
 
-Run **`python3 tools/edge_report.py`** (or read [`docs/EDGE_AND_EXPECTANCY.md`](docs/EDGE_AND_EXPECTANCY.md))
-for the current numbers. The short version, with the strategy as configured:
+The **final rules and the measured evidence behind them** are in
+[`docs/FINAL_RULES.md`](docs/FINAL_RULES.md) (frozen for live trading). The short version, with
+the strategy as configured:
 
-* +200 % ROI at 10x is a **20 % price move** — on 5m bars that is rare, so in practice the
-  **stepped trailing stop is what closes most winners** (+20 %…+70 % ROI), not the fixed TP.
-* Under that realistic exit distribution the **break-even win rate is ≈ 42 %** (MEXC, ~45 % ROI
-  stop) — i.e. the edge is real but thin, and the filter stack is what has to keep you above it.
+* +200 % ROI at 10x is a **20 % price move = 16.7 × ATR** — on 5m bars that is rare (it fires on
+  0–4 % of trades), so the **stepped trailing stop (30 → 20 → +10/+10) is what closes most
+  winners**, not the fixed TP.
+* Measured with the real exit code (`tools/rule_sim.py`): mean win **+29.6 % ROI**, mean loss
+  **−35.7 % ROI (3 × ATR)**, exit mix 44 % stop / 52 % trail / 4 % timeout — so the shipped
+  geometry needs a **break-even win rate of 54.6 %**, and the average winner is *smaller* than
+  the average loser. Wider ladders (TP 90 % / trail 40/25) need only ~47.6 %; see
+  `docs/FINAL_RULES.md` §4 for the one-line switch.
+* **At zero drift the rules measure ≈ 0 % per trade at every setting** — they shape the outcome,
+  they do not create the edge. The win rate of the AO-divergence signal is what decides it.
 * **$1,000 → $10,000 in 7 days requires +39 %/day**: ~16 clean TP hits in a row, or a >100 % win
-  rate. The honest probability is **≈ 0 % under realistic exits (<1 % even with optimistic
-  assumptions)**. It is a stress metric, not a target — the dashboard's *Compounding* tab shows
-  the same maths live against your own trade history.
+  rate. The honest probability is **< 1 % (≈0 % under trailing-realistic exits)**. It is a stress
+  metric, not a target — the dashboard's *Compounding* tab shows the same maths live against your
+  own trade history.
+
+Re-run the numbers after you have live history — `python3 tools/edge_report.py --out
+docs/EDGE_AND_EXPECTANCY.generated.md` (the curated `docs/EDGE_AND_EXPECTANCY.md` is protected
+from being overwritten; add `--force` if you really want to regenerate it in place).
 
 ## Testing
 
