@@ -1,0 +1,18 @@
+# This repo is a Python (FastAPI) trading engine, not a Hugo site. Netlify only
+# serves the static dashboard; the engine and its /api must be self-hosted
+# (see docs/DEPLOYMENT.md). No build step is needed.
+[build]
+  command = "echo 'No build step: publishing static dashboard'"
+  publish = "app/web/static"
+
+# The dashboard references assets under /static/*, as served by FastAPI.
+[[redirects]]
+  from = "/static/*"
+  to = "/:splat"
+  status = 200
+
+# Client-side dashboard routes.
+[[redirects]]
+  from = "/dashboard/*"
+  to = "/index.html"
+  status = 200
