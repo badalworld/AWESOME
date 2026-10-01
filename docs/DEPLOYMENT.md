@@ -2,10 +2,11 @@
 
 ## 1. Host location
 
-Latency to `api.mexc.com` matters. Run on a VPS in the same region as the exchange's matching
-engine (Singapore / Tokyo / Frankfurt depending on your account's routing) — typically single-digit
+Latency to your venues' matching engines matters (`api.mexc.com`, `fapi.binance.com`,
+`api-futures.kucoin.com`). Run on a VPS in the same region as the exchange's matching engine
+(Singapore / Tokyo / Frankfurt depending on your account's routing) — typically single-digit
 milliseconds vs 100–300 ms from home connections. The bot is a single Python process (asyncio,
-a few hundred MB) — 1 vCPU / 1 GB RAM is enough.
+a few hundred MB) — 1 vCPU / 1 GB RAM is enough for all three venues.
 
 ## 2. Install
 
@@ -14,12 +15,13 @@ git clone <your-repo> awesome && cd awesome
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp config.toml config.toml.bak      # keep the reference defaults
-python3 tests/run_all.py            # 70 tests must pass before you trust it
+python3 tests/run_all.py            # 98 tests must pass before you trust it
 python3 run.py --port 8080
 ```
 
-Keep `data/` on a persistent disk: it contains the SQLite DB (trades, equity curve, trailing
-state) and the machine key for the encrypted credentials. **Back up `data/`** — losing the machine
+Keep `data/` on a persistent disk: it contains one SQLite DB per venue
+(`data/venues/{mexc,binance,kucoin}.db` — trades, equity curve, trailing state) and the machine key
+for the encrypted credentials. **Back up `data/`** — losing the machine
 key means re-entering the API keys from the dashboard.
 
 ## 3. Reverse proxy + TLS
@@ -105,9 +107,13 @@ journalctl -u awesome-bot -f
 
 ## 7. Known limitations
 
-* Live MEXC connectivity could not be verified from the development sandbox (TLS to the venue is
-  blocked there); the REST/WS clients are written against the official docs and the paper path
-  exercises all the same code. Validate with a small live trade before trusting it with size.
+* Live exchange connectivity could not be verified from the development sandbox (TLS to MEXC,
+  Binance and KuCoin is blocked there); the REST/WS clients are written against the official docs
+  and the paper path exercises all the same code, with signing vectors and order-mapping pinned by
+  `tests/test_venues.py`. Validate each venue with a small live trade before trusting it with size.
+* Testnet/local replay: run the venue in `paper` mode first; there is no built-in exchange testnet
+  switch (Binance/KuCoin testnets use different hosts — set `rest_base`/`ws_url` per venue to use
+  them, but keep in mind their symbol universes and rate limits differ).
 * The synthetic simulator is a GARCH-lite model, not a market replay — it is for exercising the
   pipeline, not for estimating live edge.
 * Single-process by design; to run multiple strategies, use multiple isolated configs/data dirs

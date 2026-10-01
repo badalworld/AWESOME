@@ -25,13 +25,16 @@ from typing import Any, Dict, List, Optional
 
 from .analytics import compound as compound_mod
 from .analytics import metrics as metrics_mod
-from .config import Config
+from .config import Config, VenueConfig
 from .db import Database
 from .exchange.base import Ticker
+from .exchange.binance import BinanceClient, BinanceStream
+from .exchange.kucoin import KuCoinClient, KuCoinStream
 from .exchange.live import LiveBroker
-from .exchange.mexc import MeXCClient, MeXCWebSocket
-from .exchange.paper import MeXCPublicMarketAdapter, PaperBroker, SyntheticMarketAdapter
+from .exchange.mexc import MeXCClient, MeXCWebSocket, MexcVenueClient
+from .exchange.paper import PaperBroker, SyntheticMarketAdapter, VenuePublicMarketAdapter
 from .exchange.synthetic import SyntheticFeed
+from .exchange.venue import VenueSpec, get_venue
 from .keystore import CredentialStore
 from .risk.manager import RiskGuard
 from .strategy.signals import Signal, SignalEngine
@@ -43,8 +46,27 @@ log = logging.getLogger("engine")
 
 
 class TradingEngine:
-    def __init__(self, cfg: Config, db: Database, keystore: CredentialStore) -> None:
-        self.cfg = cfg
+    """One engine == one venue == one account == one database.
+
+    Three engines (MEXC / Binance / KuCoin) run side by side in the same
+    process: separate broker, positions, P&L, credentials and SQLite file. The
+    *strategy, filter and risk code is the same object graph* for all three,
+    which is what guarantees identical rules on every venue.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        db: Database,
+        keystore: CredentialStore,
+        venue_id: str = "mexc",
+        *,
+        base_cfg: Optional[Config] = None,
+    ) -> None:
+        self.venue_id = str(venue_id).lower()
+        self.spec: VenueSpec = get_venue(self.venue_id)
+        self.base_cfg: Config = base_cfg or cfg
+        self.cfg = cfg if isinstance(cfg, VenueConfig) else VenueConfig(cfg, self.venue_id)
         self.db = db
         self.keystore = keystore
         self.clock = Clock()
@@ -135,75 +157,63 @@ class TradingEngine:
     #  broker construction
     # ------------------------------------------------------------------ #
     async def _build_broker(self) -> None:
+        """Build the live or paper broker for *this* venue."""
         cfg = self.cfg
+        spec = self.spec
         mode = cfg.mode
-        rest_base = str(cfg.get("exchange.rest_base", "https://api.mexc.com"))
-        ws_url = str(cfg.get("exchange.ws_url", "wss://contract.mexc.com/edge"))
-
+        rest_base = str(cfg.get("exchange.rest_base", spec.rest_base))
+        ws_url = str(cfg.get("exchange.ws_url", spec.ws_url))
         creds = await self.keystore.load() or self.keystore.snapshot()
+        have_creds = bool(creds and creds.complete(spec.needs_passphrase))
 
         if mode == "live":
-            if not creds or not creds.complete:
+            if not have_creds:
                 raise RuntimeError(
-                    "Live mode requires API credentials. Open the dashboard → Settings and save "
-                    "your MEXC API key/secret (futures order permission enabled)."
+                    f"Live mode on {spec.label} requires API credentials. Open the dashboard -> "
+                    f"{spec.label} tab -> Settings and save the API key"
+                    + ("/secret/passphrase" if spec.needs_passphrase else "/secret")
+                    + " (futures trading permission enabled)."
                 )
-            client = MeXCClient(
-                rest_base, self.clock, api_key=creds.api_key, api_secret=creds.api_secret,
-                recv_window_ms=int(cfg.get("exchange.recv_window_ms", 5000)),
-                timeout_s=float(cfg.get("exchange.request_timeout_s", 5.0)),
-                http2=bool(cfg.get("exchange.http2", True)),
-                max_connections=int(cfg.get("exchange.max_connections", 20)),
-                keepalive_expiry=float(cfg.get("exchange.keepalive_expiry", 300)),
-                retry_attempts=int(cfg.get("exchange.retry_attempts", 3)),
-                retry_backoff_ms=int(cfg.get("exchange.retry_backoff_ms", 120)),
-                telemetry=self.telemetry,
-            )
+            client = self._make_client(rest_base, creds.api_key, creds.api_secret,
+                                       getattr(creds, "passphrase", ""))
             await client.start()
             try:
                 await client.ping()
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(
-                    f"Cannot reach MEXC at {rest_base} ({exc}). Live trading requires network access "
-                    "to api.mexc.com (run the bot from a VPS in the same region as the exchange)."
+                    f"Cannot reach {spec.label} at {rest_base} ({exc}). Live trading requires "
+                    "network access to the exchange (run the bot from a VPS in the same region)."
                 ) from exc
-            ws = MeXCWebSocket(ws_url, client)
-            self.broker = LiveBroker(
-                client, ws,
+            broker = LiveBroker(
+                client,
+                self._make_stream(client, ws_url),
                 position_mode=int(cfg.get("exchange.position_mode", 1)),
                 entry_order_type=str(cfg.get("exchange.entry_order_type", "market")),
                 exit_order_type=str(cfg.get("exchange.exit_order_type", "market")),
                 ioc_buffer_bps=float(cfg.get("exchange.ioc_limit_buffer_bps", 4)),
                 stop_mode=str(cfg.get("stoploss.mode", "auto")),
-                trigger_trend=2 if bool(cfg.get("stoploss.use_mark_price_trigger", True)) else 1,
-                price_protect=1,
                 telemetry=self.telemetry,
             )
-            await self.broker.start()
-            self.market_data_source = "mexc-live"
-            log.info("live broker ready (position mode %s)", self.broker.position_mode)
+            await broker.start()
+            self.broker = broker
+            self.market_data_source = "live"
+            log.info("[%s] live broker ready (position mode %s)", spec.id, broker.position_mode)
             return
 
         # ---- paper mode ------------------------------------------------ #
         source = str(cfg.get("exchange.paper_data_source", "auto")).lower()
-        public_client = MeXCClient(
-            rest_base, self.clock,
-            recv_window_ms=int(cfg.get("exchange.recv_window_ms", 5000)),
-            timeout_s=min(4.0, float(cfg.get("exchange.request_timeout_s", 5.0))),
-            http2=bool(cfg.get("exchange.http2", True)),
-            retry_attempts=2, retry_backoff_ms=150, telemetry=self.telemetry,
-        )
-        use_live_data = source in ("live", "auto")
+        public_client = self._make_client(rest_base, None, None, "")
         adapter = None
-        if use_live_data:
+        if source in ("live", "auto"):
             try:
                 await public_client.start()
                 await asyncio.wait_for(public_client.ping(), timeout=6.0)
-                adapter = MeXCPublicMarketAdapter(public_client, self.clock)
-                self.market_data_source = "mexc-public"
-                log.info("paper mode using LIVE MEXC public market data (orders are simulated)")
+                adapter = VenuePublicMarketAdapter(public_client, self.clock)
+                self.market_data_source = "public"
+                log.info("[%s] paper mode using LIVE public market data (orders are simulated)", spec.id)
             except Exception as exc:  # noqa: BLE001
-                log.warning("MEXC public data unavailable (%s) -> falling back to the synthetic feed", exc)
+                log.warning("[%s] public data unavailable (%s) -> falling back to the synthetic feed",
+                            spec.id, exc)
                 try:
                     await public_client.close()
                 except Exception:  # noqa: BLE001
@@ -211,14 +221,17 @@ class TradingEngine:
                 adapter = None
         if adapter is None:
             if source == "live":
-                raise RuntimeError("paper_data_source=live but MEXC public endpoints are unreachable")
-            feed = SyntheticFeed(tick_seconds=0.5)
+                raise RuntimeError(
+                    f"paper_data_source=live but {spec.label} public endpoints are unreachable"
+                )
+            feed = SyntheticFeed(tick_seconds=0.5, symbol_style=spec.symbol_style)
             adapter = SyntheticMarketAdapter(feed)
             self.market_data_source = "synthetic"
-            log.warning("paper mode using SIMULATED market data (dashboard is clearly labelled)")
+            log.warning("[%s] paper mode using SIMULATED market data (dashboard is clearly labelled)", spec.id)
 
         self.broker = PaperBroker(
             adapter,
+            name=f"{spec.id}-paper",
             starting_equity=float(cfg.get("account.paper_starting_equity", 1000.0)),
             slippage_bps=1.5,
             price_interval_s=0.2,
@@ -227,11 +240,54 @@ class TradingEngine:
         )
         await self.broker.start()
         self.broker.set_close_callback(self._on_paper_close)
-        # adopt simulated equity if this is a fresh database
         stored_equity = await self.db.kv_get_json("paper.equity", None)
         if stored_equity:
             self.broker.starting_equity = float(stored_equity)
-            log.info("paper equity restored: $%.2f", self.broker.starting_equity)
+            log.info("[%s] paper equity restored: $%.2f", spec.id, self.broker.starting_equity)
+
+    # -- venue factories ------------------------------------------------- #
+    def _make_client(self, rest_base: str, api_key, api_secret, passphrase):
+        """Build the REST client for this venue with the shared transport options."""
+        cfg = self.cfg
+        common = dict(
+            rest_base=rest_base,
+            api_key=api_key,
+            api_secret=api_secret,
+            timeout_s=float(cfg.get("exchange.request_timeout_s", 5.0)),
+            http2=bool(cfg.get("exchange.http2", True)),
+            max_connections=int(cfg.get("exchange.max_connections", 20)),
+            keepalive_expiry=float(cfg.get("exchange.keepalive_expiry", 300)),
+            retry_attempts=int(cfg.get("exchange.retry_attempts", 3)),
+            retry_backoff_ms=int(cfg.get("exchange.retry_backoff_ms", 120)),
+            telemetry=self.telemetry,
+        )
+        if self.venue_id == "mexc":
+            raw = MeXCClient(
+                rest_base, self.clock, api_key=api_key, api_secret=api_secret,
+                recv_window_ms=int(cfg.get("exchange.recv_window_ms", 5000)),
+                timeout_s=common["timeout_s"], http2=common["http2"],
+                max_connections=common["max_connections"],
+                keepalive_expiry=common["keepalive_expiry"],
+                retry_attempts=common["retry_attempts"],
+                retry_backoff_ms=common["retry_backoff_ms"],
+                telemetry=self.telemetry,
+            )
+            return MexcVenueClient(raw, position_mode=int(cfg.get("exchange.position_mode", 1)))
+        if self.venue_id == "binance":
+            return BinanceClient(self.clock, recv_window_ms=int(cfg.get("exchange.recv_window_ms", 5000)), **common)
+        if self.venue_id == "kucoin":
+            return KuCoinClient(self.clock, passphrase=passphrase, **common)
+        raise KeyError(f"no client implementation for venue {self.venue_id}")
+
+    def _make_stream(self, client, ws_url: str):
+        if self.venue_id == "mexc":
+            raw = getattr(client, "raw", None)
+            return MeXCWebSocket(ws_url, raw) if raw is not None else None
+        if self.venue_id == "binance":
+            return BinanceStream(client, ws_base=ws_url)
+        if self.venue_id == "kucoin":
+            return KuCoinStream(client, ws_base=ws_url)
+        return None
 
     # ------------------------------------------------------------------ #
     #  callbacks from the broker
@@ -598,6 +654,15 @@ class TradingEngine:
             progress = max(0.0, min(100.0, (equity - target_start) / (target - target_start) * 100.0))
 
         return {
+            "venue": {
+                "id": self.spec.id,
+                "label": self.spec.label,
+                "rest_base": str(self.cfg.get("exchange.rest_base", self.spec.rest_base)),
+                "quote": self.spec.quote,
+                "taker_fee": float(self.cfg.get(f"venues.{self.spec.id}.taker_fee", self.spec.taker_fee)),
+                "needs_passphrase": self.spec.needs_passphrase,
+                "docs": self.spec.docs,
+            },
             "engine": {
                 "running": self.running,
                 "trading_enabled": self.trading_enabled,
@@ -710,26 +775,26 @@ class TradingEngine:
             "order_latency": await self.db.latency_stats(),
         }
 
-    async def apply_credentials(self, api_key: str, api_secret: str) -> Dict[str, Any]:
-        """Store credentials, verify them against MEXC, and hot-swap the client."""
-        await self.keystore.save(api_key, api_secret)
-        result = {"saved": True, "verified": False}
-        probe = MeXCClient(
-            str(self.cfg.get("exchange.rest_base", "https://api.mexc.com")),
-            self.clock, api_key=api_key, api_secret=api_secret,
-            timeout_s=6.0, retry_attempts=1, telemetry=self.telemetry,
-        )
+    async def apply_credentials(self, api_key: str, api_secret: str,
+                                passphrase: str = "") -> Dict[str, Any]:
+        """Store credentials, verify them against the venue, hot-swap the client."""
+        spec = self.spec
+        await self.keystore.save(api_key, api_secret, passphrase)
+        result: Dict[str, Any] = {"saved": True, "verified": False, "venue": spec.id}
+        probe = self._make_client(str(self.cfg.get("exchange.rest_base", spec.rest_base)),
+                                  api_key, api_secret, passphrase)
         try:
             await probe.start()
-            assets = await probe.assets()
-            usdt = next((a for a in assets if str(a.get("currency", "")).upper() == "USDT"), None)
+            await probe.ping()
+            account = await probe.account()
             result.update({
                 "verified": True,
-                "equity": float(usdt.get("equity") or 0.0) if usdt else 0.0,
-                "available": float(usdt.get("availableBalance") or 0.0) if usdt else 0.0,
+                "equity": round(account.equity, 4),
+                "available": round(account.available, 4),
+                "position_mode": "hedge" if await probe.position_mode() == 1 else "one-way",
             })
             if self.broker is not None and hasattr(self.broker, "client"):
-                self.broker.client.update_credentials(api_key, api_secret)
+                self.broker.client.update_credentials(api_key, api_secret, passphrase)
         except Exception as exc:  # noqa: BLE001
             result["error"] = str(exc)
         finally:

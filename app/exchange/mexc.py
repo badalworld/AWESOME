@@ -35,11 +35,25 @@ import httpx
 
 from ..utils import Clock, LatencyTracker
 from .base import (
+    DEFAULT_TAKER_FEE,
+    LONG,
     OPEN_ISOLATED,
+    ORDER_IOC,
+    ORDER_LIMIT,
     ORDER_MARKET,
+    SHORT,
+    SIDE_CLOSE_LONG,
+    SIDE_CLOSE_SHORT,
+    SIDE_OPEN_LONG,
+    SIDE_OPEN_SHORT,
+    AccountSnapshot,
     Candle,
+    ContractSpec,
     OrderResult,
+    Position,
+    Ticker,
 )
+from .venue import HEDGE, VENUES, VenueClient
 
 log = logging.getLogger("mexc")
 
@@ -889,3 +903,308 @@ class MeXCWebSocket:
             "tick_streams": len(self._tick_subs),
             "last_message_age_s": round(time.time() - self.last_message_ts, 2) if self.last_message_ts else None,
         }
+
+
+# --------------------------------------------------------------------------- #
+#  Normalized venue adapter (multi-venue layer)
+# --------------------------------------------------------------------------- #
+class MexcVenueClient(VenueClient):
+    """Adapts the raw :class:`MeXCClient` to the normalized :class:`VenueClient`.
+
+    Thin by design: MEXC's numbers already match the canonical model
+    (``vol`` is contracts, ``volUnit``/``contractSize`` are reported in
+    ``ContractSpec``), so this only translates side enums and envelopes.
+    """
+
+    def __init__(self, raw: MeXCClient, *, position_mode: int = HEDGE) -> None:
+        self.raw = raw
+        self.spec = VENUES["mexc"]
+        self.clock = raw.clock
+        self.rest_base = raw.rest_base
+        self.position_mode = position_mode
+        self._contracts: Dict[str, ContractSpec] = {}
+        self._contracts_ts = 0.0
+
+    # -- lifecycle / credentials ---------------------------------------- #
+    @property
+    def has_credentials(self) -> bool:
+        return self.raw.has_credentials
+
+    def update_credentials(self, api_key, api_secret, passphrase=None) -> None:
+        self.raw.update_credentials(api_key, api_secret)
+
+    async def start(self) -> None:
+        await self.raw.start()
+        try:
+            self.position_mode = int(await self.raw.position_mode())
+        except Exception as exc:  # noqa: BLE001
+            log.debug("position mode unavailable (%s); keeping %s", exc, self.position_mode)
+
+    async def close(self) -> None:
+        await self.raw.close()
+
+    async def ping(self) -> Optional[int]:
+        return await self.raw.ping()
+
+    async def sync_time(self) -> None:
+        await self.raw.sync_time()
+
+    async def position_mode(self) -> int:
+        try:
+            self.position_mode = int(await self.raw.position_mode())
+        except Exception:  # noqa: BLE001
+            pass
+        return self.position_mode
+
+    # -- market data ----------------------------------------------------- #
+    async def contracts(self, force: bool = False) -> Dict[str, ContractSpec]:
+        if self._contracts and not force and time.time() - self._contracts_ts < 600:
+            return self._contracts
+        rows: List[Dict[str, Any]] = []
+        for fetch in (self.raw.contract_details, self.raw.contract_detail_country):
+            try:
+                rows = await fetch()
+                if rows:
+                    break
+            except Exception as exc:  # noqa: BLE001
+                log.debug("contract fetch failed via %s: %s", fetch.__name__, exc)
+        out: Dict[str, ContractSpec] = {}
+        for item in rows:
+            try:
+                symbol = item["symbol"]
+                out[symbol] = ContractSpec(
+                    symbol=symbol,
+                    contract_size=float(item.get("contractSize", 1) or 1),
+                    price_unit=float(item.get("priceUnit", 0.0001) or 0.0001),
+                    price_scale=int(item.get("priceScale", 4) or 4),
+                    vol_unit=float(item.get("volUnit", 1) or 1),
+                    vol_scale=int(item.get("volScale", 0) or 0),
+                    min_vol=float(item.get("minVol", 1) or 1),
+                    max_vol=float(item.get("maxVol", 1e9) or 1e9),
+                    max_leverage=int(item.get("maxLeverage", 100) or 100),
+                    min_leverage=int(item.get("minLeverage", 1) or 1),
+                    taker_fee=float(item.get("takerFeeRate", DEFAULT_TAKER_FEE) or DEFAULT_TAKER_FEE),
+                    maker_fee=float(item.get("makerFeeRate", 0.0002) or 0.0002),
+                    api_allowed=bool(item.get("apiAllowed", True)),
+                    state=int(item.get("state", 0) or 0),
+                    is_new=bool(item.get("isNew", False)),
+                    base=item.get("baseCoin", ""),
+                    quote=item.get("quoteCoin", "USDT"),
+                    position_open_type=int(item.get("positionOpenType", 3) or 3),
+                    trigger_protect=float(item.get("triggerProtect", 0) or 0),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("contract parse error: %s", exc)
+        if out:
+            self._contracts = out
+            self._contracts_ts = time.time()
+        return self._contracts
+
+    async def tickers(self, symbol: Optional[str] = None) -> Dict[str, Ticker]:
+        rows = await self.raw.tickers(symbol)
+        out: Dict[str, Ticker] = {}
+        for item in rows:
+            try:
+                sym = item["symbol"]
+                out[sym] = Ticker(
+                    symbol=sym,
+                    last=float(item.get("lastPrice") or 0),
+                    bid=float(item.get("bid1") or 0),
+                    ask=float(item.get("ask1") or 0),
+                    volume24=float(item.get("volume24") or 0),
+                    amount24=float(item.get("amount24") or 0),
+                    hold_vol=float(item.get("holdVol") or 0),
+                    high24=float(item.get("high24Price") or 0),
+                    low24=float(item.get("lower24Price") or 0),
+                    rise_fall_rate=float(item.get("riseFallRate") or 0),
+                    index_price=float(item.get("indexPrice") or 0),
+                    fair_price=float(item.get("fairPrice") or 0),
+                    funding_rate=float(item.get("fundingRate") or 0),
+                    ts=time.time(),
+                )
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    async def klines(self, symbol: str, interval: str = "Min5", limit: int = 300) -> List[Candle]:
+        return await self.raw.klines(symbol, self.spec.native_interval(interval), limit)
+
+    async def mark_price(self, symbol: str) -> float:
+        return await self.raw.mark_price(symbol)
+
+    async def depth_usd(self, symbol: str, levels: int = 5, contract_size: float = 1.0) -> float:
+        return await self.raw.depth_usd(symbol, levels, contract_size)
+
+    # -- account ---------------------------------------------------------- #
+    async def account(self) -> AccountSnapshot:
+        for row in await self.raw.assets():
+            if str(row.get("currency", "")).upper() == "USDT":
+                return AccountSnapshot(
+                    equity=float(row.get("equity") or 0.0),
+                    available=float(row.get("availableBalance") or row.get("availableOpen") or 0.0),
+                    unrealized=float(row.get("unrealized") or 0.0),
+                    position_margin=float(row.get("positionMargin") or 0.0),
+                    currency="USDT",
+                    ts=time.time(),
+                )
+        return AccountSnapshot(ts=time.time())
+
+    async def positions(self) -> List[Position]:
+        out: List[Position] = []
+        for row in await self.raw.open_positions():
+            try:
+                if int(row.get("state", 1)) != 1 or float(row.get("holdVol") or 0) <= 0:
+                    continue
+                ptype = int(row.get("positionType", 1))
+                out.append(
+                    Position(
+                        symbol=row["symbol"],
+                        side=LONG if ptype == 1 else SHORT,
+                        hold_vol=float(row.get("holdVol") or 0),
+                        open_avg_price=float(row.get("openAvgPrice") or row.get("holdAvgPrice") or 0),
+                        leverage=int(row.get("leverage") or 1),
+                        unrealized=float(row.get("unRealizedPnl") or 0.0),
+                        im=float(row.get("im") or 0.0),
+                        liquidate_price=float(row.get("liquidatePrice") or 0),
+                        position_id=int(row.get("positionId") or 0),
+                        state=int(row.get("state") or 1),
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    # -- trading ---------------------------------------------------------- #
+    async def set_leverage(self, symbol: str, leverage: int, position_type: int = 1) -> bool:
+        return await self.raw.change_leverage(
+            symbol, leverage, position_type=position_type, open_type=OPEN_ISOLATED
+        )
+
+    @staticmethod
+    def _open_side(side: str) -> int:
+        return SIDE_OPEN_LONG if side == LONG else SIDE_OPEN_SHORT
+
+    @staticmethod
+    def _close_side(side: str) -> int:
+        return SIDE_CLOSE_LONG if side == LONG else SIDE_CLOSE_SHORT
+
+    async def market_order(
+        self, symbol: str, *, side: str, qty: float, reduce_only: bool,
+        leverage: int = 0, client_id: str = "",
+    ) -> OrderResult:
+        return await self.raw.create_order(
+            symbol=symbol, vol=qty,
+            side=self._close_side(side) if reduce_only else self._open_side(side),
+            order_type=ORDER_MARKET,
+            leverage=leverage or None,
+            open_type=OPEN_ISOLATED,
+            reduce_only=reduce_only,
+            external_oid=client_id or None,
+            position_mode=self.position_mode,
+        )
+
+    async def limit_order(
+        self, symbol: str, *, side: str, qty: float, price: float,
+        reduce_only: bool, client_id: str = "",
+    ) -> OrderResult:
+        return await self.raw.create_order(
+            symbol=symbol, vol=qty,
+            side=self._close_side(side) if reduce_only else self._open_side(side),
+            order_type=ORDER_LIMIT,
+            price=price,
+            open_type=OPEN_ISOLATED,
+            reduce_only=reduce_only,
+            external_oid=client_id or None,
+            position_mode=self.position_mode,
+        )
+
+    async def entry_order_with_protection(
+        self, *, symbol: str, side: str, qty: float, leverage: int = 0,
+        price_hint: float = 0.0, client_id: str = "", sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None, entry_order_type: str = "market",
+        ioc_buffer_bps: float = 4.0,
+    ) -> OrderResult:
+        """MEXC can carry the SL/TP legs on the entry order itself."""
+        price = None
+        order_type = ORDER_MARKET
+        if entry_order_type == "ioc_limit" and price_hint:
+            buf = ioc_buffer_bps / 10_000.0
+            price = price_hint * (1 + buf) if side == LONG else price_hint * (1 - buf)
+            order_type = ORDER_IOC
+        return await self.raw.create_order(
+            symbol=symbol,
+            vol=qty,
+            side=self._open_side(side),
+            order_type=order_type,
+            price=price,
+            leverage=leverage or None,
+            open_type=OPEN_ISOLATED,
+            reduce_only=False,
+            stop_loss_price=sl_price,
+            take_profit_price=tp_price,
+            loss_trend=2,
+            profit_trend=2,
+            price_protect=1,
+            external_oid=client_id or None,
+            position_mode=self.position_mode,
+        )
+
+    async def stop_order(
+        self, symbol: str, *, side: str, qty: float, trigger_price: float,
+        reduce_only: bool = True, client_id: str = "",
+    ) -> OrderResult:
+        return await self.raw.place_plan_order(
+            symbol=symbol,
+            vol=qty,
+            side=self._close_side(side) if reduce_only else self._open_side(side),
+            trigger_price=trigger_price,
+            trigger_type=2 if side == LONG else 1,   # long stop fires below, short above
+            order_type=ORDER_MARKET,
+            reduce_only=reduce_only,
+            open_type=OPEN_ISOLATED,
+            position_mode=self.position_mode,
+        )
+
+    async def modify_stop(
+        self, symbol: str, *, order_id: str, kind: str, new_price: float, qty: float,
+        side: str = LONG, handle: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if kind == "attached":
+            return await self.raw.change_attached_stop(
+                symbol=symbol, order_id=str(order_id), stop_loss_price=new_price,
+            )
+        return await self.raw.modify_plan_order(
+            symbol=symbol, order_id=str(order_id), trigger_price=new_price,
+            execute_price=new_price, order_type=ORDER_MARKET,
+            trigger_type=2 if side == LONG else 1,
+        )
+
+    async def cancel_stop(self, symbol: str, *, order_id: str, kind: str) -> bool:
+        if kind == "attached":
+            return await self.raw.change_attached_stop(symbol=symbol, order_id=str(order_id), stop_loss_price=0.0)
+        return await self.raw.cancel_plan_orders(symbol, [str(order_id)])
+
+    async def cancel_order_ids(self, symbol: str, order_ids: List[str]) -> bool:
+        await self.raw.cancel_orders(order_ids)
+        return True
+
+    async def attached_protection(self, symbol: str, entry_order_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            rows = await self.raw.tpsl_orders(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("tpsl lookup failed for %s: %s", symbol, exc)
+            return None
+        for row in rows:
+            if str(row.get("orderId")) == str(entry_order_id) and int(row.get("state", 1)) == 1:
+                return {
+                    "kind": "attached",
+                    "tpsl_id": row.get("id"),
+                    "stop_price": float(row.get("stopLossPrice") or 0),
+                    "tp_price": float(row.get("takeProfitPrice") or 0),
+                }
+        return None
+
+    def diagnostics(self) -> Dict[str, Any]:
+        data = dict(self.raw.diagnostics())
+        data.update({"venue": "mexc", "venue_label": self.spec.label, "position_mode": self.position_mode})
+        return data

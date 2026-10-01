@@ -183,6 +183,7 @@ class Executor:
                 leverage=leverage,
                 available=available,
                 min_notional_usd=float(cfg.get("risk.min_notional_usd", 5.0)),
+                max_margin_usd=float(cfg.get("risk.max_margin_usd", 0.0)) or None,
             )
             if not sizing.ok:
                 log.info("skip %s: %s", symbol, sizing.reason)

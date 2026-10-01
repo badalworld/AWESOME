@@ -29,7 +29,7 @@ separate overrides). This matters for testing and for running paper + live insta
 | `name` | `mexc` | broker implementation |
 | `base_url` | `https://api.mexc.com` | REST base |
 | `ws_url` | `wss://contract.mexc.com/edge` | market-data / user-data socket |
-| `paper_data_source` | `auto` | `auto` \| `mexc` \| `synthetic` — `auto` uses live MEXC public data when reachable, otherwise the simulator |
+| `paper_data_source` | `auto` | `auto` \| `live` \| `synthetic` — `auto` uses live public market data from the venue when reachable, otherwise the simulator |
 | `recv_window_ms` | `60000` | signed-request tolerance |
 | `http2` | `true` | HTTP/2 keep-alive pooling |
 | `max_connections` / `keepalive_expiry` | `20` / `30` | pool size / idle lifetime |
@@ -45,6 +45,7 @@ separate overrides). This matters for testing and for running paper + live insta
 | `max_open_positions` | `10` | hard concurrency cap |
 | `max_total_margin_pct` | `80` | cap on summed margin |
 | `min_notional_usd` | `5` | venue minimum notional |
+| `max_margin_usd` | `0` | hard cap on margin per trade (`0` = no cap) |
 | `max_drawdown_halt_pct` | `40` | kill-switch from peak equity |
 | `max_daily_loss_pct` | `25` | daily loss halt |
 | `loss_cooldown_minutes` | `30` | per-symbol re-entry cooldown after a loss |

@@ -17,6 +17,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from .base import DEFAULT_TAKER_FEE, Candle, ContractSpec, Ticker
+from .venue import symbol_style_name
 
 INTERVAL_SECONDS = {
     "Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800,
@@ -225,17 +226,21 @@ class SyntheticFeed:
     ]
 
     def __init__(self, tick_seconds: float = 0.5, seed: int = 20261001,
-                 history_bars: int = 320, htf_history_bars: int = 200) -> None:
+                 history_bars: int = 320, htf_history_bars: int = 200,
+                 symbol_style: str = "mexc") -> None:
         self.tick_seconds = tick_seconds
         self.seed = seed
         self.history_bars = history_bars
         self.htf_history_bars = htf_history_bars
+        self.symbol_style = symbol_style
         self.symbols: Dict[str, SyntheticSymbol] = {}
         self.contracts: Dict[str, ContractSpec] = {}
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._intervals: set = {"Min5", "Min15"}
-        for i, (sym, price, vol) in enumerate(self.DEFS):
+        for i, (base, price, vol) in enumerate(self.DEFS):
+            base = base.split("_")[0]
+            sym = symbol_style_name(symbol_style, base)
             step = 10 ** -max(1, min(8, int(-math.floor(math.log10(price))) + 3)) if price < 1 else 0.1
             s = SyntheticSymbol(
                 symbol=sym, start_price=price, annual_vol=vol,
@@ -266,7 +271,7 @@ class SyntheticFeed:
                 api_allowed=True,
                 state=0,
                 is_new=False,
-                base=sym.split("_")[0],
+                base=base,
                 quote="USDT",
             )
 

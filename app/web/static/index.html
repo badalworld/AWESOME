@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark" />
   <meta name="theme-color" content="#04060f" />
-  <title>AO Divergence Futures Bot — MEXC</title>
+  <title>AO Divergence Futures Bot — MEXC · Binance · KuCoin</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -19,7 +19,7 @@
       <div class="logo">AO</div>
       <div>
         <div class="title">Awesome-Oscillator Divergence Bot</div>
-        <div class="subtitle">MEXC USDT-M Futures · 5m divergences · ATR 3× stop · stepped trailing</div>
+        <div class="subtitle"><span id="brandVenue">MEXC Futures</span> · 5m divergences · ATR 3× stop · stepped trailing</div>
       </div>
     </div>
 
@@ -54,6 +54,11 @@
       <button id="flattenBtn" class="btn btn-danger">Flatten all</button>
     </div>
   </header>
+
+  <div class="venue-strip" id="venueStrip">
+    <div class="venue-tabs" id="venueTabs"></div>
+    <div class="venue-meta" id="venueMeta">loading venues…</div>
+  </div>
 
   <div class="target-bar">
     <div class="target-track"><div id="targetFill" class="target-fill"></div></div>
@@ -242,17 +247,20 @@
     <section id="tab-settings" class="tab-panel">
       <div class="card">
         <div class="card-head">
-          <h3>MEXC API credentials</h3>
+          <h3>API credentials</h3>
           <span id="credState" class="badge badge-dim">not configured</span>
         </div>
         <p class="muted">
-          Keys are encrypted with AES-256-GCM using a machine-local key
-          (<code>data/.secrets/machine.key</code>, mode 0600) and never returned by the API.
-          Enable <b>futures order</b> permission on the key; IP whitelisting is strongly recommended.
+          Each exchange stores its own key in its own encrypted store — nothing is shared between
+          venues. Keys are encrypted with AES-256-GCM using a machine-local key
+          (<code>data/.secrets/machine.key</code>, mode 0600) and are never returned by the API.
+          Enable <b>futures trade</b> permission; IP whitelisting is strongly recommended.
         </p>
+        <div class="chip-row" id="credVenueChips"></div>
         <div class="form-grid">
-          <label>API key<input id="apiKey" class="input" type="password" placeholder="mx…" autocomplete="off" /></label>
+          <label>API key<input id="apiKey" class="input" type="password" placeholder="api key" autocomplete="off" /></label>
           <label>API secret<input id="apiSecret" class="input" type="password" placeholder="••••••••" autocomplete="off" /></label>
+          <label id="passphraseWrap" class="hidden">API passphrase<input id="apiPassphrase" class="input" type="password" placeholder="KuCoin requires a passphrase" autocomplete="off" /></label>
         </div>
         <div class="row-actions">
           <button id="saveCreds" class="btn">Save &amp; verify</button>
@@ -263,7 +271,15 @@
       </div>
 
       <div class="card">
-        <div class="card-head"><h3>Trading mode</h3></div>
+        <div class="card-head">
+          <h3>Trading mode <span class="muted">— this venue</span></h3>
+          <span id="scopeHint" class="badge badge-dim">venue scope</span>
+        </div>
+        <p class="muted">
+          This panel always edits <b id="modeVenueLabel">the active venue</b>. Strategy, filters and
+          risk below are global by default (identical rules everywhere) unless you turn on
+          “this venue only”.
+        </p>
         <div class="form-grid">
           <label>Mode
             <select id="cfgMode" class="input">
@@ -293,6 +309,11 @@
         </div>
       </div>
 
+      <div class="scope-bar">
+        <label class="switch"><input type="checkbox" id="venueScope" /> apply this venue only (write
+          <code>venues.&lt;id&gt;.*</code> overrides)</label>
+      </div>
+
       <div class="card">
         <div class="card-head"><h3>Risk, stops &amp; trailing</h3><small class="muted">all values configurable &amp; persisted</small></div>
         <div class="form-grid" id="riskForm"></div>
@@ -317,6 +338,19 @@
         <div class="row-actions">
           <button id="saveUniverse" class="btn">Save universe settings</button>
           <button id="resetUniverse" class="btn btn-ghost">Restore defaults</button>
+        </div>
+      </div>
+    </section>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>Venue connection <span class="muted" id="venueConnLabel">—</span></h3>
+          <small class="muted">per-venue overrides (require an engine restart)</small>
+        </div>
+        <div class="form-grid" id="venueForm"></div>
+        <div class="row-actions">
+          <button id="saveVenue" class="btn">Save venue settings</button>
+          <button id="resetVenue" class="btn btn-ghost">Restore defaults</button>
         </div>
       </div>
     </section>

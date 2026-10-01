@@ -14,7 +14,89 @@ const state = {
   logSeq: 0,
   logLines: [],
   tradeFilter: '',
+  venue: localStorage.getItem('ao.venue') || 'mexc',
+  venues: [],            // metadata from /api/venues/meta
+  summary: [],           // live per-venue summary from /api/venues
+  credVenue: null,       // venue being edited in the credentials card
+  venueScope: false,     // write config as venues.<id>.* overrides
+  ws: null,
 };
+
+/* ------------------------------ venues ------------------------------ */
+function venueById(id) { return state.venues.find(v => v.id === id) || { id, label: id, needs_passphrase: false }; }
+function venueLabel(id) { return venueById(id).label || id; }
+
+/** Venue-scoped API path: /api/v/<active venue><path> */
+function vapi(path, opts) { return api(`/api/v/${state.venue}${path}`, opts); }
+
+/** Config keys are written globally, or as venues.<id>.* when scoped. */
+function scopedKey(key) {
+  return state.venueScope && !key.startsWith('venues.') ? `venues.${state.venue}.${key}` : key;
+}
+
+function renderVenueTabs() {
+  const host = $('#venueTabs');
+  if (!host) return;
+  const summary = new Map(state.summary.map(v => [v.id, v]));
+  host.innerHTML = state.venues.map(v => {
+    const s = summary.get(v.id) || {};
+    const live = s.running ? (s.mode === 'live' ? 'live' : 'paper') : 'off';
+    const pnl = Number(s.realized_pnl || 0);
+    const cred = s.credentials ? (s.credentials.complete ? 'keys ✓' : (s.credentials.configured ? 'keys partial' : 'no keys')) : '';
+    return `<button class="venue-tab ${v.id === state.venue ? 'active' : ''} ${s.running ? '' : 'offline'}" data-venue="${v.id}">
+      <span class="vt-dot ${s.running ? 'on' : 'off'}"></span>
+      <span class="vt-name">${esc(v.label)}<em class="vt-mode vt-${live}">${live.toUpperCase()}</em></span>
+      <span class="vt-stats">
+        <b class="${cls(pnl)}">${s.equity != null ? fmtMoney(s.equity) : '—'}</b>
+        <i class="${cls(pnl)}">${pnl ? fmtMoney(pnl) : '$0.00'}</i>
+        <i>${s.open_positions ?? 0} open</i>
+        <i class="vt-cred">${cred}</i>
+      </span>
+    </button>`;
+  }).join('');
+  $$('#venueTabs .venue-tab').forEach(btn => btn.onclick = () => switchVenue(btn.dataset.venue));
+}
+
+async function pollVenues() {
+  try {
+    const data = await api('/api/venues');
+    state.summary = data.venues || [];
+    renderVenueTabs();
+    renderVenueBar();
+  } catch (e) { /* keep last known */ }
+}
+
+function renderVenueBar() {
+  const s = state.summary.find(v => v.id === state.venue);
+  const el = $('#venueMeta');
+  if (!el) return;
+  if (!s) { el.textContent = ''; return; }
+  const bits = [
+    `<span class="vm-chip">${esc(venueLabel(state.venue))}</span>`,
+    `<span>${s.running ? 'engine running' : 'engine stopped'}</span>`,
+    `<span>market data: <b>${esc(s.market_data || '—')}</b></span>`,
+    `<span>watchlist: <b>${s.watchlist ?? 0}</b></span>`,
+    `<span>trades: <b>${s.trades ?? 0}</b> · win ${Number(s.win_rate || 0).toFixed(1)}%</span>`,
+    s.start_error ? `<span class="neg">start error: ${esc(s.start_error)}</span>` : '',
+  ];
+  el.innerHTML = bits.filter(Boolean).join(' <i class="sep">·</i> ');
+}
+
+async function switchVenue(id) {
+  if (!id || id === state.venue) return;
+  state.venue = id;
+  state.logLines = [];
+  state.logSeq = 0;
+  localStorage.setItem('ao.venue', id);
+  const brand = $('#brandVenue');
+  if (brand) brand.textContent = venueLabel(id);
+  renderVenueTabs();
+  renderVenueBar();
+  if (state.ws) { try { state.ws.close(); } catch (e) {} }
+  try { await loadSettings(); } catch (e) {}
+  try { renderAll(await vapi('/state')); } catch (e) {}
+  connectWS();
+}
 
 /* ------------------------------ helpers ------------------------------ */
 function fmtMoney(v, digits = 2) {
@@ -274,7 +356,7 @@ function renderPositions(d) {
   }).join('');
   $$('[data-close]', tbody).forEach(b => b.onclick = async () => {
     try {
-      await api('/api/control/close', { method: 'POST', body: JSON.stringify({ symbol: b.dataset.close }) });
+      await vapi('/control/close', { method: 'POST', body: JSON.stringify({ symbol: b.dataset.close }) });
       toast('Close order sent for ' + b.dataset.close, 'ok');
     } catch (e) { toast('Close failed: ' + e.message, 'error'); }
   });
@@ -430,13 +512,18 @@ tickClock();
 /* ------------------------------ header ------------------------------ */
 function renderHeader(d) {
   const engine = d.state.engine, acct = d.state.account;
+  const venue = d.state.venue || {};
   const modeBadge = $('#modeBadge');
-  modeBadge.textContent = state.config?.app?.mode === 'live' ? 'LIVE' : 'PAPER';
-  modeBadge.className = 'badge ' + (state.config?.app?.mode === 'live' ? 'badge-live' : 'badge-paper');
+  const isLive = engine.mode === 'live';
+  modeBadge.textContent = `${(venue.id || state.venue).toUpperCase()} · ${isLive ? 'LIVE' : 'PAPER'}`;
+  modeBadge.className = 'badge ' + (isLive ? 'badge-live' : 'badge-paper');
+  const brand = $('#brandVenue');
+  if (brand && venue.label) brand.textContent = venue.label;
 
   const db = $('#dataBadge');
   const md = engine.market_data || 'unknown';
-  db.textContent = md === 'synthetic' ? 'SIMULATED DATA' : (md === 'mexc-public' ? 'MEXC public data' : 'MEXC live');
+  const mdLabel = { synthetic: 'SIMULATED DATA', public: 'LIVE public market data', live: 'LIVE exchange feed' }[md] || md;
+  db.textContent = mdLabel;
   db.className = 'badge ' + (md === 'synthetic' ? 'badge-paper' : 'badge-dim');
 
   setHeartbeat(engine, d.state.broker_diagnostics?.ws?.connected !== false);
@@ -479,6 +566,7 @@ const FIELD_GROUPS = {
     ['risk.max_drawdown_halt_pct', 'Drawdown halt (%)', 'number', 1],
     ['risk.cooldown_after_loss_min', 'Cooldown after loss (min)', 'number', 1],
     ['risk.min_notional_usd', 'Min notional ($)', 'number', 1],
+    ['risk.max_margin_usd', 'Max margin per trade ($, 0 = off)', 'number', 1],
     ['stoploss.atr_multiplier', 'ATR multiplier (SL)', 'number', 0.1],
     ['stoploss.atr_period', 'ATR period', 'number', 1],
     ['stoploss.use_mark_price_trigger', 'Trigger on mark price', 'bool'],
@@ -565,8 +653,42 @@ function setPath(obj, path, value) {
   node[parts[parts.length - 1]] = value;
 }
 
-function buildForms() {
-  const cfg = state.config || {};
+const VENUE_FIELDS = [
+  ['enabled', 'enabled', 'bool'],
+  ['mode', 'mode (paper / live)', 'select', ['paper', 'live']],
+  ['rest_base', 'REST base URL', 'text'],
+  ['ws_url', 'WebSocket URL', 'text'],
+  ['recv_window_ms', 'recv window (ms)', 'number', 500],
+  ['taker_fee', 'taker fee (fraction)', 'number', 0.0001],
+  ['paper_data_source', 'paper data source', 'select', ['auto', 'live', 'synthetic']],
+  ['entry_order_type', 'entry order type', 'select', ['market', 'ioc_limit']],
+];
+
+function buildVenueForm(venueCfg) {
+  const form = $('#venueForm');
+  if (!form) return;
+  const block = venueCfg || {};
+  form.innerHTML = VENUE_FIELDS.map(([key, label, type, extra]) => {
+    const value = block[key];
+    const id = 'v_' + key;
+    const attr = `id="${id}" data-key="${key}" data-type="${type}"`;
+    if (type === 'bool') {
+      return `<label>${esc(label)}<select ${attr} class="input">
+        <option value="true"${value !== false ? ' selected' : ''}>true</option>
+        <option value="false"${value === false ? ' selected' : ''}>false</option></select></label>`;
+    }
+    if (type === 'select') {
+      const opts = extra.map(o => `<option value="${o}"${String(value) === String(o) ? ' selected' : ''}>${o}</option>`).join('');
+      return `<label>${esc(label)}<select ${attr} class="input">${opts}</select></label>`;
+    }
+    const step = type === 'number' ? ` step="${extra || 1}"` : '';
+    const itype = type === 'number' ? 'number' : 'text';
+    return `<label>${esc(label)}<input ${attr} class="input" type="${itype}"${step} value="${value ?? ''}" /></label>`;
+  }).join('');
+}
+
+function buildForms(overrideCfg) {
+  const cfg = overrideCfg || state.effective || state.config || {};
   Object.entries(FIELD_GROUPS).forEach(([formId, fields]) => {
     const form = $('#' + formId);
     if (!form) return;
@@ -604,9 +726,15 @@ function collectPatch(formId) {
   return patch;
 }
 
+function scopePatch(patch) {
+  const out = {};
+  Object.entries(patch).forEach(([k, v]) => { out[scopedKey(k)] = v; });
+  return out;
+}
+
 async function saveGroup(formId, label) {
   try {
-    const res = await api('/api/settings', { method: 'PUT', body: JSON.stringify(collectPatch(formId)) });
+    const res = await vapi('/settings', { method: 'PUT', body: JSON.stringify(scopePatch(collectPatch(formId))) });
     toast(`${label} saved (${Object.keys(res.applied).length} settings)${res.restart_required ? ' — restart the engine to apply' : ''}`, 'ok');
     await loadSettings();
   } catch (e) { toast('Save failed: ' + e.message, 'error'); }
@@ -614,36 +742,78 @@ async function saveGroup(formId, label) {
 
 async function resetGroup(formId, keys, label) {
   try {
-    await api('/api/settings/reset', { method: 'POST', body: JSON.stringify(keys) });
+    const list = (keys || $$('#' + formId + ' [data-key]').map(el => el.dataset.key)).map(scopedKey);
+    await vapi('/settings/reset', { method: 'POST', body: JSON.stringify(list) });
     toast(`${label} restored to defaults`, 'ok');
     await loadSettings();
   } catch (e) { toast('Reset failed: ' + e.message, 'error'); }
 }
 
 async function loadSettings() {
-  const data = await api('/api/settings');
+  const data = await vapi('/settings');
   state.config = data.config;
   state.credentials = data.credentials;
-  buildForms();
-  const cfg = data.config;
-  $('#cfgMode').value = cfg.app.mode;
-  $('#cfgPaperSource').value = cfg.exchange.paper_data_source || 'auto';
-  $('#cfgPaperEquity').value = cfg.account.paper_starting_equity;
-  $('#cfgEntryType').value = cfg.exchange.entry_order_type;
+  state.effective = data.effective || {};
+  state.venueMeta = data.venue || {};
+  state.credVenue = state.credVenue || state.venue;
+  // forms render the *effective* (venue-scoped) values so the panel shows what
+  // will actually be used on this exchange
+  buildForms(data.effective || data.config);
+  buildVenueForm(data.venue_overrides);
+  renderCredVenueChips();
+  renderCredState();
+  const label = $('#modeVenueLabel');
+  if (label) label.textContent = venueLabel(state.venue);
+  const vc = $('#venueConnLabel');
+  if (vc) vc.textContent = '· ' + venueLabel(state.venue);
+  $('#cfgMode').value = data.mode || 'paper';
+  $('#cfgPaperSource').value = state.effective['exchange.paper_data_source'] || 'auto';
+  $('#cfgPaperEquity').value = state.effective['account.paper_starting_equity'];
+  $('#cfgEntryType').value = state.effective['exchange.entry_order_type'] || 'market';
+  const brand = $('#brandVenue');
+  if (brand) brand.textContent = venueLabel(state.venue);
+}
+
+function renderCredVenueChips() {
+  const host = $('#credVenueChips');
+  if (!host) return;
+  host.innerHTML = state.venues.map(v => {
+    const s = state.summary.find(x => x.id === v.id) || {};
+    const cred = s.credentials || {};
+    const state_ = cred.complete ? 'ok' : (cred.configured ? 'partial' : 'none');
+    return `<button class="chip ${v.id === state.credVenue ? 'active' : ''}" data-cred-venue="${v.id}">
+      ${esc(v.label)} <i class="chip-key chip-${state_}">${state_ === 'ok' ? 'key ✓' : state_ === 'partial' ? 'incomplete' : 'no key'}</i></button>`;
+  }).join('');
+  $$('#credVenueChips .chip').forEach(btn => btn.onclick = () => {
+    state.credVenue = btn.dataset.credVenue;
+    renderCredVenueChips();
+    renderCredState();
+  });
+}
+
+function renderCredState() {
   const cs = $('#credState');
-  if (data.credentials.configured) {
-    cs.textContent = 'configured · ' + data.credentials.api_key_preview;
+  const vid = state.credVenue || state.venue;
+  const s = state.summary.find(v => v.id === vid) || {};
+  const cred = s.credentials || {};
+  if (cred.complete) {
+    cs.textContent = `${venueLabel(vid)} · configured · ${cred.api_key_preview || ''}`;
     cs.className = 'badge badge-ok';
+  } else if (cred.configured) {
+    cs.textContent = `${venueLabel(vid)} · incomplete (passphrase missing?)`;
+    cs.className = 'badge badge-warn';
   } else {
-    cs.textContent = 'not configured';
+    cs.textContent = `${venueLabel(vid)} · not configured`;
     cs.className = 'badge badge-dim';
   }
+  const wrap = $('#passphraseWrap');
+  if (wrap) wrap.classList.toggle('hidden', !venueById(vid).needs_passphrase);
 }
 
 /* ------------------------------ logs ------------------------------ */
 async function pollLogs() {
   try {
-    const res = await api('/api/logs?after=' + state.logSeq + '&limit=200');
+    const res = await vapi('/logs?after=' + state.logSeq + '&limit=200');
     if (res.logs && res.logs.length) {
       res.logs.forEach(l => {
         state.logSeq = Math.max(state.logSeq, l.seq);
@@ -674,7 +844,9 @@ function renderAll(payload) {
 
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const venue = state.venue;
+  const ws = new WebSocket(`${proto}://${location.host}/ws/${venue}`);
+  state.ws = ws;
   let alive = false;
   ws.onopen = () => { alive = true; };
   ws.onmessage = ev => {
@@ -684,14 +856,14 @@ function connectWS() {
     alive = false;
     setTimeout(async () => {
       // fall back to polling while the socket is down
-      try { renderAll(await api('/api/state')); } catch (e) {}
+      try { renderAll(await vapi('/state')); } catch (e) {}
       connectWS();
     }, 2000);
   };
   ws.onerror = () => ws.close();
   setInterval(async () => {
     if (!alive) {
-      try { renderAll(await api('/api/state')); } catch (e) {}
+      try { renderAll(await vapi('/state')); } catch (e) {}
     }
   }, 5000);
 }
@@ -711,14 +883,14 @@ function initControls() {
   $('#pauseBtn').onclick = async () => {
     const enabled = !(state.lastState?.state?.engine?.trading_enabled);
     try {
-      await api('/api/control/trading', { method: 'POST', body: JSON.stringify({ enabled }) });
+      await vapi('/control/trading', { method: 'POST', body: JSON.stringify({ enabled }) });
       toast(enabled ? 'Trading resumed' : 'Trading paused (open positions still managed)', 'ok');
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   };
   $('#flattenBtn').onclick = async () => {
     if (!confirm('Close ALL open positions at market?')) return;
     try {
-      const res = await api('/api/control/flatten', { method: 'POST' });
+      const res = await vapi('/control/flatten', { method: 'POST' });
       toast(`Flattened ${res.closed.length} position(s)`, 'ok');
     } catch (e) { toast('Flatten failed: ' + e.message, 'error'); }
   };
@@ -726,61 +898,103 @@ function initControls() {
   $('#clearLogs').onclick = () => { state.logLines = []; $('#logView').innerHTML = ''; };
 
   $('#saveCreds').onclick = async () => {
+    const vid = state.credVenue || state.venue;
     const api_key = $('#apiKey').value.trim(), api_secret = $('#apiSecret').value.trim();
+    const passphrase = ($('#apiPassphrase')?.value || '').trim();
     if (!api_key || !api_secret) return toast('Enter both API key and secret', 'error');
+    if (venueById(vid).needs_passphrase && !passphrase) return toast(venueLabel(vid) + ' also needs the API passphrase', 'error');
     const btn = $('#saveCreds'); btn.disabled = true; btn.textContent = 'Saving & verifying…';
     try {
-      const res = await api('/api/credentials', { method: 'POST', body: JSON.stringify({ api_key, api_secret }) });
+      const res = await api(`/api/v/${vid}/credentials`, {
+        method: 'POST', body: JSON.stringify({ api_key, api_secret, passphrase }),
+      });
       if (res.verified) {
-        $('#credResult').innerHTML = `<span class="pos">Verified ✓</span> equity ${fmtMoney(res.equity)} · available ${fmtMoney(res.available)}`;
-        toast('API key saved and verified against MEXC', 'ok');
+        $('#credResult').innerHTML = `<span class="pos">Verified ✓</span> ${esc(venueLabel(vid))} equity ${fmtMoney(res.equity)} · available ${fmtMoney(res.available)} · ${esc(res.position_mode || '')}`;
+        toast(`${venueLabel(vid)} API key saved and verified`, 'ok');
       } else {
         $('#credResult').innerHTML = `<span class="neg">Saved, but verification failed:</span> ${esc(res.error || 'unknown')}`;
         toast('Key saved, but verification failed: ' + (res.error || ''), 'error');
       }
-      $('#apiKey').value = ''; $('#apiSecret').value = '';
+      $('#apiKey').value = ''; $('#apiSecret').value = ''; if ($('#apiPassphrase')) $('#apiPassphrase').value = '';
+      await pollVenues();
       await loadSettings();
     } catch (e) { toast('Save failed: ' + e.message, 'error'); }
     finally { btn.disabled = false; btn.textContent = 'Save & verify'; }
   };
   $('#testCreds').onclick = async () => {
+    const vid = state.credVenue || state.venue;
     try {
-      const res = await api('/api/credentials/test', { method: 'POST' });
+      const res = await api(`/api/v/${vid}/credentials/test`, { method: 'POST' });
       $('#credResult').innerHTML = res.verified
-        ? `<span class="pos">Connected ✓</span> equity ${fmtMoney(res.equity)}`
+        ? `<span class="pos">Connected ✓</span> ${esc(venueLabel(vid))} equity ${fmtMoney(res.equity)}`
         : `<span class="neg">Failed:</span> ${esc(res.error || '')}`;
     } catch (e) { toast('Test failed: ' + e.message, 'error'); }
   };
   $('#clearCreds').onclick = async () => {
-    if (!confirm('Delete stored API keys?')) return;
-    await api('/api/credentials', { method: 'DELETE' });
-    $('#credResult').textContent = 'Credentials deleted.';
+    const vid = state.credVenue || state.venue;
+    if (!confirm(`Delete the stored API keys for ${venueLabel(vid)}?`)) return;
+    await api(`/api/v/${vid}/credentials`, { method: 'DELETE' });
+    $('#credResult').textContent = venueLabel(vid) + ' credentials deleted.';
+    await pollVenues();
+    await loadSettings();
+  };
+
+  const scopeBox = $('#venueScope');
+  if (scopeBox) scopeBox.onchange = () => {
+    state.venueScope = scopeBox.checked;
+    const hint = $('#scopeHint');
+    if (hint) {
+      hint.textContent = state.venueScope ? `writes venues.${state.venue}.*` : 'global (all venues)';
+      hint.className = 'badge ' + (state.venueScope ? 'badge-warn' : 'badge-dim');
+    }
+  };
+
+  $('#saveVenue').onclick = async () => {
+    const patch = {};
+    $$('#venueForm [data-key]').forEach(el => {
+      const key = el.dataset.key, type = el.dataset.type;
+      let value = el.value;
+      if (type === 'bool') value = value === 'true';
+      else if (type === 'number') value = Number(value);
+      patch[`venues.${state.venue}.${key}`] = value;
+    });
+    try {
+      await vapi('/settings', { method: 'PUT', body: JSON.stringify(patch) });
+      toast(`${venueLabel(state.venue)} connection settings saved — restart the engine to apply`, 'ok');
+      await loadSettings();
+    } catch (e) { toast('Save failed: ' + e.message, 'error'); }
+  };
+  $('#resetVenue').onclick = async () => {
+    const keys = VENUE_FIELDS.map(([k]) => `venues.${state.venue}.${k}`);
+    await vapi('/settings/reset', { method: 'POST', body: JSON.stringify(keys) });
+    toast(`${venueLabel(state.venue)} connection settings restored`, 'ok');
     await loadSettings();
   };
 
   $('#saveMode').onclick = async () => {
+    const vid = state.venue;
     const patch = {
-      'app.mode': $('#cfgMode').value,
-      'exchange.paper_data_source': $('#cfgPaperSource').value,
+      [`venues.${vid}.mode`]: $('#cfgMode').value,
+      [`venues.${vid}.paper_data_source`]: $('#cfgPaperSource').value,
       'account.paper_starting_equity': Number($('#cfgPaperEquity').value || 1000),
-      'exchange.entry_order_type': $('#cfgEntryType').value,
+      [`venues.${vid}.entry_order_type`]: $('#cfgEntryType').value,
     };
     try {
-      const res = await api('/api/settings', { method: 'PUT', body: JSON.stringify(patch) });
-      toast('Mode settings saved — restarting engine…', 'ok');
-      await api('/api/control/restart', { method: 'POST' });
-      setTimeout(loadSettings, 2500);
+      await vapi('/settings', { method: 'PUT', body: JSON.stringify(patch) });
+      toast(`${venueLabel(vid)} mode saved — restarting that engine…`, 'ok');
+      await api(`/api/v/${vid}/control/restart`, { method: 'POST' });
+      setTimeout(() => { loadSettings(); pollVenues(); }, 2500);
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   };
   $('#restartEngine').onclick = async () => {
-    await api('/api/control/restart', { method: 'POST' });
-    toast('Engine restarting…');
+    await vapi('/control/restart', { method: 'POST' });
+    toast('Restarting ' + venueLabel(state.venue) + '…');
   };
   $('#resetPaper').onclick = async () => {
     const eq = Number(prompt('New paper starting equity ($):', String(state.config?.account?.paper_starting_equity ?? 1000)) || 0);
     if (!eq) return;
     try {
-      await api('/api/control/paper-reset', { method: 'POST', body: JSON.stringify({ equity: eq }) });
+      await vapi('/control/paper-reset', { method: 'POST', body: JSON.stringify({ equity: eq }) });
       toast('Paper account reset to ' + fmtMoney(eq), 'ok');
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   };
@@ -798,9 +1012,20 @@ window.addEventListener('resize', () => { if (state.lastState) renderAll(state.l
 (async function boot() {
   initTabs();
   initControls();
+  try {
+    const meta = await api('/api/venues/meta');
+    state.venues = meta.venues || [];
+  } catch (e) {
+    state.venues = [{ id: 'mexc', label: 'MEXC Futures' }, { id: 'binance', label: 'Binance Futures' }, { id: 'kucoin', label: 'KuCoin Futures' }];
+  }
+  if (!state.venues.some(v => v.id === state.venue)) state.venue = state.venues[0]?.id || 'mexc';
+  const brand = $('#brandVenue');
+  if (brand) brand.textContent = venueLabel(state.venue);
+  await pollVenues();
   try { await loadSettings(); } catch (e) { toast('Could not load settings: ' + e.message, 'error'); }
   connectWS();
   pollLogs();
   setInterval(pollLogs, 3000);
-  try { renderAll(await api('/api/state')); } catch (e) {}
+  setInterval(pollVenues, 5000);
+  try { renderAll(await vapi('/state')); } catch (e) {}
 })();

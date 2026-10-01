@@ -23,9 +23,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from app.config import load as load_config                     # noqa: E402
-from app.db import Database                                    # noqa: E402
-from app.engine import TradingEngine                           # noqa: E402
-from app.keystore import CredentialStore                       # noqa: E402
+from app.manager import VenueManager                           # noqa: E402
 from app.utils import RingLogHandler                           # noqa: E402
 from app.web.server import build_app                           # noqa: E402
 
@@ -52,26 +50,28 @@ async def main_async(args: argparse.Namespace) -> None:
 
     data_dir = cfg.data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
-    db = Database(cfg.resolve(str(cfg.get("persistence.db_path", "data/bot.db"))))
-    keystore = CredentialStore(db, data_dir / ".secrets")
-    await keystore.load()
 
-    engine = TradingEngine(cfg, db, keystore)
-    setup_logging(str(cfg.get("app.log_level", "INFO")), engine.ring_log)
+    manager = VenueManager(cfg)
+    setup_logging(str(cfg.get("app.log_level", "INFO")), manager.primary.engine.ring_log)
 
     log = logging.getLogger("main")
     log.info("=" * 78)
-    log.info("AO Divergence Futures Bot — mode=%s | data_dir=%s", cfg.mode, data_dir)
+    log.info("AO Divergence Futures Bot — %d venues | data_dir=%s",
+             len(manager.all()), data_dir)
+    for ctx in manager.all():
+        log.info("  %-8s %-24s mode=%-5s enabled=%s db=%s",
+                 ctx.id, ctx.spec.label, ctx.cfg.mode, ctx.enabled, ctx.db.path.name)
     log.info("=" * 78)
 
     if not args.no_engine:
-        try:
-            await engine.start()
-        except Exception as exc:  # noqa: BLE001
-            log.error("engine failed to start: %s", exc)
-            log.error("The dashboard is still available — fix settings there and press 'Restart engine'.")
+        results = await manager.start_all()
+        for vid, state in results.items():
+            log.info("[%s] %s", vid, state)
+        if all(str(s).startswith(("error",)) for s in results.values()):
+            log.error("No venue could start — the dashboard is still available; "
+                      "fix settings there and press 'Restart'.")
 
-    app = build_app(engine, cfg, db, keystore)
+    app = build_app(manager, cfg)
 
     import uvicorn
 
@@ -96,8 +96,8 @@ async def main_async(args: argparse.Namespace) -> None:
 
     async def _watch() -> None:
         await stop_event.wait()
-        log.info("shutdown requested — stopping engine and server")
-        await engine.stop()
+        log.info("shutdown requested — stopping all engines and the server")
+        await manager.stop_all()
         server.should_exit = True
 
     watcher = asyncio.create_task(_watch())
@@ -107,13 +107,14 @@ async def main_async(args: argparse.Namespace) -> None:
         watcher.cancel()
         with contextlib.suppress(Exception):
             await watcher
-        await engine.stop()
-        db.close()
+        await manager.stop_all()
+        manager.close()
         log.info("bye")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AO Divergence Futures Bot (MEXC)")
+    parser = argparse.ArgumentParser(
+        description="AO Divergence Futures Bot (MEXC + Binance + KuCoin)")
     parser.add_argument("--port", type=int, default=None, help="dashboard port")
     parser.add_argument("--no-engine", action="store_true", help="start the dashboard only")
     args = parser.parse_args()

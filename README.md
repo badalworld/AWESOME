@@ -1,15 +1,21 @@
-# AWESOME — Awesome-Oscillator Divergence Futures Bot (MEXC)
+# AWESOME — Awesome-Oscillator Divergence Futures Bot (MEXC · Binance · KuCoin)
 
-An event-driven, low-latency trading system for **MEXC USDT-M perpetual futures** that trades
-**Awesome-Oscillator (AO) divergences on the 5-minute chart** on the market's **most volatile
-liquid contracts**, with a full **anti-fake-signal filter stack**, **ATR×3 stop-loss**,
-**+200% ROI take profit**, a **stepped trailing stop**, and **8%-of-equity compounding sizing**
-towards a configurable equity target.
+An event-driven, low-latency trading system for **USDT-M perpetual futures on three venues —
+MEXC, Binance Futures and KuCoin Futures** — that trades **Awesome-Oscillator (AO) divergences on
+the 5-minute chart** on each market's **most volatile liquid contracts**, with a full
+**anti-fake-signal filter stack**, **ATR×3 stop-loss**, **+200% ROI take profit**, a
+**stepped trailing stop**, and **8%-of-equity compounding sizing** towards a configurable equity
+target.
+
+Each venue runs as an **independent account** — its own API key/secret, its own database, equity,
+positions, order router and market-data socket — inside one process and one dashboard, so a failure
+or rate-limit on one exchange never touches the others. The **strategy, filters, risk and trailing
+rules are shared code**, identical on all three.
 
 The dashboard (FastAPI + vanilla JS, no build step) provides real-time balance tracking,
 trade history, live performance metrics, an equity curve, universe scanner output, signal
 explanations (why a signal was taken or skipped), latency telemetry, and a settings panel
-where you enter your MEXC API key.
+where you enter a separate API key/secret per venue (plus the KuCoin passphrase).
 
 > ⚠️ **Risk warning.** Leveraged futures trading can lose your entire balance. A $1,000 → $10,000
 > target in 7 days is an extremely aggressive objective: the built-in Monte-Carlo model tells you
@@ -27,10 +33,12 @@ where you enter your MEXC API key.
 - [The strategy](#the-strategy)
 - [Anti-fake-signal filters](#anti-fake-signal-filters)
 - [Risk model: sizing, SL, TP, trailing](#risk-model)
-- [MEXC integration & low-latency design](#mexc-integration--low-latency-design)
+- [Multi-venue architecture](#multi-venue-architecture-mexc--binance--kucoin)
+- [Venue integration & low-latency design](#venue-integration--low-latency-design)
 - [The dashboard](#the-dashboard)
 - [Configuration](#configuration)
 - [Going live safely](#going-live-safely)
+- [Expectancy & win probability](docs/EDGE_AND_EXPECTANCY.md)
 - [Testing](#testing)
 - [Project layout](#project-layout)
 - [FAQ / troubleshooting](#faq--troubleshooting)
@@ -44,7 +52,7 @@ where you enter your MEXC API key.
 | AO divergence on 5m | `app/strategy/divergence.py` — fractal pivots + AO displacement, entry only on confirmed structure break |
 | Most volatile assets | `app/strategy/universe.py` — two-stage scan (ticker → candles) scoring turnover × realised 5m volatility × momentum |
 | Avoid fake signals | `app/strategy/filters.py` — 8 independent filters + composite quality score, all persisted and shown |
-| Real MEXC execution | `app/exchange/mexc.py` + `app/exchange/live.py` — signed REST + WSS, attached SL/TP, reduce-only exits |
+| Real multi-venue execution | `app/exchange/{mexc,binance,kucoin}.py` + `live.py` — signed REST + own WSS per venue, venue-specific attached/standalone SL/TP, reduce-only exits |
 | Low-latency routing | HTTP/2 keep-alive pool, time-sync offset, idempotent `externalOid`, priority lanes for exits, coalesced tick dispatch, p50/p95/p99 telemetry |
 | ATR×3 stop-loss per transaction | `app/risk/manager.py:build_plan()` — `entry ∓ 3 × ATR(14)`, clamped to sane ROI bounds, exchange-side + local watchdog |
 | TP = +200% ROI on margin | `ROI = price_move% × leverage`; price = `entry × (1 ± 200/(100×10))`, placed as a reduce-only limit |
@@ -52,7 +60,7 @@ where you enter your MEXC API key.
 | 8% of equity, 10x, max 10 positions | `size_position()` + `RiskGuard` (margin cap, daily-loss halt, drawdown kill-switch, per-symbol cooldown) |
 | Compounding to a target | `app/analytics/compound.py` — Monte-Carlo + required-win-rate maths, live on the dashboard |
 | Dashboard: balance, history, metrics | `app/web/` — WebSocket live feed, equity curve, ROI distribution, trade table, latency panel |
-| API key input in dashboard | Settings tab → encrypted (AES-256-GCM) storage, live verification against MEXC |
+| API keys in dashboard | Settings tab → **one key/secret per venue**, encrypted (AES-256-GCM) at rest, live verification per venue |
 
 ---
 
@@ -71,16 +79,18 @@ python3 run.py --no-engine     # dashboard only, start the engine from the UI
 AO_CONFIG=/path/to/config.toml python3 run.py
 ```
 
-Out of the box the bot starts in **paper mode**. If `api.mexc.com` is reachable it paper-trades on
-**live MEXC market data**; otherwise (offline/CI) it uses the built-in **synthetic volatile-market
-simulator** so every part of the system is still exercisable — the dashboard clearly labels which
-source is active (`MEXC public data` vs `SIMULATED DATA`).
+Out of the box all three venues start in **paper mode**. When a venue's public REST/WS is reachable
+the venue paper-trades on **live market data from that venue**; otherwise (offline/CI) it uses the
+built-in **synthetic volatile-market simulator** so every part of the system is still exercisable —
+the dashboard labels the active source (`public`, `live` or `SIMULATED DATA`) in each venue tab.
 
-To trade live:
+To trade live (repeat per venue; venues are independent):
 
-1. Create a MEXC API key with **futures order** permission enabled (IP-restrict it!).
-2. Open the dashboard → **Settings** → paste **API key** + **secret** → *Save & verify*.
-3. Set **Mode = live** → *Apply* (this restarts the engine in live mode).
+1. Create a futures API key on the exchange with **order** permission enabled
+   (IP-restrict it!). KuCoin also requires an **API passphrase**.
+2. Open the dashboard → **Settings** → **Venue connection** → pick the venue → paste **API key** +
+   **secret** (+ passphrase for KuCoin) → *Save & verify*.
+3. Set **Mode = live** for that venue → *Apply* (restarts only that venue's engine).
 4. Watch the first trade end-to-end; start with a small balance while you build confidence.
 
 ---
@@ -107,7 +117,49 @@ To trade live:
 
 Everything trading-related is broker-agnostic: **paper and live share the identical strategy,
 risk, trailing and execution code paths**, so paper results are meaningful for the code you will
-run live.
+run live. Likewise **all three venues share those code paths** and differ only in their
+`VenueSpec` (endpoints, signing, symbol format, order mapping) and their own account state.
+
+---
+
+## Multi-venue architecture (MEXC · Binance · KuCoin)
+
+```
+        dashboard:  [ MEXC ] [ Binance ] [ KuCoin ]     ← one tab per venue, nothing mixed
+                        │            │           │
+              ┌─────────┴──┐  ┌──────┴─────┐  ┌──┴─────────┐
+              │ VenueCtx   │  │ VenueCtx   │  │ VenueCtx   │   app/manager.py (VenueManager)
+              │ engine     │  │ engine     │  │ engine     │
+              │ DB  data/venues/<id>.db     │  │            │
+              │ keystore   │  │ keystore   │  │ keystore   │   ← separate encrypted API keys
+              │ broker/WS  │  │ broker/WS  │  │ broker/WS  │
+              └────────────┘  └────────────┘  └────────────┘
+                     └── shared: strategy · filters · risk · trailing · analytics ──┘
+```
+
+- **Isolation.** Per venue: `CredentialStore`, SQLite file, `TradingEngine`, broker, order router,
+  market-data stream, equity/positions, watchlist, logs. No mutable state is shared between venues.
+- **Same rules.** `app/strategy/*`, `app/risk/*`, `app/trade/*` and the trailing state machine are
+  used unchanged by every venue; only the venue adapter translates orders/auth/symbols.
+- **Per-venue overrides.** Any global setting can be overridden per venue
+  (`[venues.binance]` in `config.toml`, or the scope switch in the dashboard), e.g. `mode = "live"`
+  for MEXC while Binance and KuCoin stay in paper.
+- **Primary venue.** `app.primary_venue` (default `mexc`) answers the legacy `/api/*` routes, so
+  existing integrations keep working.
+- **HTTP surface.** `GET /api/venues` lists every venue with live status; every endpoint exists
+  both globally (`/api/state`, primary venue) and scoped (`/api/v/kucoin/state`). WebSocket:
+  `/ws/<venue>`.
+- **Venue facts baked into `VenueSpec`** (`app/exchange/venue.py`):
+
+| Venue | Symbols | Taker fee | Signing | Position mode | Attached SL/TP |
+|---|---|---|---|---|---|
+| MEXC | `BTC_USDT` | 0.02 % | api key + timestamp + body | hedge or one-way | yes (on entry order) |
+| Binance USDⓈ-M | `BTCUSDT` | 0.05 % | HMAC-SHA256 query string | one-way or hedge | no (standalone `STOP_MARKET`, `closePosition`) |
+| KuCoin Futures | `XBTUSDTM` | 0.06 % | base64 HMAC + passphrase | one-way | no (standalone reduce-only stop) |
+
+- **KuCoin specifics.** Requires the **API passphrase** (version-2 signature) — the dashboard asks
+  for it and refuses to enable live mode without it. Order `size` is in **contracts**, so the
+  executor rounds to `lotSize`; stop triggers use `stopPriceType = MP` (mark price).
 
 ---
 
@@ -216,9 +268,10 @@ else:               stop_ROI = floor((peak_ROI − 30)/10) × 10 + 20
 per-symbol cooldown after a loss (default 30 min), daily-loss halt (`-25%`), drawdown kill-switch
 (`-40%` from peak equity). Halts are visible on the dashboard and one click to clear.
 
-## MEXC integration & low-latency design
+## Venue integration & low-latency design
 
-Verified against the official MEXC futures docs:
+Every venue adapter is written against that venue's official futures docs. MEXC endpoints
+(the others are listed in `app/exchange/venue.py` and the per-venue modules):
 
 | Purpose | Endpoint |
 |---|---|
@@ -272,7 +325,8 @@ Auth: `ApiKey` + `Request-Time` + `Signature` headers where
 `config.toml` holds the defaults; anything changed in the dashboard is written to
 `data/settings.json` and survives restarts (`Config.reset()` restores defaults). Every value is
 validated on write (type + range + cross-field rules), so a typo in the UI cannot reach the order
-router. Key knobs:
+router. Any key can be overridden per venue with `[venues.<id>]` blocks in `config.toml` or the
+**scope** switch in the dashboard settings. Key knobs:
 
 ```toml
 [risk]        equity_per_trade_pct = 8.0   # per-trade margin, % of current equity
@@ -302,10 +356,24 @@ router. Key knobs:
 6. Run the bot on a VPS geographically close to MEXC's matching engine for the best latency, and
    keep `data/` on persistent storage (it contains your trade history and trailing state).
 
+## Expectancy, win probability & the $10k/7d target
+
+Run **`python3 tools/edge_report.py`** (or read [`docs/EDGE_AND_EXPECTANCY.md`](docs/EDGE_AND_EXPECTANCY.md))
+for the current numbers. The short version, with the strategy as configured:
+
+* +200 % ROI at 10x is a **20 % price move** — on 5m bars that is rare, so in practice the
+  **stepped trailing stop is what closes most winners** (+20 %…+70 % ROI), not the fixed TP.
+* Under that realistic exit distribution the **break-even win rate is ≈ 42 %** (MEXC, ~45 % ROI
+  stop) — i.e. the edge is real but thin, and the filter stack is what has to keep you above it.
+* **$1,000 → $10,000 in 7 days requires +39 %/day**: ~16 clean TP hits in a row, or a >100 % win
+  rate. The honest probability is **≈ 0 % under realistic exits (<1 % even with optimistic
+  assumptions)**. It is a stress metric, not a target — the dashboard's *Compounding* tab shows
+  the same maths live against your own trade history.
+
 ## Testing
 
 ```bash
-python3 tests/run_all.py -v          # 70 tests, ~16 s, no network needed
+python3 tests/run_all.py -v          # 98 tests, ~16 s, no network needed
 python3 -m unittest tests.test_core         # maths, indicators, strategy, filters, analytics
 python3 -m unittest tests.test_integration  # trade lifecycle on a deterministic market
 python3 -m unittest tests.test_engine       # the orchestrator on the offline synthetic feed

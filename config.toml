@@ -11,8 +11,48 @@ data_dir = "data"
 log_level = "INFO"
 timezone = "UTC"
 
+# -----------------------------------------------------------------------------
+#  VENUES — three independent exchanges, one strategy.
+#  Each venue runs its own engine, its own database (data/venues/<id>.db) and its
+#  own API credentials, so nothing can cross-contaminate. Anything under
+#  [venues.<id>] overrides the global value for that venue only; everything not
+#  overridden (strategy, risk, filters, trailing) is shared -> identical rules.
+# -----------------------------------------------------------------------------
+[venues.mexc]
+enabled = true
+mode = "paper"               # paper | live   (per venue, independent)
+label = "MEXC Futures"
+rest_base = "https://api.mexc.com"
+ws_url = "wss://contract.mexc.com/edge"
+recv_window_ms = 5000
+position_mode = 1            # 1 = hedge, 2 = one-way (auto-detected on boot)
+taker_fee = 0.0002
+maker_fee = 0.0
+
+[venues.binance]
+enabled = true
+mode = "paper"
+label = "Binance USDⓈ-M Futures"
+rest_base = "https://fapi.binance.com"
+ws_url = "wss://fstream.binance.com"
+recv_window_ms = 5000
+position_mode = 2            # Binance default is one-way (positionSide=BOTH)
+taker_fee = 0.0005
+maker_fee = 0.0002
+
+[venues.kucoin]
+enabled = true
+mode = "paper"
+label = "KuCoin Futures"
+rest_base = "https://api-futures.kucoin.com"
+ws_url = "wss://ws-api-futures.kucoin.com"
+recv_window_ms = 5000
+position_mode = 2            # KuCoin futures is one-way only
+taker_fee = 0.0006
+maker_fee = 0.0002
+
 [exchange]
-name = "mexc"
+name = "mexc"                # legacy single-venue keys: used as the global fallback
 rest_base = "https://api.mexc.com"
 ws_url = "wss://contract.mexc.com/edge"
 recv_window_ms = 5000        # MEXC allows up to 60000; 5000 is plenty for low latency
@@ -50,6 +90,7 @@ max_drawdown_halt_pct = 40.0    # kill-switch: halt bot at -40% from equity peak
 cooldown_after_loss_min = 30    # minutes to avoid a symbol after a losing trade
 cooldown_after_win_min = 0
 min_notional_usd = 5.0          # exchange minimum order notional guard
+max_margin_usd = 0.0            # hard cap on margin per trade (0 = no cap)
 risk_recalc_interval_s = 5      # mark-to-market cadence for sizing/risk gates
 
 # -----------------------------------------------------------------------------

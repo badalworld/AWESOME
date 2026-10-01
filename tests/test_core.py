@@ -190,6 +190,14 @@ class TestSizing(unittest.TestCase):
         s = size_position(5.0, 60_000.0, self.spec, equity_pct=8.0, leverage=10, min_notional_usd=5.0)
         self.assertFalse(s.ok)
 
+    def test_max_margin_cap_limits_notional(self):
+        uncapped = size_position(100_000.0, 100.0, None, equity_pct=8.0, leverage=10)
+        capped = size_position(100_000.0, 100.0, None, equity_pct=8.0, leverage=10,
+                               max_margin_usd=250.0)
+        self.assertTrue(capped.ok)
+        self.assertAlmostEqual(capped.margin_usd, 250.0, places=2)
+        self.assertLess(capped.notional_usd, uncapped.notional_usd)
+
     def test_compound_growth_uses_current_equity(self):
         s1 = size_position(1000.0, 100.0, None, equity_pct=8.0, leverage=10)
         s2 = size_position(2000.0, 100.0, None, equity_pct=8.0, leverage=10)

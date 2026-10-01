@@ -65,6 +65,60 @@ class SyntheticMarketAdapter:
         self.feed.add_interval(interval)
 
 
+class VenuePublicMarketAdapter:
+    """Paper-trading market data from *any* venue client (public endpoints).
+
+    The venue client already speaks the normalized dialect (contracts, tickers,
+    klines, mark price), so one adapter serves MEXC, Binance and KuCoin.
+    """
+
+    def __init__(self, client, clock: Clock) -> None:
+        self.client = client
+        self.clock = clock
+        self.simulated = False
+        self._cache: Dict[str, Ticker] = {}
+        self._cache_ts = 0.0
+
+    async def start(self) -> None:
+        await self.client.start()
+        await self.client.contracts()
+
+    async def stop(self) -> None:
+        await self.client.close()
+
+    async def contracts(self) -> Dict[str, ContractSpec]:
+        return await self.client.contracts()
+
+    async def _refresh(self, force: bool = False) -> None:
+        if not force and time.time() - self._cache_ts < 1.0:
+            return
+        rows = await self.client.tickers()
+        for sym, tk in rows.items():
+            self._cache[sym] = tk
+        self._cache_ts = time.time()
+
+    async def tickers(self) -> Dict[str, Ticker]:
+        await self._refresh()
+        return dict(self._cache)
+
+    async def ticker(self, symbol: str) -> Optional[Ticker]:
+        await self._refresh()
+        return self._cache.get(symbol)
+
+    async def klines(self, symbol: str, interval: str = "Min5", limit: int = 300) -> List[Candle]:
+        return await self.client.klines(symbol, interval, limit)
+
+    async def mark_price(self, symbol: str) -> float:
+        price = await self.client.mark_price(symbol)
+        if price:
+            return price
+        tk = await self.ticker(symbol)
+        return tk.mark() if tk else 0.0
+
+    async def subscribe(self, symbols: List[str], interval: str = "Min5") -> None:
+        return None
+
+
 class MeXCPublicMarketAdapter:
     """Adapts the public half of :class:`MeXCClient` for paper trading."""
 
@@ -162,6 +216,7 @@ class PaperBroker(Broker):
         self,
         market,
         *,
+        name: str = "paper",
         starting_equity: float = 1000.0,
         slippage_bps: float = 1.5,
         price_interval_s: float = 0.2,
@@ -170,6 +225,7 @@ class PaperBroker(Broker):
         clock: Optional[Clock] = None,
         telemetry=None,
     ) -> None:
+        self.name = name
         self.market = market
         self.telemetry = telemetry
         self.starting_equity = float(starting_equity)
@@ -526,6 +582,7 @@ class PaperBroker(Broker):
         return {
             "mode": self.mode,
             "name": self.name,
+            "venue": self.name,
             "simulated_market_data": getattr(self.market, "simulated", False),
             "open_positions": len(self._positions),
             "realized_pnl": round(self.realized, 6),

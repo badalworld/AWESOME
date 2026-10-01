@@ -64,6 +64,7 @@ class ContractSpec:
     api_allowed: bool = True
     state: int = 0
     is_new: bool = False
+    min_notional: float = 0.0      # venue MIN_NOTIONAL (0 = unknown / not enforced)
     base: str = ""
     quote: str = "USDT"
     position_open_type: int = 3

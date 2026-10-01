@@ -18,6 +18,8 @@ import tomllib
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from .exchange.venue import VENUES
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = ROOT / "config.toml"
 
@@ -55,6 +57,7 @@ VALIDATORS: Dict[str, Any] = {
     "risk.cooldown_after_loss_min": _num(0, 1440),
     "risk.cooldown_after_win_min": _num(0, 1440),
     "risk.min_notional_usd": _num(0.1, 1_000_000),
+    "risk.max_margin_usd": _num(0, 100_000_000),
     "risk.risk_recalc_interval_s": _num(1, 300),
     # stoploss
     "stoploss.mode": ("enum", ["auto", "attached", "separate"]),
@@ -124,6 +127,31 @@ VALIDATORS: Dict[str, Any] = {
     "persistence.equity_snapshot_sec": _num(5, 3600),
 }
 
+# Per-venue knobs: ``venues.<id>.<key>`` (e.g. venues.binance.recv_window_ms).
+VENUE_VALIDATORS: Dict[str, Any] = {
+    "enabled": ("bool",),
+    "label": ("str",),
+    "mode": ("enum", ["paper", "live"]),
+    "rest_base": ("str",),
+    "ws_url": ("str",),
+    "recv_window_ms": _num(1000, 60000),
+    "request_timeout_s": _num(0.5, 30),
+    "http2": ("bool",),
+    "max_connections": _num(1, 200),
+    "keepalive_expiry": _num(5, 3600),
+    "retry_attempts": _num(1, 10),
+    "retry_backoff_ms": _num(10, 5000),
+    "position_mode": ("enum", [1, 2]),
+    "paper_data_source": ("enum", ["auto", "live", "synthetic"]),
+    "entry_order_type": ("enum", ["market", "ioc_limit"]),
+    "exit_order_type": ("enum", ["market", "ioc_limit"]),
+    "ioc_limit_buffer_bps": _num(0, 100),
+    "time_sync_interval_s": _num(5, 3600),
+    "taker_fee": _num(0, 0.01),
+    "maker_fee": _num(0, 0.01),
+    "paper_starting_equity": _num(10, 100_000_000),
+}
+
 # Filter knobs are pattern-validated (filters.<name>.<param>).
 _FILTER_VALIDATORS: Dict[str, Any] = {
     "enabled": ("bool",),
@@ -168,7 +196,25 @@ def _deep_merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _coerce_and_validate(key: str, value: Any) -> Any:
-    """Validate a dotted key/value pair, returning the coerced value."""
+    """Validate a dotted key/value pair, returning the coerced value.
+
+    ``venues.<id>.<rest>`` reuses the validator of ``<rest>`` (venue-scoped
+    overrides of any global knob), with a small venue-local table for the
+    connection knobs that only make sense per exchange.
+    """
+    if key.startswith("venues."):
+        parts = key.split(".", 2)
+        if len(parts) < 3:
+            raise KeyError(f"unknown or read-only setting: {key}")
+        venue, rest = parts[1], parts[2]
+        if venue not in VENUES:
+            raise KeyError(f"unknown venue {venue!r}; known: {', '.join(VENUES)}")
+        spec = VALIDATORS.get(rest) or VENUE_VALIDATORS.get(rest) or VENUE_VALIDATORS.get(rest.rsplit(".", 1)[-1])
+        if spec is None and rest.startswith("filters."):
+            spec = _FILTER_VALIDATORS.get(rest.rsplit(".", 1)[-1])
+        if spec is None:
+            raise KeyError(f"unknown or read-only setting: {key}")
+        return _coerce(key, value, spec)
     spec = VALIDATORS.get(key)
     if spec is None and key.startswith("filters."):
         spec = _FILTER_VALIDATORS.get(key.rsplit(".", 1)[-1])
@@ -222,7 +268,17 @@ _INT_KEYS = {
 }
 
 
+_VENUE_INT_KEYS = {
+    "recv_window_ms", "max_connections", "retry_attempts", "retry_backoff_ms",
+    "position_mode", "time_sync_interval_s",
+}
+
+
 def _is_int_like(key: str) -> bool:
+    if key.startswith("venues."):
+        key = key.split(".", 2)[-1]
+        if key in _VENUE_INT_KEYS:
+            return True
     return key in _INT_KEYS
 
 
@@ -368,6 +424,85 @@ class Config:
         data = self.as_dict()
         data.setdefault("web", {})["api_token"] = "***" if self.get("web.api_token") else ""
         return data
+
+
+class VenueConfig:
+    """Per-venue view over the shared :class:`Config`.
+
+    Lookup order for ``get("risk.leverage")`` on venue ``binance``:
+
+    1. ``venues.binance.risk.leverage``  (an *explicit* per-venue override)
+    2. ``risk.leverage``                 (the global value — identical for all
+                                          venues, which is what "same strategy,
+                                          same rules" means)
+
+    The ``exchange.*`` / ``app.mode`` / ``account.*`` groups additionally accept
+    a venue-local short form (``venues.binance.rest_base``, ``venues.binance.mode``)
+    so the config file stays pleasant to read.
+    """
+
+    def __init__(self, cfg: Config, venue_id: str) -> None:
+        self._cfg = cfg
+        self.venue_id = venue_id
+        self.spec = VENUES[venue_id]
+
+    # -- pass-through ----------------------------------------------------- #
+    @property
+    def base_dir(self) -> Path:
+        return self._cfg.base_dir
+
+    @property
+    def path(self) -> Path:
+        return self._cfg.path
+
+    @property
+    def data_dir(self) -> Path:
+        return self._cfg.data_dir
+
+    def resolve(self, path_like: str) -> Path:
+        return self._cfg.resolve(path_like)
+
+    def section(self, name: str) -> Dict[str, Any]:
+        base = self._cfg.section(name)
+        override = self._cfg.get(f"venues.{self.venue_id}.{name}", None)
+        if isinstance(override, dict):
+            base.update(override)
+        return base
+
+    def as_dict(self) -> Dict[str, Any]:
+        return self._cfg.as_dict()
+
+    def public_dict(self) -> Dict[str, Any]:
+        return self._cfg.public_dict()
+
+    def save_overrides(self) -> None:
+        self._cfg.save_overrides()
+
+    # -- scoped lookup ---------------------------------------------------- #
+    def get(self, dotted: str, default: Any = None) -> Any:
+        vid = self.venue_id
+        short = dotted.rsplit(".", 1)[-1]
+        candidates = [f"venues.{vid}.{dotted}"]
+        if dotted.startswith(("exchange.", "app.", "account.")):
+            candidates.append(f"venues.{vid}.{short}")
+        if dotted.startswith("app."):
+            candidates.append(f"venues.{vid}.mode" if dotted == "app.mode" else "")
+        candidates.append(dotted)
+        for key in candidates:
+            if not key:
+                continue
+            value = self._cfg.get(key, None)
+            if value is not None:
+                return value
+        return default
+
+    @property
+    def mode(self) -> str:
+        return str(self.get("app.mode", "paper"))
+
+    def venue_dict(self) -> Dict[str, Any]:
+        data = self._cfg.get(f"venues.{self.venue_id}", {})
+        return dict(data) if isinstance(data, dict) else {}
 
 
 def load(path: Optional[Path] = None) -> Config:
