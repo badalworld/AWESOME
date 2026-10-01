@@ -356,6 +356,84 @@ class LiveSafetyGateTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 #  paper path still behaves after the audit changes
 # --------------------------------------------------------------------------- #
+class StartingBalanceAnchorTest(unittest.IsolatedAsyncioTestCase):
+    """The dashboard's "starting balance" is a fixed anchor.
+
+    It must survive restarts and config edits (only an explicit paper reset may
+    move it), and the state payload must expose it next to released/open P&L and
+    the win rate for the active venue.
+    """
+
+    async def asyncSetUp(self) -> None:
+        from tests._util import temp_dir
+
+        self.tmp = temp_dir("ao-anchor-")
+        self.cfg = isolated_config(self.tmp / "data")
+        self.cfg.set("exchange.paper_data_source", "synthetic")
+        self.cfg.set("account.paper_starting_equity", 1000.0)
+        self.cfg.set("universe.refresh_sec", 600)
+        self.db = Database(self.tmp / "data" / "venues" / "mexc.db")
+        self.addCleanup(self.db.close)
+        self.engine = TradingEngine(
+            self.cfg, self.db,
+            CredentialStore(self.db, self.tmp / "data" / ".secrets"),
+            venue_id="mexc",
+        )
+        await self.engine.start()
+        self.addAsyncCleanup(self.engine.stop)
+
+    async def test_anchor_is_set_once_and_never_follows_config(self):
+        anchor = await self.engine.ensure_starting_balance(1000.0)
+        self.assertEqual(anchor, 1000.0)
+        # a later config edit must not move the anchor of an existing book
+        self.cfg.set("account.paper_starting_equity", 500.0)
+        self.assertEqual(await self.engine.ensure_starting_balance(1234.0), 1000.0)
+        # ...and it is what the dashboard reports
+        state = await self.engine.state()
+        self.assertEqual(state["account"]["starting_balance"], 1000.0)
+        self.assertEqual(state["account"]["return_pct"], 0.0)
+        self.assertIn("released_pnl", state["account"])
+        self.assertIn("open_pnl", state["account"])
+        self.assertIn("win_rate", state["account"])
+        self.assertEqual(state["target"]["starting_balance"], 1000.0)
+
+    async def test_released_pnl_and_win_rate_reach_the_dashboard(self):
+        """The header figures must come from the closed trades, not a stale key.
+
+        ``db.trade_stats()`` sums into ``total_pnl`` while the analytics module
+        uses ``pnl`` — reading the wrong one reported a $0.00 released P/L on a
+        profitable account.
+        """
+        await self.engine.ensure_starting_balance(1000.0)
+        for uid, pnl, roi in (("t1", 12.5, 156.0), ("t2", -3.0, -37.5), ("t3", 4.0, 50.0)):
+            await self.db.insert_trade({
+                "trade_uid": uid, "symbol": "SOL_USDT", "side": "LONG", "status": "CLOSED",
+                "qty": 1, "entry_price": 100.0, "exit_price": 101.0, "leverage": 10,
+                "margin_usd": 8, "notional_usd": 80, "realized_pnl": pnl, "roi_pct": roi,
+                "opened_at": 1.0, "closed_at": 2.0,
+            })
+        state = await self.engine.state()
+        acct = state["account"]
+        self.assertEqual(acct["released_pnl"], 13.5)
+        self.assertEqual(acct["total_pnl"], 13.5)
+        self.assertEqual(acct["trades"], 3)
+        self.assertEqual(acct["wins"], 2)
+        self.assertEqual(acct["losses"], 1)
+        self.assertAlmostEqual(acct["win_rate"], 66.67, places=1)
+
+    async def test_explicit_reset_reanchors(self):
+        await self.engine.ensure_starting_balance(1000.0)
+        # what the paper-reset control does: shrink the book, then re-anchor
+        self.engine.broker.starting_equity = 20.0
+        self.engine.broker.realized = 0.0
+        self.engine.last_account = None          # what the reset endpoint does
+        self.assertEqual(await self.engine.ensure_starting_balance(force=20.0), 20.0)
+        self.assertEqual(await self.engine.ensure_starting_balance(), 20.0)
+        state = await self.engine.state()
+        self.assertEqual(state["account"]["starting_balance"], 20.0)
+        self.assertEqual(state["account"]["return_pct"], 0.0)
+
+
 class PaperRegressionTest(unittest.TestCase):
     def test_paper_broker_arm_protection_accepts_adopt_flag(self):
         feed = SyntheticFeed(history_bars=30, tick_seconds=0.05)

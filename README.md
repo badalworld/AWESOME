@@ -312,12 +312,19 @@ Auth: `ApiKey` + `Request-Time` + `Signature` headers where
 
 ## The dashboard
 
-- **Overview** — equity, realized PnL, win rate, expectancy, open positions, latency percentiles,
+- **Header (per active venue)** — **starting balance (fixed 🔒)**, equity with return %, **released
+  P/L** (closed trades) with the W/L count, **win rate**, open (unrealised) P/L, open positions and
+  the UTC clock. Every figure belongs to the venue of the active tab; nothing is mixed.
+- **Venue tabs** — one tab per platform showing that venue's live equity, released P/L, win rate and
+  open positions at a glance, plus engine/market-data/watchlist/keys chips. Switching a tab swaps
+  the whole dashboard (state, history, signals, settings scope, websocket).
+- **Overview** — equity, released PnL, win rate, expectancy, open positions, latency percentiles,
   equity curve, ROI distribution, risk/guard state, broker & connectivity diagnostics, activity feed.
 - **Positions** — live ROI, peak ROI, current stop, trailing status, distance to TP, margin, PnL,
   one-click close.
 - **Trade history** — entry/exit, peak ROI, PnL, fees, exit reason (`take_profit`, `stop_loss`,
-  `trail`, `manual`, `exchange-sync`), CSV export.
+  `trail`, `manual`, `exchange-sync`), CSV export. Fetched per venue (and cleared when you switch
+  tabs), so one platform's fills can never appear under another.
 - **Signals** — every candidate with score, ATR%, status and the *reason* it was rejected.
 - **Universe** — the live volatility ranking (score, turnover, 24h range, 5m ATR%, ADX, spread)
   plus a sample of rejected symbols and why.
@@ -382,7 +389,7 @@ for the current numbers. The short version, with the strategy as configured:
 ## Testing
 
 ```bash
-python3 tests/run_all.py            # 122 tests, ~18 s, no network needed
+python3 tests/run_all.py            # 126 tests, ~20 s, no network needed
 python3 -m unittest tests.test_core         # maths, indicators, strategy, filters, analytics
 python3 -m unittest tests.test_integration  # trade lifecycle on a deterministic market
 python3 -m unittest tests.test_engine       # the orchestrator on the offline synthetic feed

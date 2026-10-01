@@ -179,8 +179,18 @@ code {
 .live-dot.off { background: var(--dim); box-shadow: none; animation: none; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
-.topstats { display: flex; gap: 26px; margin-left: auto; }
-.stat { text-align: right; }
+.topstats {
+  display: flex; gap: 22px; margin-left: auto;
+  flex-wrap: wrap; justify-content: flex-end; row-gap: 8px;
+}
+.stat { text-align: right; min-width: 84px; }
+.stat-sub {
+  display: block; font-style: normal; color: var(--dim); font-size: 10px;
+  font-weight: 600; letter-spacing: 0.2px; margin-top: 1px; white-space: nowrap;
+}
+.stat .lock { opacity: 0.55; font-size: 9px; cursor: help; }
+.stat b.stat-value { display: block; }
+.vt-wr { opacity: 0.85; }
 .stat label {
   display: block; color: var(--dim); font-size: 10px; font-weight: 700;
   text-transform: uppercase; letter-spacing: 1.1px;

@@ -90,6 +90,10 @@ class TradingEngine:
         self.tickers: Dict[str, Ticker] = {}
         self.market_data_source = "unknown"
         self.last_account = None
+        # Fixed anchor: the balance this book started with. Set once and then
+        # never moved by the bot (restarts / deposits / config edits leave it
+        # alone); only an explicit paper reset re-anchors it.
+        self.starting_balance: Optional[float] = None
         self.recent_signals: List[Dict[str, Any]] = []
         self.event_log: List[Dict[str, Any]] = []
         self._tasks: List[asyncio.Task] = []
@@ -126,6 +130,9 @@ class TradingEngine:
             on_kline=self._on_kline, on_tick=self._on_tick, on_order=self._on_order_push,
         )
         await self.executor.restore()
+        self.starting_balance = await self.db.kv_get_json("account.starting_balance", None)
+        if self.starting_balance is not None:
+            self.starting_balance = float(self.starting_balance)
         self.running = True
         self.started_at = time.time()
         self.status_message = "running"
@@ -268,6 +275,41 @@ class TradingEngine:
                 "127.0.0.1 behind an authenticated reverse proxy, or set "
                 "web.allow_insecure_live = true to override."
             )
+
+    # -- starting balance anchor ----------------------------------------- #
+    async def ensure_starting_balance(self, equity: Optional[float] = None,
+                                      *, force: Optional[float] = None) -> float:
+        """Return the *fixed* starting balance for this venue's book.
+
+        The dashboard shows this as "starting balance"; it is deliberately
+        sticky, because a starting balance that silently follows the account
+        makes every return/PnL figure meaningless.  It is written once, on the
+        first account snapshot of a fresh book (paper: the configured opening
+        equity; live: the first observed equity), then survives restarts,
+        deposits/withdrawals and config edits.
+
+        ``force`` re-anchors it -- used by the explicit paper reset, which by
+        definition starts a new book.
+        """
+        if force is not None:
+            self.starting_balance = float(force)
+            await self.db.kv_set_json("account.starting_balance", self.starting_balance)
+            return self.starting_balance
+        if self.starting_balance is None:
+            anchor: Optional[float] = None
+            if self.cfg.mode == "paper":
+                # the paper book's own opening equity (restored from kv, else config)
+                from_broker = getattr(self.broker, "starting_equity", None)
+                anchor = float(from_broker) if from_broker else float(
+                    self.cfg.get("account.paper_starting_equity", 1000.0)
+                )
+            elif equity and equity > 0:
+                anchor = float(equity)
+            if anchor is not None:
+                self.starting_balance = anchor
+                await self.db.kv_set_json("account.starting_balance", anchor)
+                log.info("[%s] starting balance anchored at $%.2f", self.spec.id, anchor)
+        return float(self.starting_balance or 0.0)
 
     # -- venue factories ------------------------------------------------- #
     def _make_client(self, rest_base: str, api_key, api_secret, passphrase):
@@ -563,6 +605,7 @@ class TradingEngine:
             try:
                 account = await self.broker.account()
                 self.last_account = account
+                await self.ensure_starting_balance(account.equity)
                 positions = self.executor.live_positions(self.marks) if self.executor else []
                 realized_today = sum(
                     float(t.get("realized_pnl") or 0)
@@ -666,9 +709,18 @@ class TradingEngine:
         positions = self.executor.live_positions(self.marks) if self.executor else []
         trade_stats = await self.db.trade_stats()
         equity = account.equity if account else 0.0
-        starting = None
-        if self.cfg.mode == "paper":
-            starting = float(self.cfg.get("account.paper_starting_equity", 1000.0))
+        starting = await self.ensure_starting_balance(equity if equity > 0 else None)
+        if not starting:
+            starting = (
+                float(self.cfg.get("account.paper_starting_equity", 1000.0))
+                if self.cfg.mode == "paper" else equity
+            )
+        # NOTE: ``db.trade_stats()`` sums into ``total_pnl``; the analytics module's
+        # ``compute_trade_stats()`` uses ``pnl``. Mixing them up silently reported
+        # a $0 realised P&L on the dashboard header.
+        released_pnl = float(trade_stats.get("total_pnl") or 0.0)
+        open_pnl = float(account.unrealized) if account else 0.0
+        win_rate = float(trade_stats.get("win_rate") or 0.0)
         target = float(self.cfg.get("target.equity_target", 10000.0))
         days = float(self.cfg.get("target.days", 7))
         elapsed_days = max(1e-6, (time.time() - self.started_at) / 86400.0) if self.started_at else 0.0
@@ -706,8 +758,18 @@ class TradingEngine:
                 "unrealized": round(account.unrealized, 4) if account else 0.0,
                 "position_margin": round(account.position_margin, 4) if account else 0.0,
                 "currency": account.currency if account else "USDT",
-                "starting_equity": starting,
-                "realized_pnl": trade_stats.get("pnl", 0.0),
+                # fixed anchor (never moves on its own) + the two PnL halves
+                "starting_balance": round(starting, 4),
+                "starting_equity": round(starting, 4),
+                "released_pnl": round(released_pnl, 4),      # closed trades ("released")
+                "realized_pnl": round(released_pnl, 4),      # alias, kept for the API
+                "open_pnl": round(open_pnl, 4),              # still in the market
+                "total_pnl": round(released_pnl + open_pnl, 4),
+                "return_pct": round((equity - starting) / starting * 100.0, 3) if starting else 0.0,
+                "win_rate": round(win_rate, 2),
+                "trades": int(trade_stats.get("trades") or 0),
+                "wins": int(trade_stats.get("wins") or 0),
+                "losses": int(trade_stats.get("losses") or 0),
             },
             "positions": positions,
             "risk": self.guard.snapshot(equity) if self.guard else {},
@@ -718,7 +780,8 @@ class TradingEngine:
                 "progress_pct": round(progress, 2),
                 "elapsed_days": round(elapsed_days, 3),
                 "remaining_days": round(max(0.0, days - elapsed_days), 3),
-                "starting_equity": starting,
+                "starting_equity": round(starting, 4),
+                "starting_balance": round(starting, 4),
             },
             "universe": self.universe.to_dict_list() if self.universe else [],
             "signals": self.recent_signals[:50],
@@ -787,14 +850,24 @@ class TradingEngine:
         stats = metrics_mod.compute_trade_stats(trades)
         curve = await self.db.downsample_equity(600)
         account = self.last_account
-        starting = float(self.cfg.get("account.paper_starting_equity", 0.0)) if self.cfg.mode == "paper" else 0.0
+        equity = account.equity if account else 0.0
+        starting = await self.ensure_starting_balance(equity if equity > 0 else None)
+        if not starting:
+            starting = (
+                float(self.cfg.get("account.paper_starting_equity", 0.0))
+                if self.cfg.mode == "paper" else equity
+            )
         curve_stats = metrics_mod.compute_curve_stats(curve, starting_equity=starting)
         return {
             "trades": stats,
             "curve": curve_stats,
             "daily": metrics_mod.daily_returns(curve)[-30:],
             "open_positions": len(self.executor.positions) if self.executor else 0,
-            "equity": round(account.equity, 4) if account else starting,
+            "equity": round(equity, 4) if account else round(starting, 4),
+            "starting_balance": round(starting, 4),
+            "released_pnl": round(float(stats.get("pnl") or 0.0), 4),
+            "open_pnl": round(float(account.unrealized), 4) if account else 0.0,
+            "win_rate": round(float(stats.get("win_rate") or 0.0), 2),
             "latency": self.telemetry.snapshot(),
             "order_latency": await self.db.latency_stats(),
         }

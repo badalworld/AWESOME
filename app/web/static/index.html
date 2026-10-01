@@ -34,16 +34,23 @@
 
     <div class="topstats">
       <div class="stat">
-        <label>Equity</label><b id="topEquity">—</b>
+        <label>Starting balance <span class="lock" title="Fixed anchor for this venue — set when the book opened. Only an explicit paper reset moves it.">🔒</span></label>
+        <b id="topStart">—</b><i id="topStartSub" class="stat-sub">fixed</i>
       </div>
       <div class="stat">
-        <label>Today</label><b id="topDay">—</b>
+        <label>Equity</label><b id="topEquity">—</b><i id="topEquitySub" class="stat-sub">—</i>
       </div>
       <div class="stat">
-        <label>Open</label><b id="topOpen">0</b>
+        <label>Released P/L</label><b id="topPnl">—</b><i id="topPnlSub" class="stat-sub">closed trades</i>
       </div>
       <div class="stat">
-        <label>PnL</label><b id="topPnl">—</b>
+        <label>Win rate</label><b id="topWin">—</b><i id="topWinSub" class="stat-sub">—</i>
+      </div>
+      <div class="stat">
+        <label>Open P/L</label><b id="topOpenPnl">—</b><i id="topOpenPnlSub" class="stat-sub">unrealized</i>
+      </div>
+      <div class="stat">
+        <label>Open</label><b id="topOpen">0</b><i id="topOpenSub" class="stat-sub">positions</i>
       </div>
       <div class="stat clock">
         <label>UTC</label><b id="topClock">--:--:--</b>
@@ -88,8 +95,9 @@
     <!-- ================= OVERVIEW ================= -->
     <section id="tab-overview" class="tab-panel active">
       <div class="grid cards">
+        <div class="card"><label>Starting balance <span class="lock" title="Fixed anchor for this venue — set when the book opened. Only an explicit paper reset moves it.">🔒</span></label><div id="kStart" class="kpi">—</div><small id="kStartSub">fixed</small></div>
         <div class="card"><label>Equity</label><div id="kEquity" class="kpi">—</div><small id="kEquitySub">—</small></div>
-        <div class="card"><label>Realized PnL</label><div id="kPnl" class="kpi">—</div><small id="kPnlSub">—</small></div>
+        <div class="card"><label>Released P/L (closed)</label><div id="kPnl" class="kpi">—</div><small id="kPnlSub">—</small></div>
         <div class="card"><label>Win rate</label><div id="kWin" class="kpi">—</div><small id="kWinSub">—</small></div>
         <div class="card"><label>Open positions</label><div id="kOpen" class="kpi">0</div><small id="kOpenSub">max 10</small></div>
         <div class="card"><label>Expectancy / trade</label><div id="kExp" class="kpi">—</div><small id="kExpSub">—</small></div>

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -190,6 +191,12 @@ class VenueManager:
                 except Exception:  # noqa: BLE001
                     account = None
             stats = await ctx.db.trade_stats()
+            equity = account.equity if account else 0.0
+            released = float(stats.get("total_pnl") or 0.0)  # db.trade_stats() key
+            open_pnl = float(account.unrealized) if account else 0.0
+            starting = await engine.ensure_starting_balance(equity if equity > 0 else None)
+            if not starting and ctx.cfg.mode == "paper":
+                starting = float(ctx.cfg.get("account.paper_starting_equity", 0.0))
             venues.append({
                 "id": ctx.id,
                 "label": ctx.spec.label,
@@ -199,10 +206,18 @@ class VenueManager:
                 "status": engine.status_message,
                 "start_error": ctx.start_error,
                 "market_data": engine.market_data_source,
-                "equity": round(account.equity, 4) if account else 0.0,
-                "realized_pnl": round(float(stats.get("pnl") or 0.0), 4),
+                "equity": round(equity, 4) if account else 0.0,
+                # fixed opening balance + the two halves of the P&L
+                "starting_balance": round(starting, 4),
+                "released_pnl": round(released, 4),
+                "realized_pnl": round(released, 4),
+                "open_pnl": round(open_pnl, 4),
+                "total_pnl": round(released + open_pnl, 4),
+                "return_pct": round((equity - starting) / starting * 100.0, 3) if starting and account else 0.0,
                 "open_positions": len(engine.executor.positions) if engine.executor else 0,
                 "trades": int(stats.get("trades") or 0),
+                "wins": int(stats.get("wins") or 0),
+                "losses": int(stats.get("losses") or 0),
                 "win_rate": float(stats.get("win_rate") or 0.0),
                 "watchlist": len(engine.watchlist),
                 "credentials": ctx.keystore.masked(),
@@ -213,7 +228,7 @@ class VenueManager:
         return {
             "venues": venues,
             "primary": self.primary.id,
-            "updated_at": asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else 0.0,
+            "updated_at": time.time(),
         }
 
 

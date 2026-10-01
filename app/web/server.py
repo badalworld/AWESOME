@@ -315,6 +315,12 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
         # shrinking the book reads as a catastrophic drawdown and halts trading
         if ctx.engine.guard is not None:
             await ctx.engine.guard.rebaseline(equity)
+        # ...and it is the one thing allowed to move the *fixed* starting balance,
+        # because a reset starts a new book by definition
+        await ctx.engine.ensure_starting_balance(force=equity)
+        # drop the cached account snapshot so the dashboard shows the new book at
+        # once instead of waiting for the next equity-loop tick
+        ctx.engine.last_account = None
         return {"reset": True, "equity": equity, "venue": ctx.id}
 
     # ------------------------------------------------------------------ #

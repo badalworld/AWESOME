@@ -7,6 +7,15 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+/** Set text (and optionally a class) on an optional node — never throws. */
+function setText(id, value, className) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  el.textContent = value;
+  if (className !== undefined) el.className = className;
+  return el;
+}
+
 const state = {
   config: null,
   credentials: null,
@@ -17,6 +26,8 @@ const state = {
   venue: localStorage.getItem('ao.venue') || 'mexc',
   venues: [],            // metadata from /api/venues/meta
   summary: [],           // live per-venue summary from /api/venues
+  trades: [],            // closed/open trade history for the active venue
+  equityCurve: [],       // equity points for the active venue
   credVenue: null,       // venue being edited in the credentials card
   venueScope: false,     // write config as venues.<id>.* overrides
   ws: null,
@@ -57,7 +68,8 @@ function renderVenueTabs() {
       <span class="vt-name">${esc(v.label)}<em class="vt-mode vt-${live}">${live.toUpperCase()}</em></span>
       <span class="vt-stats">
         <b class="${cls(pnl)}">${s.equity != null ? fmtMoney(s.equity) : '—'}</b>
-        <i class="${cls(pnl)}">${pnl ? fmtMoney(pnl) : '$0.00'}</i>
+        <i class="${cls(pnl)}">${pnl ? fmtMoney(pnl) : '$0.00'} released</i>
+        <i class="vt-wr">${(s.win_rate || 0).toFixed(1)}% WR${s.trades ? ` (${s.trades})` : ''}</i>
         <i>${s.open_positions ?? 0} open</i>
         <i class="vt-cred">${cred}</i>
       </span>
@@ -113,6 +125,22 @@ function renderVenueBar() {
   el.innerHTML = bits.filter(Boolean).join(' <i class="sep">·</i> ');
 }
 
+/** Trade history and the equity curve are paginated REST data, not part of the
+ *  websocket frame — poll them for the active venue and feed them back into the
+ *  renderer so the dashboard always shows *that venue's* trades. */
+async function pollExtras() {
+  try {
+    const [t, e] = await Promise.all([vapi('/trades?limit=200'), vapi('/equity?limit=400')]);
+    state.trades = t.trades || [];
+    state.equityCurve = e.curve || [];
+    if (state.lastState) {
+      state.lastState.trades = state.trades;
+      state.lastState.equity = state.equityCurve;
+      renderAll(state.lastState);
+    }
+  } catch (e) { /* keep last known */ }
+}
+
 async function switchVenue(id) {
   if (!id || id === state.venue) return;
   state.venue = id;
@@ -124,9 +152,12 @@ async function switchVenue(id) {
   renderVenueTabs();
   renderVenueBar();
   if (state.ws) { try { state.ws.close(); } catch (e) {} }
+  state.trades = [];              // never show the previous venue's trades
+  state.equityCurve = [];
   try { await loadSettings(); } catch (e) {}
   try { renderAll(await vapi('/state')); } catch (e) {}
   connectWS();
+  pollExtras();
 }
 
 /* ------------------------------ helpers ------------------------------ */
@@ -296,11 +327,15 @@ const HIST_COLORS = { green: 'var(--green)', red: 'var(--red)' };
 /* ------------------------------ overview ------------------------------ */
 function renderOverview(d) {
   const acct = d.state.account, stats = d.metrics.trades, engine = d.state.engine;
+  const fixedStart = acct.starting_balance ?? d.state.target?.starting_balance ?? null;
+  setText('kStart', fixedStart == null ? '—' : fmtMoney(fixedStart));
+  setText('kStartSub', fixedStart == null ? 'fixed' : `fixed · return ${fmtPct(acct.return_pct)}`);
   $('#kEquity').textContent = fmtMoney(acct.equity);
-  $('#kEquitySub').textContent = `available ${fmtMoney(acct.available)} · unrealized ${fmtMoney(acct.unrealized)}`;
-  $('#kPnl').textContent = fmtMoney(stats.pnl);
-  $('#kPnl').className = 'kpi ' + cls(stats.pnl);
-  $('#kPnlSub').textContent = `${stats.trades} closed · fees ${fmtMoney(stats.total_fees)}`;
+  $('#kEquitySub').textContent = `available ${fmtMoney(acct.available)} · open P/L ${fmtMoney(acct.open_pnl ?? acct.unrealized)}`;
+  const released = acct.released_pnl ?? acct.realized_pnl ?? stats.pnl;
+  $('#kPnl').textContent = fmtMoney(released);
+  $('#kPnl').className = 'kpi ' + cls(released);
+  $('#kPnlSub').textContent = `${stats.trades} closed · fees ${fmtMoney(stats.total_fees)} · open ${fmtMoney(acct.open_pnl ?? 0)}`;
   $('#kWin').textContent = (stats.win_rate || 0).toFixed(1) + '%';
   $('#kWinSub').textContent = `${stats.wins}W / ${stats.losses}L · PF ${stats.profit_factor === Infinity ? '∞' : stats.profit_factor}`;
   $('#kOpen').textContent = d.state.positions.length;
@@ -574,17 +609,32 @@ function renderHeader(d) {
   if (d.state.risk?.halted) { halt.classList.remove('hidden'); halt.textContent = 'HALTED: ' + (d.state.risk.halt_reason || ''); }
   else halt.classList.add('hidden');
 
-  $('#topEquity').textContent = fmtMoney(acct.equity);
-  $('#topDay').textContent = fmtPct(d.state.risk?.day_pnl_pct);
-  $('#topDay').className = cls(d.state.risk?.day_pnl_pct);
-  $('#topOpen').textContent = d.state.positions.length;
-  $('#topPnl').textContent = fmtMoney(acct.realized_pnl);
-  $('#topPnl').className = cls(acct.realized_pnl);
+  const stats = d.metrics?.trades || {};
+  const released = acct.released_pnl ?? acct.realized_pnl ?? 0;
+  const openPnl = acct.open_pnl ?? acct.unrealized ?? 0;
+  const startBal = acct.starting_balance ?? d.state.target?.starting_balance ?? null;
+  const venueTag = (venue.id || state.venue || '').toUpperCase();
+
+  // every figure below belongs to the *active venue tab* — never mixed
+  setText('topStart', startBal == null ? '—' : fmtMoney(startBal));
+  setText('topStartSub', startBal == null ? 'fixed' : `${venueTag} book · fixed`);
+  setText('topEquity', fmtMoney(acct.equity));
+  setText('topEquitySub', `return ${fmtPct(acct.return_pct)} · avail ${fmtMoney(acct.available)}`);
+  setText('topPnl', fmtMoney(released), 'stat-value ' + cls(released));
+  setText('topPnlSub', `${stats.trades ?? acct.trades ?? 0} closed · ${stats.wins ?? acct.wins ?? 0}W/${stats.losses ?? acct.losses ?? 0}L`);
+  const wr = acct.win_rate ?? stats.win_rate ?? 0;
+  setText('topWin', (Number(wr) || 0).toFixed(1) + '%');
+  setText('topWinSub', startBal == null ? '—' : `vs fixed ${fmtMoney(startBal)}`);
+  setText('topOpenPnl', fmtMoney(openPnl), 'stat-value ' + cls(openPnl));
+  setText('topOpenPnlSub', 'unrealized');
+  setText('topOpen', d.state.positions.length);
+  setText('topOpenSub', `max ${state.config?.risk?.max_open_positions ?? 10}`);
+  // (day P/L lives in the risk table now, next to the drawdown and peak)
   $('#pauseBtn').textContent = engine.trading_enabled ? 'Pause' : 'Resume';
   $('#pauseBtn').className = 'btn ' + (engine.trading_enabled ? 'btn-ghost' : '');
 
   const t = d.state.target || {};
-  const start = t.starting_equity || acct.equity || 1;
+  const start = acct.starting_balance || t.starting_balance || t.starting_equity || acct.equity || 1;
   const pct = Math.max(0, Math.min(100, ((acct.equity - start) / (t.equity_target - start)) * 100));
   $('#targetFill').style.width = (isFinite(pct) ? pct : 0) + '%';
   $('#targetLabel').textContent = fmtMoney(t.equity_target, 0);
@@ -868,6 +918,27 @@ async function pollLogs() {
 /* ------------------------------ live feed ------------------------------ */
 function renderAll(payload) {
   if (!payload) return;
+  if (payload.state) {
+    // the WS frame carries state/metrics/curve; REST /state carries neither
+    // metrics nor curve, so merge in what we have rather than blanking cards
+    if (!payload.trades) payload.trades = state.trades || [];
+    else state.trades = payload.trades;
+    if (!payload.equity) payload.equity = state.equityCurve || [];
+    else state.equityCurve = payload.equity;
+    if (!payload.metrics) {
+      const st = payload.state;
+      payload.metrics = {
+        trades: st.stats || {},
+        curve: {
+          return_pct: st.account?.return_pct,
+          max_drawdown_pct: st.risk?.drawdown_pct,
+        },
+        daily: [],
+        open_positions: (st.positions || []).length,
+        equity: st.account?.equity,
+      };
+    }
+  }
   state.lastState = payload;
   renderHeader(payload);
   renderTickerStrip(payload);
@@ -1065,5 +1136,7 @@ window.addEventListener('resize', () => { if (state.lastState) renderAll(state.l
   pollLogs();
   setInterval(pollLogs, 3000);
   setInterval(pollVenues, 5000);
+  setInterval(pollExtras, 5000);
   try { renderAll(await vapi('/state')); } catch (e) {}
+  pollExtras();
 })();

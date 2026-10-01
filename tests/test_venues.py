@@ -377,6 +377,34 @@ class VenueIsolationTest(unittest.TestCase):
         for row in data["venues"]:
             self.assertIn("credentials", row)
             self.assertEqual(row["mode"], "paper")
+            # the dashboard tabs read these per venue: fixed opening balance,
+            # released (closed) P/L, still-open P/L and the win rate
+            for key in ("starting_balance", "released_pnl", "realized_pnl", "open_pnl",
+                        "total_pnl", "return_pct", "win_rate", "trades", "wins", "losses"):
+                self.assertIn(key, row)
+            self.assertEqual(
+                row["starting_balance"],
+                float(self.cfg.get("account.paper_starting_equity")),
+            )
+
+    def test_released_pnl_is_reported_per_venue(self):
+        async def scenario():
+            kucoin = self.mgr.get("kucoin")
+            await kucoin.db.insert_trade({
+                "trade_uid": "dash-1", "symbol": "ETHUSDTM", "side": "SHORT", "status": "CLOSED",
+                "qty": 2, "entry_price": 3000.0, "exit_price": 2940.0, "leverage": 10,
+                "margin_usd": 8, "notional_usd": 80, "realized_pnl": 1.6, "roi_pct": 20.0,
+                "opened_at": 10.0, "closed_at": 20.0, "exit_reason": "trailing_stop",
+            })
+            rows = {r["id"]: r for r in (await self.mgr.summary())["venues"]}
+            self.assertEqual(rows["kucoin"]["released_pnl"], 1.6)
+            self.assertEqual(rows["kucoin"]["trades"], 1)
+            self.assertEqual(rows["kucoin"]["wins"], 1)
+            self.assertEqual(rows["kucoin"]["win_rate"], 100.0)
+            self.assertEqual(rows["mexc"]["released_pnl"], 0.0)
+            self.assertEqual(rows["mexc"]["trades"], 0)
+
+        asyncio.run(scenario())
 
     def test_per_venue_config_override_only_affects_that_venue(self):
         self.cfg.set_many({"venues.binance.risk.leverage": 7, "risk.max_open_positions": 9})
