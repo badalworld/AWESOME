@@ -6,7 +6,7 @@ import logging
 import math
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Iterable, List
+from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional
 
 
 # --------------------------------------------------------------------------- #
@@ -153,4 +153,148 @@ class LatencyTracker:
             "p99": round(percentile(vals, 99), 2),
             "max": round(max(vals), 2),
             "avg": round(mean(vals), 2),
+        }
+
+
+class ExchangeRequestTracker:
+    """Observe REST request volume and exchange-reported rate-limit pressure.
+
+    Exchanges expose different quotas, and several expose no usable quota
+    headers at all. This tracker reports the latest *actual* quota only when a
+    response supplies both a limit and remaining count; it never invents a
+    denominator from local token-bucket settings.
+    """
+
+    _LIMIT_PAIRS = (
+        ("gw-ratelimit-limit", "gw-ratelimit-remaining"),  # KuCoin gateway
+        ("x-ratelimit-limit", "x-ratelimit-remaining"),
+        ("x-rate-limit-limit", "x-rate-limit-remaining"),
+        ("ratelimit-limit", "ratelimit-remaining"),
+    )
+    _USED_HEADERS = (
+        "x-mbx-used-weight-1m",
+        "x-mbx-order-count-10s",
+        "x-mbx-order-count-1d",
+    )
+    _RATE_LIMIT_CODES = {"418", "429", "429000", "-1003", "-1015"}
+
+    @classmethod
+    def is_rate_limit_code(cls, code: Any) -> bool:
+        """Recognize common HTTP/envelope throttle codes across supported venues."""
+        return str(code).strip() in cls._RATE_LIMIT_CODES
+
+    def __init__(self, capacity: int = 4096) -> None:
+        self.requests_total = 0
+        self.responses_total = 0
+        self.errors_total = 0
+        self.retries_total = 0
+        self.rate_limit_hits_total = 0
+        self.last_status: Optional[int] = None
+        self.last_response_at = 0.0
+        self.last_latency_ms: Optional[float] = None
+        self._recent_requests: Deque[float] = deque(maxlen=capacity)
+        self._recent_rate_limits: Deque[float] = deque(maxlen=capacity)
+        self._quota: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def _number(value: Any) -> Optional[float]:
+        try:
+            # Headers may contain whitespace or a comma-separated list.
+            parsed = float(str(value).strip().split(",", 1)[0])
+            return parsed if math.isfinite(parsed) and parsed >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def record_request(self) -> None:
+        now = time.time()
+        self.requests_total += 1
+        self._recent_requests.append(now)
+
+    def record_response(self, status: int, headers: Optional[Mapping[str, Any]] = None,
+                        latency_ms: Optional[float] = None) -> None:
+        now = time.time()
+        status = int(status)
+        self.responses_total += 1
+        self.last_status = status
+        self.last_response_at = now
+        if latency_ms is not None and math.isfinite(float(latency_ms)):
+            self.last_latency_ms = round(float(latency_ms), 2)
+        if status >= 400:
+            self.errors_total += 1
+        if status in (418, 429):
+            self.rate_limit_hits_total += 1
+            self._recent_rate_limits.append(now)
+
+        normalized = {str(k).lower(): v for k, v in (headers or {}).items()}
+        for limit_key, remaining_key in self._LIMIT_PAIRS:
+            limit = self._number(normalized.get(limit_key))
+            remaining = self._number(normalized.get(remaining_key))
+            if limit is None or remaining is None or limit <= 0:
+                continue
+            used = max(0.0, min(limit, limit - remaining))
+            self._quota = {
+                "source": f"{limit_key} / {remaining_key}",
+                "limit": limit,
+                "remaining": min(limit, remaining),
+                "used": used,
+                "utilization_pct": round(used / limit * 100.0, 2),
+                "observed_at": now,
+            }
+            return
+
+        # Binance exposes used request weight/order count, but not the applicable
+        # per-IP limit in every response. Report the usage without a guessed %.
+        for key in self._USED_HEADERS:
+            used = self._number(normalized.get(key))
+            if used is not None:
+                self._quota = {
+                    "source": key,
+                    "used": used,
+                    "limit": None,
+                    "remaining": None,
+                    "utilization_pct": None,
+                    "observed_at": now,
+                }
+                return
+
+    def record_error(self) -> None:
+        self.errors_total += 1
+
+    def record_network_error(self) -> None:
+        self.errors_total += 1
+        self.last_response_at = time.time()
+        self.last_status = None
+
+    def record_retry(self) -> None:
+        self.retries_total += 1
+
+    def record_rate_limit(self) -> None:
+        """Count venue-level throttling codes returned inside a 2xx envelope."""
+        now = time.time()
+        self.rate_limit_hits_total += 1
+        self.errors_total += 1
+        self._recent_rate_limits.append(now)
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        cutoff = now - 60.0
+        while self._recent_requests and self._recent_requests[0] < cutoff:
+            self._recent_requests.popleft()
+        while self._recent_rate_limits and self._recent_rate_limits[0] < cutoff:
+            self._recent_rate_limits.popleft()
+        quota = dict(self._quota) if self._quota else None
+        if quota is not None:
+            quota["age_s"] = round(max(0.0, now - float(quota.get("observed_at") or now)), 1)
+        return {
+            "requests_total": self.requests_total,
+            "requests_last_minute": len(self._recent_requests),
+            "responses_total": self.responses_total,
+            "errors_total": self.errors_total,
+            "retries_total": self.retries_total,
+            "rate_limit_hits_total": self.rate_limit_hits_total,
+            "rate_limit_hits_last_minute": len(self._recent_rate_limits),
+            "last_status": self.last_status,
+            "last_response_age_s": round(max(0.0, now - self.last_response_at), 1) if self.last_response_at else None,
+            "last_latency_ms": self.last_latency_ms,
+            "quota": quota,
         }

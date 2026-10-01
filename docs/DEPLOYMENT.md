@@ -15,7 +15,8 @@ git clone <your-repo> awesome && cd awesome
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp config.toml config.toml.bak      # keep the reference defaults
-python3 tests/run_all.py            # 151 tests must pass before you trust it
+python3 tests/run_all.py            # Python suite; also run the JavaScript dashboard suite below
+node --test tests/test_dashboard.js
 python3 run.py --port 8080
 ```
 
@@ -54,7 +55,7 @@ Also set `web.api_token` in `config.toml` for defence in depth; the dashboard se
 
 ```ini
 [Unit]
-Description=AO Divergence Futures Bot
+Description=Crypto Hunter Trading System
 After=network-online.target
 Wants=network-online.target
 
@@ -81,17 +82,23 @@ sudo systemctl daemon-reload && sudo systemctl enable --now awesome-bot
 journalctl -u awesome-bot -f
 ```
 
-## 5. Going live checklist
+## 5. Live-readiness gate — currently NOT CLEARED
 
-- [ ] `python3 tests/run_all.py` passes.
-- [ ] Paper mode has run long enough to see several full trade lifecycles (entry → trailing → exit).
-- [ ] You have read the Signals tab and agree with the filter rejections.
-- [ ] API key: futures orders enabled, withdrawals disabled, **IP whitelisted** to the VPS.
-- [ ] Mode switched to `live` in Settings (the engine restarts itself).
-- [ ] First live trade observed end to end, including a trailing stop modification.
-- [ ] `data/` backed up and a restart tested (`restore()` must re-attach stops without
-      re-opening positions).
-- [ ] Alerts configured (the log is the source of truth; wire `data/bot.log` into your monitoring).
+**Do not enable live order routing on this checkout yet.** The latest
+[code-hygiene audit](CODE_HYGIENE_AUDIT_2026-10-02.md) still lists uncertain-order recovery,
+incident resolution, partial-fill/external-exit accounting, and authenticated venue acceptance
+as blockers. Passing tests or paper fills do not close those gaps. Keep all venue modes in `paper`.
+
+Before this guidance can change, the release owner must document and verify all of the following:
+
+- [ ] The latest audit explicitly changes its live-trading decision after each blocker is fixed.
+- [ ] Python and dashboard JavaScript suites plus static checks pass on the release commit.
+- [ ] Order lookup, delayed/partial fills, cancel/replace and restart recovery are tested per venue.
+- [ ] Protective-stop adoption/replacement and external exits are reconciled to authoritative fills.
+- [ ] Dashboard/API token, TLS/reverse proxy, IP restrictions, exchange key permissions and backups are reviewed.
+- [ ] Exchange-specific acceptance evidence is recorded without inferring it from paper/synthetic tests.
+
+Do not treat this checklist as permission to switch `mode` to `live`; the current release gate is closed.
 
 ## 6. Operations
 
@@ -103,8 +110,8 @@ journalctl -u awesome-bot -f
 | Reset paper account | dashboard Settings → *Reset paper account* |
 | Rotate API keys | dashboard Settings → *Clear*, then enter new keys, then *Test* |
 | Reset the dashboard token | clear the browser's `ao.token` (or change `web.api_token` and restart) |
-| Inspect why a trade was skipped | Signals tab (stores the full rejection list) |
-| Tune parameters | Settings tab (validated, hot-applied, persisted) |
+| Inspect why a trade was skipped | Dashboard → Signals page (stores the full rejection list) |
+| Tune parameters | Dashboard → Settings page (validated, hot-applied, persisted) |
 
 ## 6b. Hardening checklist (from the 2026-10 audit)
 
@@ -112,18 +119,18 @@ journalctl -u awesome-bot -f
 |---|---|---|
 | Set `web.api_token` | live start is **refused** without it while the dashboard is bound to a public address; with it, every REST call needs `X-API-Token` and the WS needs `?token=` (the dashboard asks once) | `config.toml` → `[web]` |
 | IP-restrict the API keys | a leaked key can then only be used from your VPS | venue key settings |
-| Keep the halts on | 40 % drawdown / 25 % daily loss are the only thing between a bad day and a blown account | `[risk]` |
+| Keep the halts on | 40 % drawdown / 25 % daily loss halt new entries; they do not cap losses on existing positions | `[risk]` |
 | Expect affordability rejections on a small book | the venue's smallest order can exceed 8 % of a $20 account; such symbols are filtered out of the universe and rejected with a reason in the Signals tab | `universe.only_affordable_orders` |
 | Never run two instances on one account | both would manage the same positions | — |
 
-See [`AUDIT_2026-10.md`](AUDIT_2026-10.md) for the full findings list.
+See [`CODE_HYGIENE_AUDIT_2026-10-02.md`](CODE_HYGIENE_AUDIT_2026-10-02.md) for current findings and blockers; `AUDIT_2026-10.md` is historical.
 
 ## 7. Known limitations
 
-* Live exchange connectivity could not be verified from the development sandbox (TLS to MEXC,
-  Binance and KuCoin is blocked there); the REST/WS clients are written against the official docs
-  and the paper path exercises all the same code, with signing vectors and order-mapping pinned by
-  `tests/test_venues.py`. Validate each venue with a small live trade before trusting it with size.
+* Live exchange connectivity has not been certified by this audit. The REST/WS clients are written
+  against venue documentation, and tests include signing vectors, mappings and paper/mocked paths;
+  that is not proof of exchange acceptance. The live-readiness gate above stays closed until
+  documented per-venue acceptance and recovery evidence is reviewed.
 * Testnet/local replay: run the venue in `paper` mode first; there is no built-in exchange testnet
   switch (Binance/KuCoin testnets use different hosts — set `rest_base`/`ws_url` per venue to use
   them, but keep in mind their symbol universes and rate limits differ).

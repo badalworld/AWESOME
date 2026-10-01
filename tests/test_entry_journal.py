@@ -245,6 +245,63 @@ class EntryJournalTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.guard.halted)
         self.assertEqual(self.ex.pending_fills, {})
 
+    async def test_restored_trade_without_verified_stop_latches_recovery_incident(self):
+        opened = await self.ex.open_from_signal(make_signal())
+        self.assertIsNotNone(opened)
+        fresh = Executor(self.broker, self.cfg, self.db, self.guard)
+        with patch.object(self.broker, 'arm_protection', new=AsyncMock(return_value={"kind": "none"})):
+            await fresh.restore()
+
+        self.assertTrue(self.guard.halted)
+        incident = await fresh.recovery_incident()
+        self.assertEqual(incident["symbol"], "TEST_USDT")
+        self.assertIn("verified active stop", incident["reason"])
+        engine = TradingEngine(self.cfg, self.db, None)
+        engine.executor, engine.guard = fresh, self.guard
+        self.assertFalse(await engine.resume_risk_halt())
+
+    async def test_orphan_position_without_candle_atr_adopts_real_stop_without_guessing_atr(self):
+        opened = await self.broker.open_position(
+            "TEST_USDT", "LONG", 1.0, 10, price_hint=100.0,
+            client_id="manual-order", sl_price=95.0,
+        )
+        self.assertTrue(opened.ok)
+        fresh = Executor(self.broker, self.cfg, self.db, self.guard)
+        with patch.object(self.broker, 'klines', new=AsyncMock(return_value=[])):
+            await fresh.restore()
+
+        recovered = fresh.positions["TEST_USDT"]
+        self.assertEqual(recovered.atr, 0.0, "missing ATR must remain unknown, not be fabricated")
+        self.assertEqual(recovered.stop_price, 95.0)
+        self.assertEqual(recovered.protection["kind"], "paper")
+        self.assertIsNone(await fresh.recovery_incident())
+
+    async def test_orphan_without_atr_or_verified_stop_latches_non_bypassable_incident(self):
+        opened = await self.broker.open_position(
+            "TEST_USDT", "LONG", 1.0, 10, price_hint=100.0,
+            client_id="manual-unprotected-order", sl_price=None,
+        )
+        self.assertTrue(opened.ok)
+        fresh = Executor(self.broker, self.cfg, self.db, self.guard)
+        with patch.object(self.broker, 'klines', new=AsyncMock(return_value=[])):
+            await fresh.restore()
+
+        recovered = fresh.positions["TEST_USDT"]
+        incident = await fresh.recovery_incident()
+        self.assertEqual(recovered.atr, 0.0)
+        self.assertEqual(recovered.stop_price, 0.0)
+        self.assertEqual(recovered.protection, {})
+        self.assertIsNotNone(incident)
+        self.assertTrue(self.guard.halted)
+
+        engine = TradingEngine(self.cfg, self.db, None)
+        engine.executor, engine.guard = fresh, self.guard
+        self.assertFalse(await engine.resume_risk_halt())
+        await self.guard.resume()  # direct guard resume still cannot bypass the incident
+        with patch.object(self.broker, 'open_position', new=AsyncMock()) as submit:
+            self.assertIsNone(await fresh.open_from_signal(make_signal()))
+            submit.assert_not_awaited()
+
     async def test_invalid_protection_handles_cannot_pass_as_active_stop(self):
         for handle in ({'kind': 'none', 'stop_price': 97.},
                        {'kind': 'plan', 'stop_price': 97.},

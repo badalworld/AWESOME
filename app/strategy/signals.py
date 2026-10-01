@@ -94,8 +94,8 @@ class SignalEngine:
         if features is None:
             return None
 
-        # higher-timeframe context (15m by default, plus 1h for context)
-        for tf in {str(self.cfg.get("filters.htf.htf_timeframe", "Min15")), "Min15", "Min60"}:
+        # The 15m frame feeds the score; the selected frame feeds the HTF filter.
+        for tf in dict.fromkeys((str(self.cfg.get("filters.htf.htf_timeframe", "Min15")), "Min15")):
             series = (htf_candles or {}).get(tf)
             if not series:
                 continue

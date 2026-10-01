@@ -42,6 +42,7 @@ VALIDATORS: Dict[str, Any] = {
     "exchange.paper_data_source": ("enum", ["auto", "live", "synthetic"]),
     "exchange.set_leverage_on_entry": ("bool",),
     "exchange.position_mode": ("enum", [1, 2]),
+    "market_data.max_ws_stale_sec": _num(1, 120),
     # account
     "account.paper_starting_equity": _num(10, 100_000_000),
     # risk
@@ -103,6 +104,7 @@ VALIDATORS: Dict[str, Any] = {
     "universe.enabled": ("bool",),
     "universe.max_symbols": _num(1, 100),
     "universe.refresh_sec": _num(30, 3600),
+    "universe.scan_concurrency": _num(1, 24),
     "universe.min_turnover_24h_usd": _num(0, 10_000_000_000),
     "universe.min_atr_pct": _num(0, 100),
     "universe.max_atr_pct": _num(0.01, 500),
@@ -263,14 +265,39 @@ def _coerce(key: str, value: Any, spec: Any) -> Any:
     raise ValueError(f"{key}: unsupported spec {spec}")
 
 
+_FILE_VALIDATORS: Dict[str, Any] = {
+    # File-only connection/storage settings are intentionally not dashboard
+    # mutations, but malformed values must still fail before engine startup.
+    "app.data_dir": ("str",),
+    "exchange.rest_base": ("str",),
+    "exchange.ws_url": ("str",),
+    "exchange.http2": ("bool",),
+    "exchange.max_connections": _num(1, 200),
+    "exchange.keepalive_expiry": _num(5, 3600),
+    "exchange.retry_attempts": _num(1, 10),
+    "exchange.retry_backoff_ms": _num(10, 5000),
+    "exchange.time_sync_interval_s": _num(5, 3600),
+    "web.host": ("str",),
+    "web.allow_origins": ("str",),
+    "persistence.db_path": ("str",),
+    "persistence.log_ring_size": _num(50, 10000),
+    "universe.weights.turnover": _num(0, 1),
+    "universe.weights.volatility": _num(0, 1),
+    "universe.weights.momentum": _num(0, 1),
+}
+
+
 _INT_KEYS = {
     "risk.max_open_positions", "risk.leverage",
-    "exchange.recv_window_ms", "stoploss.atr_period", "strategy.ao_fast",
+    "exchange.recv_window_ms", "exchange.max_connections", "exchange.retry_attempts",
+    "exchange.retry_backoff_ms", "exchange.time_sync_interval_s",
+    "stoploss.atr_period", "strategy.ao_fast",
     "strategy.ao_slow", "strategy.pivot_k", "strategy.lookback_bars",
     "strategy.min_pivot_gap", "strategy.max_pivot_gap", "strategy.trigger_lookback",
     "strategy.signal_cooldown_bars", "strategy.max_signals_per_cycle",
     "strategy.signal_expiry_bars", "universe.max_symbols", "universe.refresh_sec",
-    "target.monte_carlo_runs", "web.port", "persistence.equity_snapshot_sec",
+    "universe.scan_concurrency", "target.monte_carlo_runs", "web.port",
+    "persistence.equity_snapshot_sec", "persistence.log_ring_size",
 }
 
 
@@ -313,18 +340,118 @@ class Config:
         data_dir = Path(self._base.get("app", {}).get("data_dir", "data"))
         return self.resolve(str(data_dir)) / "settings.json"
 
+    @staticmethod
+    def _set_dotted(data: Dict[str, Any], dotted: str, value: Any) -> None:
+        parts = dotted.split(".")
+        node = data
+        for part in parts[:-1]:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        node[parts[-1]] = value
+
+    @staticmethod
+    def _leaves(node: Any, prefix: str = ""):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                dotted = f"{prefix}.{key}" if prefix else str(key)
+                yield from Config._leaves(value, dotted)
+        elif prefix:
+            yield prefix, node
+
+    @classmethod
+    def _validated_settings_tree(cls, tree: Dict[str, Any], source: str,
+                                 *, overrides: bool = False) -> Dict[str, Any]:
+        """Validate recognized config values before they reach the engine.
+
+        Runtime overrides are stricter than TOML: every stored leaf must still
+        be a supported setting, so stale/typoed settings fail startup instead of
+        silently changing which strategy the process runs.
+        """
+        normalized = copy.deepcopy(tree)
+
+        def validate_one(dotted: str, value: Any) -> Any:
+            try:
+                return _coerce_and_validate(dotted, value)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"{source}: invalid setting {dotted}: {exc}") from exc
+
+        def validate_file_value(dotted: str, value: Any, spec: Any) -> Any:
+            try:
+                return _coerce(dotted, value, spec)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{source}: invalid setting {dotted}: {exc}") from exc
+
+        if overrides:
+            normalized = {}
+            for dotted, value in cls._leaves(tree):
+                cls._set_dotted(normalized, dotted, validate_one(dotted, value))
+            return normalized
+
+        # A TOML table replaced by a scalar otherwise makes nested lookups fall
+        # back silently to defaults. Reject malformed known section shapes.
+        for group in ("app", "exchange", "market_data", "account", "risk", "stoploss",
+                      "takeprofit", "trailing", "strategy", "filters", "universe",
+                      "target", "web", "persistence", "venues"):
+            if group in normalized and not isinstance(normalized[group], dict):
+                raise ValueError(f"{source}: [{group}] must be a TOML table")
+
+        # Validate every public runtime knob present in the TOML, plus every
+        # filter and per-venue field. Other static TOML settings remain intact.
+        def get_dotted(dotted: str):
+            node: Any = normalized
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return None, False
+                node = node[part]
+            return node, True
+
+        for dotted in VALIDATORS:
+            value, exists = get_dotted(dotted)
+            if exists:
+                cls._set_dotted(normalized, dotted, validate_one(dotted, value))
+        for dotted, spec in _FILE_VALIDATORS.items():
+            value, exists = get_dotted(dotted)
+            if exists:
+                cls._set_dotted(normalized, dotted, validate_file_value(dotted, value, spec))
+
+        weights = normalized.get("universe", {}).get("weights", {})
+        if weights is not None and not isinstance(weights, dict):
+            raise ValueError(f"{source}: universe.weights must be a TOML table")
+        if isinstance(weights, dict) and weights and sum(float(v) for v in weights.values()) <= 0:
+            raise ValueError(f"{source}: at least one universe ranking weight must be positive")
+
+        for group in ("filters", "venues"):
+            value = normalized.get(group, {})
+            if not isinstance(value, dict):
+                raise ValueError(f"{source}: [{group}] must be a TOML table")
+            for dotted, leaf in cls._leaves(value, group):
+                cls._set_dotted(normalized, dotted, validate_one(dotted, leaf))
+        return normalized
+
     def reload(self) -> None:
         with self._lock:
             with open(self.path, "rb") as fh:
-                self._base = tomllib.load(fh)
-            self._overrides = {}
-            op = self.overrides_path
+                base = tomllib.load(fh)
+            base = self._validated_settings_tree(base, str(self.path))
+
+            overrides: Dict[str, Any] = {}
+            configured_data_dir = str(base.get("app", {}).get("data_dir", "data"))
+            op = self.resolve(configured_data_dir) / "settings.json"
             if op.exists():
                 try:
-                    self._overrides = json.loads(op.read_text() or "{}")
-                except (json.JSONDecodeError, OSError):
-                    self._overrides = {}
-            self._data = _deep_merge(self._base, self._overrides)
+                    decoded = json.loads(op.read_text())
+                except (json.JSONDecodeError, OSError) as exc:
+                    raise ValueError(f"cannot load runtime settings {op}: {exc}") from exc
+                if not isinstance(decoded, dict):
+                    raise ValueError(f"runtime settings {op} must contain a JSON object")
+                overrides = self._validated_settings_tree(decoded, str(op), overrides=True)
+
+            data = _deep_merge(base, overrides)
+            self._validate_relations(data)
+            self._base, self._overrides, self._data = base, overrides, data
 
     def save_overrides(self) -> None:
         with self._lock:

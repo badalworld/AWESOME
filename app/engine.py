@@ -89,6 +89,8 @@ class TradingEngine:
         self.watchlist: List[str] = []
         self.marks: Dict[str, float] = {}
         self.tickers: Dict[str, Ticker] = {}
+        self.last_market_update_ts = 0.0
+        self.market_tick_count = 0
         self.market_data_source = "unknown"
         self.last_account = None
         # Fixed anchor: the balance this book started with. Set once and then
@@ -400,6 +402,8 @@ class TradingEngine:
     def _on_tick(self, symbol: str, mark: float, bid: float, ask: float) -> None:
         if not self.running or not math.isfinite(mark) or mark <= 0:
             return
+        self.last_market_update_ts = time.time()
+        self.market_tick_count += 1
         self.marks[symbol] = mark
         tk = self.tickers.get(symbol)
         if tk is not None:
@@ -482,8 +486,10 @@ class TradingEngine:
                     if htf_tf != str(self.cfg.get("strategy.timeframe", "Min5")):
                         await self.broker.subscribe(symbols, htf_tf)
                     if self.market_data_source != "synthetic":
-                        await self._refresh_tickers(symbols)
-                wait = int(self.cfg.get("universe.refresh_sec", 300))
+                        # Reuse the universe scan's full ticker snapshot instead
+                        # of paying for a second all-market REST request.
+                        await self._refresh_tickers(symbols, self.universe.last_tickers or None)
+                wait = int(self.cfg.get("universe.refresh_sec", 60))
                 await asyncio.sleep(wait)
             except asyncio.CancelledError:
                 raise
@@ -492,9 +498,9 @@ class TradingEngine:
                 log.warning("universe loop error: %s", exc)
                 await asyncio.sleep(30)
 
-    async def _refresh_tickers(self, symbols: List[str]) -> None:
+    async def _refresh_tickers(self, symbols: List[str], snapshot: Optional[Dict[str, Ticker]] = None) -> None:
         try:
-            all_tickers = await self.broker.tickers()
+            all_tickers = snapshot if snapshot is not None else await self.broker.tickers()
             for sym in symbols:
                 if sym in all_tickers:
                     self.tickers[sym] = all_tickers[sym]
@@ -555,14 +561,23 @@ class TradingEngine:
         if len(candles) >= 2:
             candles = candles[:-1]
 
-        htf: Dict[str, List] = {}
         htf_tf = str(cfg.get("filters.htf.htf_timeframe", "Min15"))
-        for tf_name in {htf_tf, "Min15", "Min60"}:
+        # The score uses 15m context and the filter uses its selected timeframe.
+        # Avoid fetching unused 60m candles, and fetch the needed higher frames in
+        # parallel so one symbol does not wait through multiple REST round trips.
+        htf_names = list(dict.fromkeys((htf_tf, "Min15")))
+
+        async def fetch_htf(tf_name: str):
+            if tf_name == tf:
+                return tf_name, candles
             try:
                 series = await self.broker.klines(symbol, tf_name, 160)
-                htf[tf_name] = series[:-1] if len(series) >= 2 else series
+                return tf_name, (series[:-1] if len(series) >= 2 else series)
             except Exception:  # noqa: BLE001
-                continue
+                return tf_name, None
+
+        htf_rows = await asyncio.gather(*(fetch_htf(name) for name in htf_names))
+        htf = {name: series for name, series in htf_rows if series}
 
         tk = self.tickers.get(symbol)
         if tk is None:
@@ -626,8 +641,37 @@ class TradingEngine:
             log.debug("depth fetch failed for %s: %s", symbol, exc)
         return max(1_000.0, (tk.amount24 / 2880.0) if tk else 0.0)
 
+    def _live_feed_health(self) -> Dict[str, Any]:
+        """Live entries require a connected WS and a recent mark-price tick."""
+        if self.cfg.mode != "live":
+            return {"fresh": True, "age_s": None, "reason": ""}
+        try:
+            diagnostics = self.broker.diagnostics() if self.broker else {}
+        except Exception as exc:  # noqa: BLE001 - health reporting failure is fail-closed
+            return {"fresh": False, "age_s": None, "reason": f"market feed health unavailable: {exc}"}
+        ws = diagnostics.get("ws") or {}
+        max_age = float(self.cfg.get("market_data.max_ws_stale_sec", 10.0))
+        age = max(0.0, time.time() - self.last_market_update_ts) if self.last_market_update_ts else None
+        if not ws.get("connected"):
+            return {"fresh": False, "age_s": age, "reason": "live market WebSocket is disconnected"}
+        if age is None:
+            return {"fresh": False, "age_s": None, "reason": "no live mark-price ticks received yet"}
+        if not math.isfinite(age) or age > max_age:
+            return {"fresh": False, "age_s": age,
+                    "reason": f"market data stale ({age:.1f}s; limit {max_age:.1f}s)"}
+        return {"fresh": True, "age_s": age, "reason": ""}
+
     async def _try_open(self, signal: Signal):
         if not self.executor or not self.guard:
+            return
+        feed = self._live_feed_health()
+        if not feed["fresh"]:
+            reason = f"entry blocked: {feed['reason']}"
+            if signal.signal_id:
+                await self.db.update_signal(signal.signal_id, {"status": "rejected", "reason": reason})
+            self._log_event("signal_rejected", {"symbol": signal.symbol, "side": signal.side,
+                                                "score": signal.score, "reason": reason})
+            log.warning("[%s] %s %s", self.spec.id, signal.symbol, reason)
             return
         task = asyncio.create_task(self.executor.open_from_signal(signal))
         self._entry_tasks.add(task)
@@ -727,10 +771,15 @@ class TradingEngine:
         return await self.executor.force_close_symbol(symbol, reason=reason)
 
     async def resume_risk_halt(self) -> bool:
-        if self.executor and await self.executor.pending_entry() is not None:
-            if self.guard:
-                await self.guard.halt("unresolved entry journal; operator reconciliation required")
-            return False
+        if self.executor:
+            pending = await self.executor.pending_entry()
+            incident = await self.executor.recovery_incident()
+            if pending is not None or incident is not None:
+                reason = ("unresolved entry journal; operator reconciliation required" if pending
+                          else f"recovery incident: {incident.get('reason')}")
+                if self.guard:
+                    await self.guard.halt(reason)
+                return False
         if self.guard:
             await self.guard.resume()
             log.info("risk halt cleared")
@@ -750,6 +799,18 @@ class TradingEngine:
                 account = None
         positions = self.executor.live_positions(self.marks) if self.executor else []
         trade_stats = await self.db.trade_stats()
+        market_data_age = max(0.0, time.time() - self.last_market_update_ts) if self.last_market_update_ts else None
+        scanner = self.universe
+        scan_snapshot = {
+            "started_at": scanner.last_scan_started_at if scanner else 0.0,
+            "last_success_at": scanner.last_scan_ts if scanner else 0.0,
+            "duration_ms": scanner.last_scan_duration_ms if scanner else 0.0,
+            "scan_count": scanner.scan_count if scanner else 0,
+            "candidate_count": scanner.last_candidate_count if scanner else 0,
+            "eligible_count": scanner.last_eligible_count if scanner else 0,
+            "selected_count": len(scanner.last_entries) if scanner else 0,
+            "error": scanner.last_scan_error if scanner else "",
+        }
         equity = account.equity if account else 0.0
         starting = await self.ensure_starting_balance(equity if equity > 0 else None)
         if not starting:
@@ -792,6 +853,8 @@ class TradingEngine:
                 "uptime_s": round(time.time() - self.started_at, 1) if self.started_at else 0,
                 "last_error": self.last_error,
                 "watchlist": self.watchlist,
+                "market_data_age_s": round(market_data_age, 2) if market_data_age is not None else None,
+                "market_tick_count": self.market_tick_count,
                 "clock_offset_ms": round(self.clock.offset_ms, 2),
             },
             "account": {
@@ -815,6 +878,7 @@ class TradingEngine:
             },
             "positions": positions,
             "pending_entry": await self.executor.pending_entry() if self.executor else None,
+            "recovery_incident": await self.executor.recovery_incident() if self.executor else None,
             "risk": self.guard.snapshot(equity) if self.guard else {},
             "stats": trade_stats,
             "target": {
@@ -827,6 +891,7 @@ class TradingEngine:
                 "starting_balance": round(starting, 4),
             },
             "universe": self.universe.to_dict_list() if self.universe else [],
+            "universe_scan": scan_snapshot,
             "signals": self.recent_signals[:50],
             "events": self.event_log[:50],
             "latency": self.telemetry.snapshot(),

@@ -5,7 +5,9 @@ signal counts — are only checked for internal consistency)."""
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
+from types import SimpleNamespace
 
 from tests._util import isolated_config, temp_dir
 
@@ -76,6 +78,20 @@ class EngineTest(_EngineHarness, unittest.IsolatedAsyncioTestCase):
         self.assertIn("risk", state)
         self.assertFalse(state["risk"]["halted"])
 
+    async def test_new_live_entries_require_a_fresh_connected_market_feed(self):
+        self.cfg.set("venues.mexc.mode", "live")
+        ws_state = {"connected": True}
+        self.engine.broker = SimpleNamespace(diagnostics=lambda: {"ws": ws_state})
+
+        self.assertFalse(self.engine._live_feed_health()["fresh"], "no tick must fail closed")
+        self.engine.last_market_update_ts = time.time()
+        self.assertTrue(self.engine._live_feed_health()["fresh"])
+        self.engine.last_market_update_ts = time.time() - 10.1
+        self.assertFalse(self.engine._live_feed_health()["fresh"], "stale tick must block a new entry")
+        self.engine.last_market_update_ts = time.time()
+        ws_state["connected"] = False
+        self.assertFalse(self.engine._live_feed_health()["fresh"], "disconnected socket must block")
+
     async def test_universe_scan_selects_tradable_symbols(self):
         await self._start()
         scanner = self.engine.universe
@@ -85,6 +101,11 @@ class EngineTest(_EngineHarness, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("score" in row for row in selected))
         # scores are 0-100 percentiles (regression: they used to be raw dollar values)
         self.assertTrue(all(0.0 <= row["score"] <= 100.0 for row in selected))
+        self.assertGreaterEqual(scanner.scan_count, 1)
+        self.assertGreaterEqual(scanner.last_scan_duration_ms, 0.0)
+        self.assertTrue(scanner.last_tickers)
+        state = await self.engine.state()
+        self.assertGreaterEqual(state["universe_scan"]["selected_count"], 1)
 
     async def test_metrics_and_state_survive_without_trades(self):
         await self._start()

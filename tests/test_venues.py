@@ -58,6 +58,15 @@ class _FrozenClock(Clock):
 
 
 class SigningTest(unittest.TestCase):
+    def test_binance_diagnostics_include_quota_usage_without_keys(self):
+        client = BinanceClient(_FrozenClock(), api_key="private-key", api_secret="private-secret")
+        diagnostics = client.diagnostics()
+        self.assertTrue(diagnostics["credentials"])
+        self.assertIn("api_usage", diagnostics)
+        self.assertEqual(diagnostics["api_usage"]["requests_last_minute"], 0)
+        self.assertNotIn("private-key", str(diagnostics))
+        self.assertNotIn("private-secret", str(diagnostics))
+
     def test_binance_signature_is_hmac_over_the_exact_query(self):
         client = BinanceClient(_FrozenClock(), api_key="KEY123", api_secret="SECRET456")
         headers, query, content = client._sign_request(

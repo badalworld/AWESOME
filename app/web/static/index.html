@@ -4,8 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark" />
-  <meta name="theme-color" content="#04060f" />
-  <title>AO Divergence Futures Bot — MEXC · Binance · KuCoin</title>
+  <meta name="theme-color" content="#07110f" />
+  <title>Crypto Hunter — Live Market Intelligence</title>
+  <link rel="icon" type="image/svg+xml" href="/static/crypto-hunter.svg" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -15,12 +16,21 @@
 
 <div id="app">
   <div id="safetyBanner" class="hidden"></div>
+  <aside class="readiness-banner" role="status" aria-label="Live readiness">
+    <span class="readiness-mark" aria-hidden="true">!</span>
+    <div class="readiness-copy">
+      <strong>Live readiness not cleared</strong>
+      <span>Uncertain fills, incident resolution and partial/external-exit reconciliation remain open. Keep all venue modes in paper; do not arm live routing yet.</span>
+    </div>
+    <a href="/dashboard/settings">Open settings</a>
+  </aside>
   <header class="topbar">
     <div class="brand">
-      <div class="logo">AO</div>
-      <div>
-        <div class="title">Awesome-Oscillator Divergence Bot</div>
-        <div class="subtitle"><span id="brandVenue">MEXC Futures</span> · 5m divergences · ATR 3× stop · stepped trailing</div>
+      <span class="logo-wrap"><img class="logo" src="/static/crypto-hunter.svg" alt="Crypto Hunter mark" width="48" height="48" /></span>
+      <div class="brand-copy">
+        <div class="brand-kicker">MULTI-EXCHANGE TRADING SYSTEM</div>
+        <div class="title">Crypto Hunter</div>
+        <div class="subtitle"><span id="brandVenue">MEXC Futures</span> · real-time market intelligence · automated execution</div>
       </div>
     </div>
 
@@ -68,30 +78,35 @@
     <div class="venue-meta" id="venueMeta">loading venues…</div>
   </div>
 
-  <div class="target-bar">
-    <div class="target-track"><div id="targetFill" class="target-fill"></div></div>
-    <div class="target-text">
-      <span>Compounding target: <b id="targetLabel">$10,000</b> in <b id="targetDays">7</b> days</span>
-      <span id="targetProgress">0%</span>
-    </div>
-  </div>
-
   <div class="ticker-strip" id="tickerStrip">
     <div class="ticker-empty">waiting for the first universe scan…</div>
   </div>
 
-  <nav class="tabs">
-    <button class="tab active" data-tab="overview">Overview</button>
-    <button class="tab" data-tab="positions">Positions <span id="posCount" class="pill">0</span></button>
-    <button class="tab" data-tab="trades">Trade history</button>
-    <button class="tab" data-tab="signals">Signals</button>
-    <button class="tab" data-tab="universe">Universe</button>
-    <button class="tab" data-tab="plan">Compounding plan</button>
-    <button class="tab" data-tab="settings">Settings</button>
-    <button class="tab" data-tab="logs">Logs</button>
+  <nav class="tabs" aria-label="Dashboard pages">
+    <a class="tab active" data-tab="overview" href="/dashboard/overview" aria-current="page">Overview</a>
+    <a class="tab" data-tab="positions" href="/dashboard/positions">Positions <span id="posCount" class="pill">0</span></a>
+    <a class="tab" data-tab="trades" href="/dashboard/trades">Trade history</a>
+    <a class="tab" data-tab="signals" href="/dashboard/signals">Signals</a>
+    <a class="tab" data-tab="universe" href="/dashboard/markets">Markets</a>
+    <a class="tab" data-tab="plan" href="/dashboard/strategy">Strategy &amp; plan</a>
+    <a class="tab" data-tab="settings" href="/dashboard/settings">Settings</a>
+    <a class="tab" data-tab="logs" href="/dashboard/logs">Logs</a>
   </nav>
 
-  <main>
+  <section class="page-heading" aria-live="polite">
+    <div class="page-heading-copy">
+      <span id="pageEyebrow" class="page-eyebrow">PORTFOLIO</span>
+      <h1 id="pageTitle">Overview</h1>
+      <p id="pageDescription">A live, venue-scoped view of account health, exposure and execution.</p>
+    </div>
+    <div class="page-context">
+      <span class="page-context-label">ACTIVE VENUE</span>
+      <strong id="pageVenue">MEXC Futures</strong>
+      <span id="pageRoute" class="page-route">/dashboard/overview</span>
+    </div>
+  </section>
+
+  <main id="pageContent">
     <!-- ================= OVERVIEW ================= -->
     <section id="tab-overview" class="tab-panel active">
       <div class="grid cards">
@@ -103,6 +118,39 @@
         <div class="card"><label>Expectancy / trade</label><div id="kExp" class="kpi">—</div><small id="kExpSub">—</small></div>
         <div class="card"><label>Order latency p50 / p95</label><div id="kLat" class="kpi">—</div><small id="kLatSub">—</small></div>
       </div>
+
+      <section class="card ops-card" aria-labelledby="opsTitle">
+        <div class="card-head">
+          <div>
+            <span class="ops-kicker">SYSTEM TELEMETRY</span>
+            <h3 id="opsTitle">Operations pulse</h3>
+          </div>
+          <span class="muted ops-updated">Per-venue · refreshed with the live dashboard feed</span>
+        </div>
+        <div class="ops-grid">
+          <article class="ops-metric">
+            <div class="ops-topline"><span><i id="apiQuotaDot" class="ops-dot"></i>API quota pressure</span><span id="apiQuotaState" class="ops-state">—</span></div>
+            <strong id="apiQuotaValue" class="ops-value">—</strong>
+            <div class="ops-meter" id="apiQuotaMeter"><span id="apiQuotaFill"></span></div>
+            <div class="ops-foot"><span id="apiQuotaDetail">waiting for exchange telemetry</span><span class="ops-ceiling">95% soft ceiling</span></div>
+          </article>
+          <article class="ops-metric">
+            <div class="ops-topline"><span><i id="feedDot" class="ops-dot"></i>Market data feed</span><span id="feedState" class="ops-state">—</span></div>
+            <strong id="feedValue" class="ops-value">—</strong>
+            <div class="ops-foot"><span id="feedDetail">waiting for first market tick</span></div>
+          </article>
+          <article class="ops-metric">
+            <div class="ops-topline"><span><i id="scanDot" class="ops-dot"></i>Volatility scanner</span><span id="scanState" class="ops-state">—</span></div>
+            <strong id="scanValue" class="ops-value">—</strong>
+            <div class="ops-foot"><span id="scanDetail">scan metrics appear after startup</span></div>
+          </article>
+          <article class="ops-metric">
+            <div class="ops-topline"><span><i id="execDot" class="ops-dot"></i>Order routing</span><span id="execState" class="ops-state">—</span></div>
+            <strong id="execValue" class="ops-value">—</strong>
+            <div class="ops-foot"><span id="execDetail">p50 / p95 exchange order latency</span></div>
+          </article>
+        </div>
+      </section>
 
       <div class="grid two">
         <div class="card chart-card">
@@ -217,6 +265,13 @@
 
     <!-- ================= PLAN ================= -->
     <section id="tab-plan" class="tab-panel">
+      <div class="target-bar">
+        <div class="target-track"><div id="targetFill" class="target-fill"></div></div>
+        <div class="target-text">
+          <span>Compounding target: <b id="targetLabel">$10,000</b> in <b id="targetDays">7</b> days</span>
+          <span id="targetProgress">0%</span>
+        </div>
+      </div>
       <div class="grid cards">
         <div class="card"><label>Required daily growth</label><div id="pDaily" class="kpi">—</div><small>to hit the target in time</small></div>
         <div class="card"><label>P(hit target)</label><div id="pHit" class="kpi">—</div><small>Monte-Carlo, 20k runs</small></div>
@@ -263,7 +318,8 @@
           Each exchange stores its own key in its own encrypted store — nothing is shared between
           venues. Keys are encrypted with AES-256-GCM using a machine-local key
           (<code>data/.secrets/machine.key</code>, mode 0600) and are never returned by the API.
-          Enable <b>futures trade</b> permission; IP whitelisting is strongly recommended.
+          Enable <b>futures trade</b> permission only (never withdrawals) and IP-whitelist each key.
+          Quota pressure is shown when the venue reports limit headers; request volume is not forced toward its ceiling.
         </p>
         <div class="chip-row" id="credVenueChips"></div>
         <div class="form-grid">
@@ -343,7 +399,6 @@
           <button id="resetUniverse" class="btn btn-ghost">Restore defaults</button>
         </div>
       </div>
-    </section>
 
       <div class="card">
         <div class="card-head">

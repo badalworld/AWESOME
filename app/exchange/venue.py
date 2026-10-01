@@ -32,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
-from ..utils import Clock, LatencyTracker
+from ..utils import Clock, ExchangeRequestTracker, LatencyTracker
 from .base import (
     DEFAULT_TAKER_FEE,
     AccountSnapshot,
@@ -404,6 +404,15 @@ class BaseHTTPVenueClient(VenueClient):
         self._query_lane = RateLimiter(query_rate, burst=6)
         self._public_lane = RateLimiter(public_rate, burst=20)
         self.stats: Dict[str, Any] = {"requests": 0, "errors": 0, "retries": 0, "last_error": ""}
+        self.request_tracker = ExchangeRequestTracker()
+
+    def diagnostics(self) -> Dict[str, Any]:
+        data = super().diagnostics()
+        data.update({
+            "credentials": self.has_credentials,
+            "api_usage": self.request_tracker.snapshot(),
+        })
+        return data
 
     # -- lifecycle ------------------------------------------------------ #
     async def start(self) -> None:
@@ -505,11 +514,13 @@ class BaseHTTPVenueClient(VenueClient):
             started = time.perf_counter()
             try:
                 self.stats["requests"] += 1
+                self.request_tracker.record_request()
                 resp = await self._client.request(
                     method.upper(), path, params=query, content=content,
                     headers=headers, timeout=timeout or self._timeout,
                 )
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
+                self.request_tracker.record_response(resp.status_code, getattr(resp, "headers", {}), elapsed_ms)
                 if self.telemetry is not None:
                     await self.telemetry.record(elapsed_ms)
                 if resp.status_code == 429 or resp.status_code in (500, 502, 503, 504):
@@ -524,6 +535,10 @@ class BaseHTTPVenueClient(VenueClient):
                     raise _Fatal(f"HTTP {resp.status_code}: {detail}")
                 code, msg = self._is_envelope_error(payload)
                 if code is not None:
+                    if ExchangeRequestTracker.is_rate_limit_code(code):
+                        self.request_tracker.record_rate_limit()
+                    else:
+                        self.request_tracker.record_error()
                     if str(code) in {str(c) for c in self._retryable_codes()}:
                         raise _Retryable(f"code={code} {msg}")
                     raise _Fatal(f"code={code} {msg}")
@@ -531,6 +546,9 @@ class BaseHTTPVenueClient(VenueClient):
             except (_Retryable, httpx.TransportError, httpx.TimeoutException) as exc:
                 last_err = exc
                 self.stats["retries"] += 1
+                self.request_tracker.record_retry()
+                if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+                    self.request_tracker.record_network_error()
                 if attempt >= self.retry_attempts:
                     break
                 backoff = self.retry_backoff_ms * attempt * (1.0 + 0.25 * (time.perf_counter() % 1.0))

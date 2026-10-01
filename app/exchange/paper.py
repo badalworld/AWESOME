@@ -487,6 +487,13 @@ class PaperBroker(Broker):
         (rather than dashes) while paper trading."""
         running = bool(self._task and not self._task.done())
         latency = self.telemetry.snapshot() if self.telemetry else {}
+        api_usage = None
+        public_client = getattr(self.market, "client", None)
+        if public_client is not None and callable(getattr(public_client, "diagnostics", None)):
+            try:
+                api_usage = public_client.diagnostics().get("api_usage")
+            except Exception:  # noqa: BLE001 - diagnostics must not disrupt state rendering
+                api_usage = None
         return {
             "mode": self.mode,
             "name": self.name,
@@ -501,6 +508,7 @@ class PaperBroker(Broker):
             "clock_offset_ms": 0,
             "clock_rtt_ms": 0,
             "order_latency_ms": latency,
+            "api_usage": api_usage,
             "ws": {
                 "connected": running,
                 "kline_streams": len(self._subscribed),
