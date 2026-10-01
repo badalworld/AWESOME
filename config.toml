@@ -1,0 +1,271 @@
+# =============================================================================
+#  AO-DIVERGENCE FUTURES BOT  —  main configuration
+#  Edit here for defaults. The dashboard "Settings" tab writes runtime overrides
+#  to data/settings.json (which takes precedence and survives restarts).
+# =============================================================================
+
+[app]
+mode = "paper"              # "paper" (simulated fills, real market data) | "live" (real orders)
+data_dir = "data"
+log_level = "INFO"
+
+# -----------------------------------------------------------------------------
+#  VENUES — three independent exchanges, one strategy.
+#  Each venue runs its own engine, its own database (data/venues/<id>.db) and its
+#  own API credentials, so nothing can cross-contaminate. Anything under
+#  [venues.<id>] overrides the global value for that venue only; everything not
+#  overridden (strategy, risk, filters, trailing) is shared -> identical rules.
+# -----------------------------------------------------------------------------
+[venues.mexc]
+enabled = true
+mode = "paper"               # paper | live   (per venue, independent)
+label = "MEXC Futures"
+rest_base = "https://api.mexc.com"
+ws_url = "wss://contract.mexc.com/edge"
+recv_window_ms = 5000
+position_mode = 1            # 1 = hedge, 2 = one-way (auto-detected on boot)
+taker_fee = 0.0002
+maker_fee = 0.0
+
+[venues.binance]
+enabled = true
+mode = "paper"
+label = "Binance USDⓈ-M Futures"
+rest_base = "https://fapi.binance.com"
+ws_url = "wss://fstream.binance.com"
+recv_window_ms = 5000
+position_mode = 2            # Binance default is one-way (positionSide=BOTH)
+taker_fee = 0.0005
+maker_fee = 0.0002
+
+[venues.kucoin]
+enabled = true
+mode = "paper"
+label = "KuCoin Futures"
+rest_base = "https://api-futures.kucoin.com"
+ws_url = "wss://ws-api-futures.kucoin.com"
+recv_window_ms = 5000
+position_mode = 2            # KuCoin futures is one-way only
+taker_fee = 0.0006
+maker_fee = 0.0002
+
+[exchange]
+# Set leverage before entry (cached per symbol/side).
+set_leverage_on_entry = true
+rest_base = "https://api.mexc.com"
+ws_url = "wss://contract.mexc.com/edge"
+recv_window_ms = 5000        # MEXC allows up to 60000; 5000 is plenty for low latency
+http2 = true
+max_connections = 20
+keepalive_expiry = 300
+request_timeout_s = 5.0      # hard timeout on the order hot-path
+retry_attempts = 3
+retry_backoff_ms = 120
+position_mode = 1            # 1 = Hedge (MEXC default), 2 = One-way. Auto-detected on boot.
+paper_data_source = "auto"   # auto | live | synthetic  (paper mode market data)
+# Execution is ALWAYS market (see the 2026-10 live audit): entries and exits are
+# sent as market orders so nothing can rest unfilled, and no limit order is ever
+# placed. The only orders that ever rest on the exchange are the protective
+# trigger orders described under [stoploss]/[trailing].
+time_sync_interval_s = 300   # re-sync clock offset vs exchange server
+
+[account]
+# Starting balance. The dashboard's "Reset paper account" button uses this too.
+# NOTE: 20 U$D is a *small* account — see docs/EDGE_AND_EXPECTANCY.md. At 8%
+# margin x 10x, one trade risks ~$1.60 of margin (~$16 notional), so symbols
+# whose smallest possible order is bigger than that are filtered out of the
+# universe automatically (universe.only_affordable_orders).
+paper_starting_equity = 20.0
+
+# -----------------------------------------------------------------------------
+#  RISK / SIZING  (user-requested: 8% of equity per trade, 10x leverage, max 10)
+# -----------------------------------------------------------------------------
+[risk]
+# One managed position per symbol; sizing always compounds from running equity.
+equity_per_trade_pct = 8.0      # margin per trade = current equity * 8%
+leverage = 10                   # 10x -> ROI = price_move% * leverage
+max_open_positions = 10         # maximum concurrent positions
+max_total_margin_pct = 80.0     # never have more than 80% of equity as margin
+max_daily_loss_pct = 25.0       # halt new entries after -25% day
+max_drawdown_halt_pct = 40.0    # kill-switch: halt bot at -40% from equity peak
+cooldown_after_loss_min = 30    # minutes to avoid a symbol after a losing trade
+cooldown_after_win_min = 0
+min_notional_usd = 5.0          # exchange minimum order notional guard
+max_margin_usd = 0.0            # hard cap on margin per trade (0 = no cap)
+
+# -----------------------------------------------------------------------------
+#  STOP LOSS  (user-requested: ATR x 3)
+# -----------------------------------------------------------------------------
+[stoploss]
+# Exchange triggers always use mark price; this is not a runtime toggle.
+mode = "auto"                   # auto | attached | separate  (exchange-side protection)
+atr_multiplier = 3.0
+atr_period = 14
+local_watchdog = true           # bot-side immediate market close if price breaches SL
+watchdog_grace_bps = 3          # tolerance before watchdog fires (bps through the stop)
+min_sl_roi_pct = 5.0            # never place an SL tighter than this ROI%
+                                # (5% ROI @10x = 0.5% price — a low-ATR symbol
+                                #  would be stopped by noise; the ATR stop is
+                                #  only tightened to this floor, never below)
+max_sl_roi_pct = 150.0          # ...or wider than this ROI%
+
+# -----------------------------------------------------------------------------
+#  TAKE PROFIT  (B1 fixed TP = +200% ROI, reduce-only, exchange-side)
+# -----------------------------------------------------------------------------
+[takeprofit]
+tp_roi_pct = 200.0
+# The target is enforced locally: when the mark reaches the target ROI the bot
+# sends a reduce-only *market* close. No resting take-profit limit order is ever
+# placed (2026-10 live audit).
+
+# OPTIONAL partial take-profit (off by default). Banks a fraction of the position
+# at a nearer target so the trade is not a coin flip against a 3xATR stop: with
+# 50% off at +50% ROI the remaining half keeps running on the stepped trail.
+# See docs/WIN_PROBABILITY.md section 5 -- enabling this raises the break-even
+# win rate bar you must clear and smooths the equity curve.
+partial_tp_enabled = false
+partial_tp_roi_pct = 50.0       # ROI on margin at which the slice is taken
+partial_tp_fraction = 0.5       # fraction of the *position* closed there
+
+# -----------------------------------------------------------------------------
+#  STEPPED TRAILING STOP  (B2)
+#   peak <  TRAIL_START            -> initial ATR SL, no trailing
+#   stop = floor((peak - START)/STEP)*STEP + INITIAL_STOP
+# -----------------------------------------------------------------------------
+[trailing]
+# Mark-price peaks and SQLite persistence are always enabled.
+enabled = true
+trail_start_roi = 30.0          # TRAIL_START_ROI
+trail_initial_stop_roi = 20.0   # TRAIL_INITIAL_STOP_ROI
+trail_step_roi = 10.0           # TRAIL_STEP_ROI
+trail_stop_step_roi = 10.0      # TRAIL_STOP_STEP_ROI
+ratchet_only = true             # stop only ever moves in the profit direction
+step_only_updates = true        # avoid excessive order modifications
+min_move_bps = 2                # ignore stop moves smaller than this (tick noise)
+
+# -----------------------------------------------------------------------------
+#  STRATEGY — Awesome Oscillator divergence on the 5m chart
+# -----------------------------------------------------------------------------
+[strategy]
+timeframe = "Min5"
+candle_history = 300            # candles fetched per symbol for analysis
+ao_fast = 5                     # AO = SMA5(median) - SMA34(median)
+ao_slow = 34
+pivot_k = 2                     # fractal pivot strength (bars each side)
+lookback_bars = 90              # how far back to search for divergence pivots
+min_pivot_gap = 3               # minimum bars between the two pivots
+max_pivot_gap = 45              # maximum bars between the two pivots
+min_ao_delta_atr = 0.12         # AO delta between pivots, normalised by ATR
+require_ao_extreme = true       # bullish div: AO < 0 at the trigger pivot (and vice versa)
+require_trigger_break = true    # entry only on a confirmed break of the pivot structure
+trigger_lookback = 3            # bars after pivot within which the break must happen
+allow_hidden_divergence = false # hidden (continuation) divergence off by default
+signal_cooldown_bars = 6        # per-symbol cooldown between signals (in 5m bars)
+max_signals_per_cycle = 3       # how many entries the engine may open per scan
+signal_expiry_bars = 1          # a signal not executed within N bars is dropped
+
+# Signal quality gate --------------------------------------------------------
+min_signal_score = 60.0         # 0..100 composite quality score required to trade
+
+# --- Anti-fake-signal filter pipeline ---------------------------------------
+[filters.volatility]
+enabled = true
+min_atr_pct = 0.12              # reject dead / illiquid chop
+max_atr_pct = 4.00              # reject chaos / news spikes
+min_atr_percentile = 25.0       # ATR must be >= 25th percentile of last 200 bars
+
+[filters.trend]
+enabled = true
+ema_period = 200
+mode = "ema"                    # "ema" | "ema_stack" | "off"
+ema_stack_fast = 50             # used when mode = "ema_stack"
+slope_lookback = 10             # EMA(200) must not oppose the trade beyond this
+require_slope = false
+
+[filters.htf]
+enabled = true
+htf_timeframe = "Min15"         # higher-timeframe confirmation
+htf_ema_period = 50
+require_htf_ao_rising = true    # HTF AO must turn in the trade direction
+
+[filters.volume]
+enabled = true
+volume_sma_period = 20
+min_volume_mult = 1.15          # trigger candle volume vs SMA20
+min_turnover_24h_usd = 5000000 # liquidity floor for the whole symbol
+require_volume_climax = false   # panic-capitulation volume at the pivot (optional)
+
+[filters.momentum]
+enabled = true
+rsi_period = 14
+rsi_long_max = 62               # don't buy an already-exhausted move
+rsi_short_min = 38
+require_rsi_divergence = false  # RSI must confirm too (stricter)
+macd_confirm = true             # MACD histogram must turn with the trade
+
+[filters.chop]
+enabled = true
+adx_period = 14
+min_adx = 15.0                  # avoid range-bound fakeouts
+require_bb_expansion = false    # Bollinger width expanding
+
+[filters.orderbook]
+enabled = true
+max_spread_bps = 12             # alt liquidity guard
+min_depth_mult = 5.0            # top-5 depth must cover N x our notional
+
+[filters.shock]
+enabled = true
+max_candle_atr = 4.0            # reject entries right after a >4 ATR bar (news candle)
+block_before_funding_sec = 0    # optional funding-window blackout
+
+# -----------------------------------------------------------------------------
+#  UNIVERSE — "most volatile assets" scanner
+# -----------------------------------------------------------------------------
+[universe]
+enabled = true
+max_symbols = 20                # how many contracts to actively monitor
+refresh_sec = 300               # rescan cadence
+min_turnover_24h_usd = 5000000
+min_atr_pct = 0.15              # 5m ATR% (volatility)
+max_atr_pct = 6.0
+min_open_interest_usd = 1000000
+require_api_allowed = true
+exclude_new_listings = true
+exclude_stable_pairs = true     # USDC_USDT etc.
+min_max_leverage = 10           # our leverage must be supported
+weights = { turnover = 0.40, volatility = 0.40, momentum = 0.20 }
+only_affordable_orders = true   # drop symbols whose minimum order > per-trade budget
+blacklist = ["BTC_USDT"]        # optional manual exclusions
+whitelist = []                  # if set (non-empty) -> only these are considered
+
+# -----------------------------------------------------------------------------
+#  COMPOUNDING TARGET — used for projections & the dashboard Maths tab
+# -----------------------------------------------------------------------------
+#  From a $20 start, $10,000 in 7 days requires +143%/day compounded. That is
+#  not a plan, it is a lottery ticket: tools/edge_report.py shows P(<1%) even
+#  with optimistic assumptions. Set a target you can actually inspect weekly
+#  (e.g. 60.0 for a 3x month) and let the calculator tell you the truth.
+[target]
+# (no starting_equity key -> the bot uses the account/paper equity at start)
+equity_target = 10000.0
+days = 7
+monte_carlo_runs = 20000
+
+# -----------------------------------------------------------------------------
+#  WEB DASHBOARD / API
+# -----------------------------------------------------------------------------
+[web]
+host = "0.0.0.0"                # must bind 0.0.0.0 for the hosted live preview
+port = 8080
+api_token = ""                  # STRONGLY recommended for live trading: every REST call
+                                # then needs X-API-Token and the WS needs ?token=...
+                                # (the dashboard asks for it once and remembers it).
+allow_insecure_live = false     # live mode is refused while the dashboard is token-less
+                                # and bound to a non-loopback address
+allow_origins = ""              # empty = same-origin only; set explicit origins to enable CORS
+
+[persistence]
+db_path = "data/bot.db"
+equity_snapshot_sec = 30        # balance-tracking cadence
+log_ring_size = 500
