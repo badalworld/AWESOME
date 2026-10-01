@@ -1,0 +1,28 @@
+# Runtime data (never commit)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+.secrets/
+*.key
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Local scratch
+/tmp_*

@@ -1,0 +1,8 @@
+# Core runtime (async REST + WSS client for MEXC, web dashboard)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx[http2]>=0.27
+cryptography>=42.0
+
+# Optional performance extras (auto-detected, not required)
+# uvloop        # faster event loop on Linux/macOS

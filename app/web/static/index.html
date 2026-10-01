@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AO Divergence Futures Bot — MEXC</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">AO</div>
+      <div>
+        <div class="title">Awesome-Oscillator Divergence Bot</div>
+        <div class="subtitle">MEXC USDT-M Futures · 5m divergences · ATR 3× stop · stepped trailing</div>
+      </div>
+    </div>
+
+    <div class="badges">
+      <span id="modeBadge" class="badge badge-paper">PAPER</span>
+      <span id="dataBadge" class="badge badge-dim">…</span>
+      <span id="statusBadge" class="badge badge-dim">starting</span>
+      <span id="haltBadge" class="badge badge-danger hidden">HALTED</span>
+    </div>
+
+    <div class="topstats">
+      <div class="stat">
+        <label>Equity</label><b id="topEquity">—</b>
+      </div>
+      <div class="stat">
+        <label>Today</label><b id="topDay">—</b>
+      </div>
+      <div class="stat">
+        <label>Open</label><b id="topOpen">0</b>
+      </div>
+      <div class="stat">
+        <label>PnL</label><b id="topPnl">—</b>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="pauseBtn" class="btn btn-ghost">Pause</button>
+      <button id="flattenBtn" class="btn btn-danger">Flatten all</button>
+    </div>
+  </header>
+
+  <div class="target-bar">
+    <div class="target-track"><div id="targetFill" class="target-fill"></div></div>
+    <div class="target-text">
+      <span>Compounding target: <b id="targetLabel">$10,000</b> in <b id="targetDays">7</b> days</span>
+      <span id="targetProgress">0%</span>
+    </div>
+  </div>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview">Overview</button>
+    <button class="tab" data-tab="positions">Positions <span id="posCount" class="pill">0</span></button>
+    <button class="tab" data-tab="trades">Trade history</button>
+    <button class="tab" data-tab="signals">Signals</button>
+    <button class="tab" data-tab="universe">Universe</button>
+    <button class="tab" data-tab="plan">Compounding plan</button>
+    <button class="tab" data-tab="settings">Settings</button>
+    <button class="tab" data-tab="logs">Logs</button>
+  </nav>
+
+  <main>
+    <!-- ================= OVERVIEW ================= -->
+    <section id="tab-overview" class="tab-panel active">
+      <div class="grid cards">
+        <div class="card"><label>Equity</label><div id="kEquity" class="kpi">—</div><small id="kEquitySub">—</small></div>
+        <div class="card"><label>Realized PnL</label><div id="kPnl" class="kpi">—</div><small id="kPnlSub">—</small></div>
+        <div class="card"><label>Win rate</label><div id="kWin" class="kpi">—</div><small id="kWinSub">—</small></div>
+        <div class="card"><label>Open positions</label><div id="kOpen" class="kpi">0</div><small id="kOpenSub">max 10</small></div>
+        <div class="card"><label>Expectancy / trade</label><div id="kExp" class="kpi">—</div><small id="kExpSub">—</small></div>
+        <div class="card"><label>Order latency p50 / p95</label><div id="kLat" class="kpi">—</div><small id="kLatSub">—</small></div>
+      </div>
+
+      <div class="grid two">
+        <div class="card chart-card">
+          <div class="card-head"><h3>Equity curve</h3><span id="curveMeta" class="muted"></span></div>
+          <div id="equityChart" class="chart"></div>
+        </div>
+        <div class="card chart-card">
+          <div class="card-head"><h3>ROI distribution (closed trades)</h3><span class="muted">%ROI on margin</span></div>
+          <div id="roiChart" class="chart"></div>
+        </div>
+      </div>
+
+      <div class="grid two">
+        <div class="card">
+          <div class="card-head"><h3>Risk &amp; guard state</h3></div>
+          <table class="kv" id="riskTable"></table>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Broker &amp; connectivity</h3></div>
+          <table class="kv" id="brokerTable"></table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Recent activity</h3></div>
+        <div id="eventFeed" class="feed"></div>
+      </div>
+    </section>
+
+    <!-- ================= POSITIONS ================= -->
+    <section id="tab-positions" class="tab-panel">
+      <div class="card">
+        <div class="card-head">
+          <h3>Open positions</h3>
+          <small class="muted">Stop is ATR×3, then a stepped trailing stop takes over at +30% ROI</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="positionsTable">
+            <thead><tr>
+              <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>ROI</th>
+              <th>Peak ROI</th><th>Stop</th><th>Trail</th><th>TP</th><th>Margin</th><th>PnL</th><th>Age</th><th></th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= TRADES ================= -->
+    <section id="tab-trades" class="tab-panel">
+      <div class="card">
+        <div class="card-head">
+          <h3>Trade history</h3>
+          <div class="row-actions">
+            <input id="tradeFilter" class="input" placeholder="filter symbol…" />
+            <a class="btn btn-ghost" href="/api/trades.csv">Export CSV</a>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="tradesTable">
+            <thead><tr>
+              <th>Closed</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th>
+              <th>Lev</th><th>Margin</th><th>Peak ROI</th><th>ROI</th><th>PnL</th><th>Fees</th><th>Exit reason</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= SIGNALS ================= -->
+    <section id="tab-signals" class="tab-panel">
+      <div class="card">
+        <div class="card-head">
+          <h3>Divergence signals</h3>
+          <small class="muted">Every candidate is scored; rejected ones show exactly which filter blocked them</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="signalsTable">
+            <thead><tr>
+              <th>Time</th><th>Symbol</th><th>Side</th><th>Score</th><th>Price</th><th>ATR%</th>
+              <th>Status</th><th>Reason / filters</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= UNIVERSE ================= -->
+    <section id="tab-universe" class="tab-panel">
+      <div class="card">
+        <div class="card-head">
+          <h3>Volatility universe (live scan)</h3>
+          <small class="muted">Ranked by turnover, realised 5m volatility and momentum</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data" id="universeTable">
+            <thead><tr>
+              <th>#</th><th>Symbol</th><th>Score</th><th>Price</th><th>24h turnover</th>
+              <th>24h range</th><th>5m ATR%</th><th>Vol ratio</th><th>ADX</th><th>Spread</th><th>Max lev</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Rejected in the last scan</h3></div>
+        <div id="rejectedList" class="chips"></div>
+      </div>
+    </section>
+
+    <!-- ================= PLAN ================= -->
+    <section id="tab-plan" class="tab-panel">
+      <div class="grid cards">
+        <div class="card"><label>Required daily growth</label><div id="pDaily" class="kpi">—</div><small>to hit the target in time</small></div>
+        <div class="card"><label>P(hit target)</label><div id="pHit" class="kpi">—</div><small>Monte-Carlo, 20k runs</small></div>
+        <div class="card"><label>Median outcome</label><div id="pMedian" class="kpi">—</div><small>50th percentile</small></div>
+        <div class="card"><label>Break-even win rate</label><div id="pBreakeven" class="kpi">—</div><small>expectancy = 0</small></div>
+      </div>
+
+      <div class="grid two">
+        <div class="card">
+          <div class="card-head"><h3>Per-trade mechanics</h3></div>
+          <table class="kv" id="planMath"></table>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Simulation assumptions</h3></div>
+          <table class="kv" id="planAssumptions"></table>
+        </div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head"><h3>Simulated equity paths</h3><span class="muted">12 of 20,000 runs</span></div>
+        <div id="mcChart" class="chart"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Win-rate sensitivity</h3><span class="muted">what the target actually requires</span></div>
+        <div class="table-wrap">
+          <table class="data" id="sensitivityTable">
+            <thead><tr><th>Win rate</th><th>P(hit target)</th><th>Median equity</th><th>Mean equity</th><th>P(ruin)</th><th>Avg max DD</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="planDisclaimer" class="disclaimer"></p>
+      </div>
+    </section>
+
+    <!-- ================= SETTINGS ================= -->
+    <section id="tab-settings" class="tab-panel">
+      <div class="card">
+        <div class="card-head">
+          <h3>MEXC API credentials</h3>
+          <span id="credState" class="badge badge-dim">not configured</span>
+        </div>
+        <p class="muted">
+          Keys are encrypted with AES-256-GCM using a machine-local key
+          (<code>data/.secrets/machine.key</code>, mode 0600) and never returned by the API.
+          Enable <b>futures order</b> permission on the key; IP whitelisting is strongly recommended.
+        </p>
+        <div class="form-grid">
+          <label>API key<input id="apiKey" class="input" type="password" placeholder="mx…" autocomplete="off" /></label>
+          <label>API secret<input id="apiSecret" class="input" type="password" placeholder="••••••••" autocomplete="off" /></label>
+        </div>
+        <div class="row-actions">
+          <button id="saveCreds" class="btn">Save &amp; verify</button>
+          <button id="testCreds" class="btn btn-ghost">Test connection</button>
+          <button id="clearCreds" class="btn btn-danger-ghost">Delete keys</button>
+        </div>
+        <div id="credResult" class="hint"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Trading mode</h3></div>
+        <div class="form-grid">
+          <label>Mode
+            <select id="cfgMode" class="input">
+              <option value="paper">paper (simulated orders)</option>
+              <option value="live">live (real orders)</option>
+            </select>
+          </label>
+          <label>Paper data source
+            <select id="cfgPaperSource" class="input">
+              <option value="auto">auto (MEXC public, fallback synthetic)</option>
+              <option value="live">MEXC public only</option>
+              <option value="synthetic">synthetic simulator</option>
+            </select>
+          </label>
+          <label>Paper starting equity ($)<input id="cfgPaperEquity" class="input" type="number" step="10" /></label>
+          <label>Entry order type
+            <select id="cfgEntryType" class="input">
+              <option value="market">market (fastest)</option>
+              <option value="ioc_limit">IOC limit (slippage cap)</option>
+            </select>
+          </label>
+        </div>
+        <div class="row-actions">
+          <button id="saveMode" class="btn">Apply</button>
+          <button id="restartEngine" class="btn btn-ghost">Restart engine</button>
+          <button id="resetPaper" class="btn btn-danger-ghost">Reset paper account</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Risk, stops &amp; trailing</h3><small class="muted">all values configurable &amp; persisted</small></div>
+        <div class="form-grid" id="riskForm"></div>
+        <div class="row-actions">
+          <button id="saveRisk" class="btn">Save risk settings</button>
+          <button id="resetRisk" class="btn btn-ghost">Restore defaults</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Strategy &amp; anti-fake-signal filters</h3></div>
+        <div class="form-grid" id="strategyForm"></div>
+        <div class="row-actions">
+          <button id="saveStrategy" class="btn">Save strategy settings</button>
+          <button id="resetStrategy" class="btn btn-ghost">Restore defaults</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Universe &amp; target</h3></div>
+        <div class="form-grid" id="universeForm"></div>
+        <div class="row-actions">
+          <button id="saveUniverse" class="btn">Save universe settings</button>
+          <button id="resetUniverse" class="btn btn-ghost">Restore defaults</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= LOGS ================= -->
+    <section id="tab-logs" class="tab-panel">
+      <div class="card">
+        <div class="card-head"><h3>Live logs</h3><button id="clearLogs" class="btn btn-ghost">Clear view</button></div>
+        <pre id="logView" class="logs"></pre>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
