@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -66,6 +67,13 @@ class ManagedPosition:
     trough_roi_pct: float = 0.0
     trail_active: bool = False
     trail_step_index: int = -1
+    # partial take-profit bookkeeping (see Executor._take_partial)
+    partial_done: bool = False
+    partial_qty: float = 0.0
+    partial_pnl: float = 0.0
+    partial_fees: float = 0.0
+    partial_roi_pct: float = 0.0
+    initial_margin_usd: float = 0.0
     last_persist_ts: float = 0.0
     signal_id: Optional[int] = None
     fees_usd: float = 0.0
@@ -313,6 +321,7 @@ class Executor:
                 entry_price=entry_price,
                 leverage=leverage,
                 margin_usd=plan.margin_usd,
+                initial_margin_usd=plan.margin_usd,
                 notional_usd=filled_qty * contract_size * entry_price,
                 atr=signal.atr,
                 sl_price=plan.sl_price,
@@ -405,6 +414,16 @@ class Executor:
                     await self.close(pos, reason=reason, price=mark, source="watchdog")
                     return
 
+            # ---- optional partial take-profit (opt-in, off by default) ------- #
+            # Banks a fraction of the position at a nearer ROI so the trade stops
+            # being a coin flip (see docs/WIN_PROBABILITY.md: the median trail
+            # exit is smaller than the 3xATR stop). Off by default, so the
+            # shipped behaviour is unchanged.
+            if not pos.partial_done and bool(cfg.get("takeprofit.partial_tp_enabled", False)):
+                partial_roi = float(cfg.get("takeprofit.partial_tp_roi_pct", 50.0))
+                if roi >= partial_roi:
+                    await self._take_partial(pos, mark, partial_roi)
+
             # ---- stepped trailing stop -------------------------------------- #
             decision = evaluate_trailing(
                 entry_price=pos.entry_price,
@@ -467,6 +486,94 @@ class Executor:
                 await self.db.update_trade(pos.trade_id, {"peak_roi_pct": pos.peak_roi_pct})
         except Exception as exc:  # noqa: BLE001
             log.warning("tick handler error for %s: %s", symbol, exc)
+
+    # ------------------------------------------------------------------ #
+    #  partial take-profit
+    # ------------------------------------------------------------------ #
+    async def _take_partial(self, pos: ManagedPosition, mark: float, target_roi: float) -> bool:
+        """Close ``takeprofit.partial_tp_fraction`` of the position at market.
+
+        The remainder keeps the same stop/target levels, re-armed at the new
+        size (a resting stop for the *old* size would over-close on some venues
+        and be rejected on others). Realised P&L is accumulated on the position
+        and folded into the single trade row at the final close, so the history
+        stays one row per trade.
+        """
+        cfg = self.cfg
+        fraction = float(cfg.get("takeprofit.partial_tp_fraction", 0.5))
+        try:
+            spec = (await self.broker.contracts()).get(pos.symbol)
+        except Exception:  # noqa: BLE001
+            spec = None
+        unit = float(getattr(spec, "vol_unit", 1.0) or 1.0)
+        min_vol = float(getattr(spec, "min_vol", 0.0) or 0.0)
+
+        qty = math.floor((pos.qty * fraction) / unit) * unit if unit > 0 else pos.qty * fraction
+        qty = round(qty, 8)
+        remainder = round(pos.qty - qty, 8)
+        if qty <= 0 or remainder <= 0 or (min_vol and remainder < min_vol):
+            # cannot split this size (1-lot positions, or the remainder would be
+            # below the venue minimum) -> leave the trade on its normal path
+            pos.partial_done = True
+            pos.notes["partial_skipped"] = (
+                f"qty {pos.qty} too small to split {fraction:.0%} "
+                f"(unit {unit}, min {min_vol})"
+            )
+            log.info("PARTIAL %s skipped: %s", pos.symbol, pos.notes["partial_skipped"])
+            return False
+
+        result = await self.broker.close_position(
+            pos.symbol, pos.side, qty, reason="partial_tp",
+            client_id=f"partial-{pos.trade_uid}",
+        )
+        if not result.ok:
+            log.warning("PARTIAL %s failed: %s", pos.symbol, result.error)
+            return False
+
+        exit_price = await self._confirm_exit_price(pos, result, mark)
+        fee_rate = await self._taker_fee(pos.symbol)
+        fees = (pos.entry_price + exit_price) * qty * pos.contract_size * fee_rate
+        direction = 1.0 if pos.is_long else -1.0
+        pnl = (exit_price - pos.entry_price) * qty * pos.contract_size * direction - fees
+
+        original_margin = pos.margin_usd
+        pos.partial_done = True
+        pos.partial_qty = round(pos.partial_qty + qty, 8)
+        pos.partial_pnl = round(pos.partial_pnl + pnl, 8)
+        pos.partial_fees = round(pos.partial_fees + fees, 8)
+        pos.partial_roi_pct = round(target_roi, 4)
+        pos.qty = remainder
+        pos.notional_usd = round(pos.qty * pos.contract_size * pos.entry_price, 8)
+        pos.margin_usd = round(pos.notional_usd / max(1, pos.leverage), 8)
+        if not pos.initial_margin_usd:
+            pos.initial_margin_usd = round(original_margin, 8)
+
+        # re-arm protection for the remainder (same levels, new size)
+        await self.broker.release_stop(symbol=pos.symbol, handle=pos.protection or {})
+        pos.protection = await self.broker.arm_protection(
+            symbol=pos.symbol, side=pos.side, qty=pos.qty,
+            sl_price=pos.stop_price or pos.sl_price, tp_price=pos.tp_price,
+            entry_order_id=pos.entry_order_id, adopt=False,
+        ) or {}
+
+        await self._persist(pos)
+        await self.db.update_trade(pos.trade_id, {
+            "qty": pos.qty,
+            "margin_usd": pos.margin_usd,
+            "notional_usd": pos.notional_usd,
+            "meta": json.dumps({**(pos.notes or {}), "partial_qty": pos.partial_qty,
+                                "partial_pnl": pos.partial_pnl,
+                                "partial_roi_pct": pos.partial_roi_pct}, default=str),
+        })
+        log.info(
+            "PARTIAL %s %s closed %.8g @ %.8g | +$%.4f | ROI %.1f%% | remainder %.8g",
+            pos.side, pos.symbol, qty, exit_price, pnl, target_roi, pos.qty,
+        )
+        self._emit("partial_taken", {
+            "symbol": pos.symbol, "side": pos.side, "qty": qty, "price": exit_price,
+            "pnl": pnl, "roi_pct": target_roi, "remaining_qty": pos.qty,
+        })
+        return True
 
     # ------------------------------------------------------------------ #
     #  close
@@ -581,9 +688,17 @@ class Executor:
         if pos.closed:
             return {}
         fee_rate = await self._taker_fee(pos.symbol)
-        fees = (pos.entry_price + exit_price) * pos.qty * pos.contract_size * fee_rate
-        pnl = pos.pnl_at(exit_price) - fees
-        roi = pos.roi_at(exit_price)
+        leg_fees = (pos.entry_price + exit_price) * pos.qty * pos.contract_size * fee_rate
+        leg_pnl = pos.pnl_at(exit_price) - leg_fees
+        # a partial take-profit may already have banked part of this position:
+        # one trade row, both legs, fees from both
+        pnl = leg_pnl + pos.partial_pnl
+        fees = leg_fees + pos.partial_fees
+        if pos.partial_done and pos.partial_qty > 0:
+            base_margin = pos.initial_margin_usd or pos.margin_usd or 1.0
+            roi = pnl / base_margin * 100.0
+        else:
+            roi = pos.roi_at(exit_price)
         closed_at = time.time()
         await self.db.update_trade(pos.trade_id, {
             "status": "CLOSED",
@@ -596,7 +711,12 @@ class Executor:
             "closed_at": closed_at,
             "trail_active": 1 if pos.trail_active else 0,
             "trail_stop_roi": pos.stop_roi_pct,
-            "meta": json.dumps({**(pos.notes or {}), "close_latency_ms": round(latency_ms, 2)}, default=str),
+            "meta": json.dumps({
+                **(pos.notes or {}),
+                "close_latency_ms": round(latency_ms, 2),
+                **({"partial_qty": pos.partial_qty, "partial_pnl": round(pos.partial_pnl, 6),
+                    "partial_roi_pct": pos.partial_roi_pct} if pos.partial_done else {}),
+            }, default=str),
         })
         await self.db.kv_delete(self._state_key(pos.symbol))
         pos.closed = True

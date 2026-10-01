@@ -71,6 +71,9 @@ separate overrides). This matters for testing and for running paper + live insta
 | `tp_roi_pct` | `200` | target ROI on margin |
 | `close_remainder_on_tp` | `true` | flatten any residual volume after a partial TP |
 | `count_partials_as_win` | `true` | stats classification |
+| `partial_tp_enabled` | `false` | bank part of the position at a nearer target (opt-in) |
+| `partial_tp_roi_pct` | `50` | ROI on margin for that slice (5-300) |
+| `partial_tp_fraction` | `0.5` | fraction of the position closed there (0.1-0.9) |
 
 ## `[trailing]`
 

@@ -110,9 +110,10 @@ winner only adds 3.04%, and the mix does not compound.  With 8% of equity at
    while the 3xATR stop costs 25-35% ROI, so the median loser is ~1.4x the
    median winner -- you are risking more than the trade usually makes. Either
    widen the trail window (activate at +60% ROI, lock +30%) or take partial
-   profit: close half at +50% ROI (about 1R) and let the rest run. Until the
-   average winner clears the average loser the required win rate stays above
-   46%.
+   profit: close half at +50% ROI (about 1R) and let the rest run -- this is
+   implemented as `takeprofit.partial_tp_enabled` (opt-in, off by default;
+   see docs/RISK.md). Until the average winner clears the average loser, the
+   required win rate stays above 46%.
 2. **Treat the +200% ROI TP as a lottery ticket, not the exit.** Keep it on the
    exchange as a reduce-only order (it costs nothing and catches the tail), but
    plan expectancy off the trailing ladder.

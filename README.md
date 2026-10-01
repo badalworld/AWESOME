@@ -348,6 +348,7 @@ router. Any key can be overridden per venue with `[venues.<id>]` blocks in `conf
               max_open_positions = 10
 [stoploss]    atr_multiplier = 3.0          # SL = entry -/+ 3 x ATR(14)
 [takeprofit]  tp_roi_pct = 200              # +200% ROI on margin
+              partial_tp_enabled = false    # optional: bank half at +50% ROI
 [trailing]    trail_start_roi = 30          # activate trailing here
               trail_initial_stop_roi = 20   # lock this in at activation
               trail_step_roi = 10           # per +10% ROI of peak...
@@ -389,7 +390,7 @@ for the current numbers. The short version, with the strategy as configured:
 ## Testing
 
 ```bash
-python3 tests/run_all.py            # 126 tests, ~20 s, no network needed
+python3 tests/run_all.py            # 130 tests, ~22 s, no network needed
 python3 -m unittest tests.test_core         # maths, indicators, strategy, filters, analytics
 python3 -m unittest tests.test_integration  # trade lifecycle on a deterministic market
 python3 -m unittest tests.test_engine       # the orchestrator on the offline synthetic feed

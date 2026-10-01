@@ -72,6 +72,12 @@ VALIDATORS: Dict[str, Any] = {
     "takeprofit.tp_roi_pct": _num(5, 100000),
     "takeprofit.exchange_side": ("bool",),
     "takeprofit.close_remainder_on_tp": ("bool",),
+    # optional partial take-profit: bank half the position at a nearer target and
+    # let the rest run on the trailing stop (off by default -- the shipped
+    # behaviour is the fixed +200% ROI target + stepped trail)
+    "takeprofit.partial_tp_enabled": ("bool",),
+    "takeprofit.partial_tp_roi_pct": _num(5, 300),
+    "takeprofit.partial_tp_fraction": _num(0.1, 0.9),
     # trailing
     "trailing.enabled": ("bool",),
     "trailing.trail_start_roi": _num(0, 100000),

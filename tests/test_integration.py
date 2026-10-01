@@ -13,6 +13,7 @@ trading logic) with a controllable market, verifying:
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -286,6 +287,128 @@ class TradeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         )
         assert large is not None
         self.assertGreater(large.notional_usd, small.notional_usd * 1.8)
+
+
+class PartialTakeProfitTest(unittest.IsolatedAsyncioTestCase):
+    """Optional half-off-at-a-nearer-target exit (takeprofit.partial_tp_*).
+
+    Off by default, so the shipped behaviour (fixed +200% ROI target + stepped
+    trail) is untouched. Enabled, it must bank the configured fraction exactly
+    once, leave the remainder protected at the same levels but the new size, and
+    fold both legs into the single closed-trade row.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ao-partial-"))
+        self.cfg = isolated_config()
+        self.cfg._base["app"]["data_dir"] = str(self.tmp)     # type: ignore[attr-defined]
+        self.db = Database(self.tmp / "partial.db")
+        self.guard = RiskGuard(self.cfg, self.db)
+        self.market = StaticMarket(price=100.0, atr=0.5)
+        self.broker = PaperBroker(self.market, starting_equity=1000.0,
+                                  slippage_bps=0.0, price_interval_s=3600)
+        await self.broker.start()
+        self.executor = Executor(self.broker, self.cfg, self.db, self.guard)
+
+    async def asyncTearDown(self) -> None:
+        await self.broker.stop()
+        self.db.close()
+
+    async def _open(self):
+        return await self.executor.open_from_signal(
+            make_signal(price=100.0, atr=0.5),
+            equity=1000.0, available=1000.0, margin_used=0.0, open_positions=0,
+        )
+
+    def _enable(self, *, roi: float = 50.0, fraction: float = 0.5) -> None:
+        self.cfg.set_many({
+            "takeprofit.partial_tp_enabled": True,
+            "takeprofit.partial_tp_roi_pct": roi,
+            "takeprofit.partial_tp_fraction": fraction,
+        })
+
+    async def _tick_at_roi(self, pos, roi_pct: float) -> None:
+        price = price_from_roi(pos.entry_price, roi_pct, pos.leverage, pos.is_long)
+        self.market.set_price(price)
+        self.executor.marks_cache[pos.symbol] = price
+        await self.executor.handle_tick(pos.symbol, price)
+
+    # ------------------------------------------------------------------ #
+    async def test_disabled_by_default(self):
+        pos = await self._open()
+        assert pos is not None
+        qty_before = pos.qty
+        await self._tick_at_roi(pos, 60.0)
+        self.assertFalse(pos.partial_done)
+        self.assertEqual(pos.qty, qty_before)
+        self.assertEqual(pos.partial_qty, 0.0)
+
+    async def test_banks_the_configured_fraction_once(self):
+        self._enable(roi=50.0, fraction=0.5)
+        pos = await self._open()
+        assert pos is not None
+        self.assertEqual(pos.qty, 8.0)
+
+        await self._tick_at_roi(pos, 60.0)
+        self.assertTrue(pos.partial_done)
+        self.assertAlmostEqual(pos.partial_qty, 4.0, places=6)
+        self.assertAlmostEqual(pos.qty, 4.0, places=6)
+        self.assertAlmostEqual(pos.notional_usd, 400.0, delta=1.0)
+        self.assertGreater(pos.partial_pnl, 0.0, "a +60% ROI partial must book a profit")
+        # 4 contracts x ~+6 price, minus taker fees on both sides (the paper
+        # broker fills at the bid, so a hair under the mid)
+        self.assertAlmostEqual(pos.partial_pnl, 23.47, delta=0.1)
+        self.assertAlmostEqual(pos.partial_roi_pct, 50.0, places=6)
+        # the remainder is still protected, and the resting stop matches the
+        # managed stop (the trail moved it to +20% ROI in the same tick)
+        handle = pos.protection or {}
+        self.assertEqual(handle.get("kind"), "paper")
+        self.assertAlmostEqual(float(handle["stop_price"]), pos.stop_price, places=9)
+        self.assertAlmostEqual(float(handle["tp_price"]), pos.tp_price, places=9)
+        self.assertGreater(pos.stop_price, pos.entry_price, "trail must have locked profit")
+
+        # idempotent: a further run must not take a second slice
+        await self._tick_at_roi(pos, 90.0)
+        self.assertAlmostEqual(pos.partial_qty, 4.0, places=6)
+
+    async def test_both_legs_are_folded_into_one_closed_trade(self):
+        self._enable(roi=50.0, fraction=0.5)
+        pos = await self._open()
+        assert pos is not None
+        await self._tick_at_roi(pos, 60.0)
+        partial_pnl = pos.partial_pnl
+
+        # exit the remainder at +30% ROI through the normal close path
+        exit_price = price_from_roi(pos.entry_price, 30.0, pos.leverage, pos.is_long)
+        self.market.set_price(exit_price)
+        result = await self.executor.close(pos, reason="manual")
+
+        self.assertTrue(result["ok"])
+        trades = [t for t in await self.db.get_trades(limit=10) if t["status"] == "CLOSED"]
+        self.assertEqual(len(trades), 1)
+        trade = trades[0]
+        # one row, both legs, and the ROI is measured against the *original* margin
+        self.assertGreater(trade["realized_pnl"], partial_pnl)
+        self.assertAlmostEqual(trade["qty"], 4.0, delta=1e-6)
+        # blended ROI = total P&L / original margin (~+60% on half, +30% on the
+        # rest, less fees) -- must sit between the two legs
+        self.assertGreater(trade["roi_pct"], 35.0)
+        self.assertLess(trade["roi_pct"], 60.0)
+        meta = json.loads(trade["meta"] or "{}")
+        self.assertAlmostEqual(meta["partial_qty"], 4.0, places=6)
+        self.assertAlmostEqual(meta["partial_pnl"], round(partial_pnl, 6), places=4)
+        self.assertGreater(trade["fees_usd"], 0.0)
+
+    async def test_skips_when_the_remainder_would_be_below_the_venue_minimum(self):
+        self.market.contract.min_vol = 5.0        # 8 -> 4 remainder < 5
+        self._enable(roi=50.0, fraction=0.5)
+        pos = await self._open()
+        assert pos is not None
+        await self._tick_at_roi(pos, 60.0)
+        self.assertTrue(pos.partial_done)
+        self.assertEqual(pos.partial_qty, 0.0)
+        self.assertEqual(pos.qty, 8.0)
+        self.assertIn("partial_skipped", pos.notes)
 
 
 if __name__ == "__main__":

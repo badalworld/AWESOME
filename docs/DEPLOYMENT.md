@@ -15,7 +15,7 @@ git clone <your-repo> awesome && cd awesome
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp config.toml config.toml.bak      # keep the reference defaults
-python3 tests/run_all.py            # 126 tests must pass before you trust it
+python3 tests/run_all.py            # 130 tests must pass before you trust it
 python3 run.py --port 8080
 ```
 

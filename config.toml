@@ -122,6 +122,15 @@ tp_roi_pct = 200.0
 exchange_side = true            # place reduce-only limit on the exchange
 close_remainder_on_tp = true    # if partially filled, close the rest with market
 
+# OPTIONAL partial take-profit (off by default). Banks a fraction of the position
+# at a nearer target so the trade is not a coin flip against a 3xATR stop: with
+# 50% off at +50% ROI the remaining half keeps running on the stepped trail.
+# See docs/WIN_PROBABILITY.md section 5 -- enabling this raises the break-even
+# win rate bar you must clear and smooths the equity curve.
+partial_tp_enabled = false
+partial_tp_roi_pct = 50.0       # ROI on margin at which the slice is taken
+partial_tp_fraction = 0.5       # fraction of the *position* closed there
+
 # -----------------------------------------------------------------------------
 #  STEPPED TRAILING STOP  (B2)
 #   peak <  TRAIL_START            -> initial ATR SL, no trailing

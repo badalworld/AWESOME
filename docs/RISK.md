@@ -57,9 +57,32 @@ win  (TP hit) : +200% ROI × 8% margin = +16.0% of equity
 loss (SL 3ATR): -SL_ROI% × 8% margin  = -0.08 × SL_ROI%  (e.g. -30% ROI -> -2.4%)
 ```
 
-So the break-even win rate for a 30% ROI stop is `30 / (200 + 30) ≈ 13%`. The dashboard's
-**Compounding plan** tab shows the required win rate for the selected equity target and horizon,
-plus a Monte-Carlo distribution of outcomes.
+So the break-even win rate for a 30% ROI stop is `30 / (200 + 30) ≈ 13%` — **but only if the
++200% ROI target actually fills**. At 10x that target needs a **+20% price move** (~21× ATR on the
+symbols the scanner picks), so in practice most winners exit on the trailing stop at +20…+40% ROI
+and the *effective* break-even win rate is ~46% (see
+[`WIN_PROBABILITY.md`](WIN_PROBABILITY.md)). Treat the fixed TP as a free tail-catcher, not as the
+plan.
+
+### Optional partial take-profit
+
+`takeprofit.partial_tp_enabled = true` banks a fraction of the position at a nearer target and lets
+the rest run on the trail:
+
+```toml
+partial_tp_enabled = true
+partial_tp_roi_pct = 50.0     # take the slice at +50% ROI
+partial_tp_fraction = 0.5     # half of the position (0.1 - 0.9)
+```
+
+* the slice is closed **reduce-only at market** in one order; the remainder keeps the same stop and
+  target levels, re-armed at the new size (a resting stop for the old size would over-close on some
+  venues and be rejected on others);
+* it fires **once** per trade, is floored to the venue's lot size, and is skipped if the remainder
+  would fall below the venue minimum;
+* both legs are folded into the **single** trade row (`realized_pnl`, `fees_usd`, and `roi_pct`
+  measured against the original margin), with `partial_qty` / `partial_pnl` in the row metadata;
+* **off by default** — the shipped behaviour is the fixed +200% ROI target plus the stepped trail.
 
 ## 5. Stepped trailing stop
 
