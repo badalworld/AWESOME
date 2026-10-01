@@ -148,6 +148,8 @@ server directly and no CORS setup is needed.
 1. In the Netlify UI, open **Project configuration → Environment variables** and add
    `ENGINE_URL` with your server's address, e.g. `http://203.0.113.10:8080`
    (a bare `203.0.113.10` or `203.0.113.10:8080` also works; the port defaults to `8080`).
+   A variable named `IPAddress` is also accepted if `ENGINE_URL` is not set.
+   `203.0.113.10` is a reserved documentation address — use your server's real public IP.
 2. Make sure the engine's port is reachable from the internet (firewall / security group).
 3. Redeploy. Until `ENGINE_URL` is set, the dashboard shows an "Engine address not configured" error.
 
