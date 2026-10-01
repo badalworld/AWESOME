@@ -38,8 +38,6 @@ from .base import (
     DEFAULT_TAKER_FEE,
     LONG,
     OPEN_ISOLATED,
-    ORDER_IOC,
-    ORDER_LIMIT,
     ORDER_MARKET,
     SHORT,
     SIDE_CLOSE_LONG,
@@ -489,6 +487,27 @@ class MeXCClient:
         return data if isinstance(data, dict) else None
 
 
+    async def open_orders(self, symbol: str = "", page_size: int = 100) -> List[Dict[str, Any]]:
+        """GET /api/v1/private/order/list/open_orders — regular resting orders.
+
+        Plan/trigger orders live on a different endpoint (``plan_orders``); this
+        one is used by the repair path to find *resting* orders that would
+        otherwise survive as pending orders after the market-only audit. The
+        endpoint is paginated and has no symbol filter, so the caller filters.
+        """
+        payload = await self._request(
+            "GET", "/api/v1/private/order/list/open_orders",
+            params={"page_num": 1, "page_size": max(1, min(100, page_size))},
+            signed=True, lane="query",
+        )
+        data = payload.get("data")
+        if isinstance(data, dict):
+            data = data.get("resultList") or data.get("list") or data.get("items") or []
+        rows = list(data or [])
+        if symbol:
+            rows = [r for r in rows if str(r.get("symbol") or "") == symbol]
+        return rows
+
     async def cancel_orders(self, order_ids: List[str]) -> List[Dict[str, Any]]:
         if not order_ids:
             return []
@@ -562,6 +581,7 @@ class MeXCClient:
         if stop_loss_price is not None:
             body["stopLossPrice"] = stop_loss_price
             body["lossTrend"] = loss_trend
+            body["priceProtect"] = 1        # never let a wick "trigger" the stop
         if take_profit_price is not None:
             body["takeProfitPrice"] = take_profit_price
             body["profitTrend"] = profit_trend
@@ -627,25 +647,52 @@ class MeXCClient:
         symbol: str,
         order_id: str,
         trigger_price: float,
-        execute_price: float,
+        execute_price: Optional[float] = None,
         order_type: int = ORDER_MARKET,
         trigger_type: int = 2,
         trend: int = 2,
     ) -> bool:
-        body = {
-            "symbol": symbol,
-            "orderId": int(order_id) if str(order_id).isdigit() else order_id,
-            "triggerPrice": trigger_price,
-            "price": execute_price,
-            "orderType": order_type,
-            "triggerType": trigger_type,
-            "trend": trend,
-            "from": 2,
-        }
-        payload = await self._request(
-            "POST", "/api/v1/private/planorder/change_price", body=body, signed=True, lane="order"
-        )
-        return bool(payload.get("success", True))
+        """POST /api/v1/private/planorder/change_price — move a resting stop.
+
+        ``orderType=5`` (market) executes at market when triggered, so the
+        ``price`` field must **not** carry the trigger price: sending it could be
+        read as a limit execution price and turn the protective stop into a
+        resting limit order (2026-10 live audit). Market moves therefore send
+        ``price: 0``. A few MEXC deployments insist on ``price > 0``; that case
+        retries once with the trigger price so the ratchet still happens.
+        """
+        def _body(price: float) -> Dict[str, Any]:
+            return {
+                "symbol": symbol,
+                "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+                "triggerPrice": trigger_price,
+                "price": price,
+                "orderType": order_type,
+                "triggerType": trigger_type,
+                "trend": trend,
+                "from": 2,
+            }
+
+        prices = [0.0, trigger_price] if order_type == ORDER_MARKET else [
+            float(execute_price if execute_price is not None else trigger_price)
+        ]
+        last_exc: Optional[Exception] = None
+        for idx, price in enumerate(prices):
+            try:
+                payload = await self._request(
+                    "POST", "/api/v1/private/planorder/change_price",
+                    body=_body(price), signed=True, lane="order",
+                )
+                if idx and order_type == ORDER_MARKET:
+                    log.warning(
+                        "[mexc] plan-order move for %s required price=%s (market price=0 was refused)",
+                        symbol, price,
+                    )
+                return bool(payload.get("success", True))
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                continue
+        raise RuntimeError(f"plan-order move failed on {symbol}: {last_exc}")
 
     async def cancel_plan_orders(self, symbol: str, order_ids: List[str]) -> bool:
         if not order_ids:
@@ -1112,45 +1159,26 @@ class MexcVenueClient(VenueClient):
             position_mode=self.position_mode,
         )
 
-    async def limit_order(
-        self, symbol: str, *, side: str, qty: float, price: float,
-        reduce_only: bool, client_id: str = "",
-    ) -> OrderResult:
-        return await self.raw.create_order(
-            symbol=symbol, vol=qty,
-            side=self._close_side(side) if reduce_only else self._open_side(side),
-            order_type=ORDER_LIMIT,
-            price=price,
-            open_type=OPEN_ISOLATED,
-            reduce_only=reduce_only,
-            external_oid=client_id or None,
-            position_mode=self.position_mode,
-        )
-
     async def entry_order_with_protection(
         self, *, symbol: str, side: str, qty: float, leverage: int = 0,
         price_hint: float = 0.0, client_id: str = "", sl_price: Optional[float] = None,
-        tp_price: Optional[float] = None, entry_order_type: str = "market",
-        ioc_buffer_bps: float = 4.0,
     ) -> OrderResult:
-        """MEXC can carry the SL/TP legs on the entry order itself."""
-        price = None
-        order_type = ORDER_MARKET
-        if entry_order_type == "ioc_limit" and price_hint:
-            buf = ioc_buffer_bps / 10_000.0
-            price = price_hint * (1 + buf) if side == LONG else price_hint * (1 - buf)
-            order_type = ORDER_IOC
+        """MEXC can carry the stop-loss leg on the entry order itself.
+
+        Always a market entry, and **never** a take-profit leg: the target is
+        enforced locally so no resting limit order ever exists (2026-10 audit).
+        """
         return await self.raw.create_order(
             symbol=symbol,
             vol=qty,
             side=self._open_side(side),
-            order_type=order_type,
-            price=price,
+            order_type=ORDER_MARKET,
+            price=None,
             leverage=leverage or None,
             open_type=OPEN_ISOLATED,
             reduce_only=False,
             stop_loss_price=sl_price,
-            take_profit_price=tp_price,
+            take_profit_price=None,
             loss_trend=2,
             profit_trend=2,
             price_protect=1,
@@ -1184,7 +1212,7 @@ class MexcVenueClient(VenueClient):
             )
         return await self.raw.modify_plan_order(
             symbol=symbol, order_id=str(order_id), trigger_price=new_price,
-            execute_price=new_price, order_type=ORDER_MARKET,
+            execute_price=None, order_type=ORDER_MARKET,
             trigger_type=2 if side == LONG else 1,
         )
 
@@ -1210,8 +1238,20 @@ class MexcVenueClient(VenueClient):
                     "tpsl_id": row.get("id"),
                     "stop_price": float(row.get("stopLossPrice") or 0),
                     "tp_price": float(row.get("takeProfitPrice") or 0),
+                    # an attached take-profit leg is edited through the entry
+                    # order id, and its kind differs from a standalone TP order
+                    "tp_order_id": str(row.get("orderId") or ""),
+                    "tp_kind": "attached",
                 }
         return None
+
+    async def cancel_take_profit(self, symbol: str, *, order_id: str, kind: str = "plan") -> bool:
+        """Drop a take-profit leg: attached TPSL groups are edited in place."""
+        if kind == "attached":
+            return await self.raw.change_attached_stop(
+                symbol=symbol, order_id=str(order_id), take_profit_price=0.0,
+            )
+        return await self.cancel_order_ids(symbol, [str(order_id)])
 
     async def order_status(self, symbol: str, *, order_id: str = "",
                            client_id: str = "") -> Optional[Dict[str, Any]]:
@@ -1255,6 +1295,22 @@ class MexcVenueClient(VenueClient):
                 out["stop_order_id"] = str(row.get("id") or row.get("orderId") or "")
                 out["stop_price"] = float(row.get("triggerPrice") or 0)
                 break
+        if "tp_order_id" not in out:
+            try:
+                resting = await self.raw.open_orders(symbol)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[mexc] open-order query failed for %s: %s", symbol, exc)
+                known = False
+                resting = []
+            for row in resting:
+                # only *reduce-only* orders are take-profit legs left behind by
+                # the previous version; entry orders are never touched
+                if row.get("reduceOnly") and int(row.get("state", 1) or 1) in (1, 2, 3):
+                    out.setdefault("kind", "plan")
+                    out["tp_order_id"] = str(row.get("orderId") or row.get("id") or "")
+                    out["tp_kind"] = "regular"
+                    out["tp_price"] = float(row.get("price") or 0)
+                    break
         try:
             tpsl = await self.raw.tpsl_orders(symbol)
         except Exception as exc:  # noqa: BLE001
@@ -1274,6 +1330,8 @@ class MexcVenueClient(VenueClient):
                     out["stop_price"] = stop
                 if tp:
                     out["tp_price"] = tp
+                    out["tp_order_id"] = str(row.get("orderId") or "")
+                    out["tp_kind"] = "attached"
                 break
         if not known and not out:
             return None

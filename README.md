@@ -62,7 +62,7 @@ where you enter a separate API key/secret per venue (plus the KuCoin passphrase)
 | Real multi-venue execution | `app/exchange/{mexc,binance,kucoin}.py` + `live.py` — signed REST + own WSS per venue, venue-specific attached/standalone SL/TP, reduce-only exits |
 | Low-latency routing | HTTP/2 keep-alive pool, time-sync offset, idempotent `externalOid`, priority lanes for exits, coalesced tick dispatch, p50/p95/p99 telemetry |
 | ATR×3 stop-loss per transaction | `app/risk/manager.py:build_plan()` — `entry ∓ 3 × ATR(14)`, clamped to sane ROI bounds, exchange-side + local watchdog |
-| TP = +200% ROI on margin | `ROI = price_move% × leverage`; price = `entry × (1 ± 200/(100×10))`, placed as a reduce-only limit |
+| TP = +200% ROI on margin | `ROI = price_move% × leverage`; target = `entry × (1 ± 200/(100×10))`, closed by the bot with a reduce-only **market** order |
 | Stepped trailing stop | `trailing_stop_roi(peak) = floor((peak−30)/10)×10 + 20` — activate at +30%, lock +20%, +10% per +10%, ratchet-only, step-quantised, restart-safe |
 | 8% of equity, 10x, max 10 positions | `size_position()` + `RiskGuard` (margin cap, daily-loss halt, drawdown kill-switch, per-symbol cooldown) |
 | Compounding to a target | `app/analytics/compound.py` — Monte-Carlo + required-win-rate maths, live on the dashboard |
@@ -244,7 +244,8 @@ clamped to `[min_sl_roi_pct, max_sl_roi_pct]`. Placed **on the exchange** (fair-
 `priceProtect` enabled to avoid wick-triggered stops) *and* watched locally: if price breaches the
 stop before the exchange triggers, the bot market-closes immediately (fast lane).
 
-**Take profit (B1)** — fixed `+200% ROI` as a **reduce-only limit order** on the exchange.
+**Take profit (B1)** — fixed `+200% ROI`, enforced by the bot with a reduce-only **market** close
+(no take-profit order is ever left resting on the exchange).
 
 **Stepped trailing stop (B2)**
 
@@ -390,7 +391,7 @@ for the current numbers. The short version, with the strategy as configured:
 ## Testing
 
 ```bash
-python3 tests/run_all.py            # 130 tests, ~22 s, no network needed
+python3 tests/run_all.py            # 151 tests, ~22 s, no network needed
 python3 -m unittest tests.test_core         # maths, indicators, strategy, filters, analytics
 python3 -m unittest tests.test_integration  # trade lifecycle on a deterministic market
 python3 -m unittest tests.test_engine       # the orchestrator on the offline synthetic feed
@@ -454,9 +455,11 @@ Loosen the filters that reject for reasons you disagree with, and watch the pape
 `[min_sl_roi_pct, max_sl_roi_pct]` (default 5–150% ROI) so a tiny ATR can't produce a stop that
 gets wicked out instantly. Adjust in Settings → Risk.
 
-**Do I need to keep the bot running for the trailing stop to work?** The initial SL and the
-+200% TP are live on the exchange, so you are protected even if the bot dies. The *trailing*
-stop and peak tracking resume automatically on restart from persisted state.
+**Do I need to keep the bot running for the trailing stop to work?** The initial stop-loss
+rests on the exchange (a trigger order that executes at market), so a dead bot still cannot
+leave the position unprotected — and the local watchdog re-arms it on restart. The *trailing*
+stop, the peak tracking and the +200% ROI market exit need the bot alive; they resume
+automatically from persisted state when it comes back.
 
 **Where are my keys stored?** Encrypted with AES-256-GCM in `data/bot.db`; the machine key lives in
 `data/.secrets/machine.key` (mode 0600). Keys are never returned by the API (only a masked preview)

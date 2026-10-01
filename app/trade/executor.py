@@ -243,7 +243,7 @@ class Executor:
             result: OrderResult = await self.broker.open_position(
                 symbol=symbol, side=signal.side, qty=sizing.qty, leverage=leverage,
                 price_hint=price_hint, client_id=trade_uid,
-                sl_price=plan.sl_price, tp_price=plan.tp_price,
+                sl_price=plan.sl_price,
             )
             entry_latency = (time.perf_counter() - entry_started) * 1000.0
             await self._record_order(symbol, "entry", signal.side, plan.entry_price or price_hint,
@@ -290,18 +290,18 @@ class Executor:
             if protection_kind == "attached":
                 handle = await self.broker.arm_protection(
                     symbol=symbol, side=signal.side, qty=filled_qty,
-                    sl_price=plan.sl_price, tp_price=plan.tp_price,
+                    sl_price=plan.sl_price,
                     entry_order_id=result.order_id or "",
                 )
             else:
                 handle = await self.broker.arm_protection(
                     symbol=symbol, side=signal.side, qty=filled_qty,
-                    sl_price=plan.sl_price, tp_price=plan.tp_price,
+                    sl_price=plan.sl_price,
                     entry_order_id="",
                 )
             protection_ok = bool(handle) and (
                 handle.get("kind") in ("attached", "plan", "paper")
-                or handle.get("stop_price") or handle.get("tp_price")
+                or handle.get("stop_price")
             )
             if not protection_ok:
                 # Never hold an unprotected leveraged position: flatten immediately.
@@ -465,18 +465,14 @@ class Executor:
                         "stop_roi": pos.stop_roi_pct, "peak_roi": pos.peak_roi_pct,
                     })
 
-            # ---- take profit ------------------------------------------------ #
-            # The +200% ROI target rests on the exchange as a reduce-only limit.
-            # When price reaches it we do NOT fire a second market order (that
-            # would race the exchange fill): the position-sync loop books the
-            # exit as soon as the exchange reports the position gone. We only
-            # close locally if there is no resting target order at all.
-            tp_hit = mark >= pos.tp_price if pos.is_long else mark <= pos.tp_price
-            if tp_hit and bool(cfg.get("takeprofit.close_remainder_on_tp", True)):
-                if self._has_resting_tp(pos):
-                    pos.notes["tp_pending_since"] = pos.notes.get("tp_pending_since") or time.time()
-                else:
-                    await self.close(pos, reason="take_profit", price=pos.tp_price, source="mark")
+            # ---- take profit (local, market exit) ---------------------------- #
+            # No take-profit order rests on the exchange (2026-10 audit): when the
+            # mark reaches the target ROI we send a reduce-only *market* close, so
+            # nothing is ever pending and the fill price is the real one.
+            if pos.tp_price > 0:
+                tp_hit = mark >= pos.tp_price if pos.is_long else mark <= pos.tp_price
+                if tp_hit:
+                    await self.close(pos, reason="take_profit", price=mark, source="mark")
 
             # ---- periodic state persistence --------------------------------- #
             now = time.time()
@@ -552,7 +548,7 @@ class Executor:
         await self.broker.release_stop(symbol=pos.symbol, handle=pos.protection or {})
         pos.protection = await self.broker.arm_protection(
             symbol=pos.symbol, side=pos.side, qty=pos.qty,
-            sl_price=pos.stop_price or pos.sl_price, tp_price=pos.tp_price,
+            sl_price=pos.stop_price or pos.sl_price,
             entry_order_id=pos.entry_order_id, adopt=False,
         ) or {}
 
@@ -578,10 +574,6 @@ class Executor:
     # ------------------------------------------------------------------ #
     #  close
     # ------------------------------------------------------------------ #
-    def _has_resting_tp(self, pos: ManagedPosition) -> bool:
-        handle = pos.protection or {}
-        return bool(handle.get("tp_order_id") or handle.get("tp_price"))
-
     async def close(self, pos: ManagedPosition, *, reason: str, price: Optional[float] = None,
                     source: str = "bot") -> Dict[str, Any]:
         """Flatten a position at market and book the result.
@@ -843,7 +835,6 @@ class Executor:
                 handle = await self.broker.arm_protection(
                     symbol=symbol, side=managed.side, qty=managed.qty,
                     sl_price=managed.stop_price or managed.sl_price,
-                    tp_price=managed.tp_price,
                     entry_order_id=managed.entry_order_id,
                     adopt=True,
                 )
@@ -888,7 +879,7 @@ class Executor:
                 "meta": json.dumps({"adopted": True}),
             })
             handle = await self.broker.arm_protection(
-                symbol=symbol, side=live.side, qty=live.hold_vol, sl_price=sl, tp_price=tp,
+                symbol=symbol, side=live.side, qty=live.hold_vol, sl_price=sl,
                 adopt=True,
             )
             self.positions[symbol] = ManagedPosition(

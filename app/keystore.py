@@ -13,9 +13,17 @@ from typing import Optional
 
 from .crypto import Cipher
 
+# Legacy (un-namespaced) keys — still read as a fallback so an existing
+# single-venue install keeps its credentials after the namespacing change.
 _DB_KEY_API = "cred.api_key"
 _DB_KEY_SECRET = "cred.api_secret"
 _DB_KEY_PASSPHRASE = "cred.passphrase"
+_DB_KEY_PREFIX = "cred"
+_ASCII = "abcdefghijklmnopqrstuvwxyz0123456789_"
+
+
+def _slug(text: str) -> str:
+    return "".join(ch for ch in str(text or "").strip().lower() if ch in _ASCII)
 
 
 @dataclass
@@ -34,19 +42,47 @@ class CredentialStore:
     """Wraps the SQLite kv table with AES-GCM encrypted credential storage."""
 
     def __init__(self, db, secrets_dir: Path, venue_label: str = "MEXC",
-                 needs_passphrase: bool = False) -> None:
+                 needs_passphrase: bool = False, venue_id: str = "") -> None:
         self._db = db
         self._cipher = Cipher(secrets_dir)
         self._lock = threading.RLock()
         self._cache: Optional[Credentials] = None
         self.venue_label = venue_label
         self.needs_passphrase = needs_passphrase
+        # Namespacing the kv keys by venue means two stores can never read each
+        # other's keys even if they are ever handed the same database — the
+        # three venues must be isolated by construction, not by convention.
+        self.venue_id = _slug(venue_id)
+        self._label_id = _slug(venue_label)
+
+    def _key(self, base: str, slug: str = "") -> str:
+        slug = slug or self.venue_id
+        if slug:
+            return f"{_DB_KEY_PREFIX}.{slug}.{base.rsplit('.', 1)[-1]}"
+        return base
+
+    def _candidate_keys(self, base: str) -> list:
+        keys = [self._key(base)]
+        if self._label_id and self._label_id != self.venue_id:
+            keys.append(self._key(base, self._label_id))
+        keys.append(base)                     # pre-namespacing databases
+        return keys
+
+    async def _get(self, base: str) -> Optional[str]:
+        for key in self._candidate_keys(base):
+            value = await self._db.kv_get(key)
+            if value is not None:
+                if key != self._key(base):
+                    # one-time read-fallback: re-store under the canonical key
+                    await self._db.kv_set(self._key(base), value)
+                return value
+        return None
 
     async def load(self) -> Optional[Credentials]:
         """Load (and cache) credentials from the encrypted store."""
-        enc_key = await self._db.kv_get(_DB_KEY_API)
-        enc_secret = await self._db.kv_get(_DB_KEY_SECRET)
-        enc_pass = await self._db.kv_get(_DB_KEY_PASSPHRASE)
+        enc_key = await self._get(_DB_KEY_API)
+        enc_secret = await self._get(_DB_KEY_SECRET)
+        enc_pass = await self._get(_DB_KEY_PASSPHRASE)
         if not enc_key or not enc_secret:
             with self._lock:
                 self._cache = None
@@ -66,19 +102,19 @@ class CredentialStore:
             raise ValueError(f"API key and secret look too short to be valid {self.venue_label} credentials.")
         if self.needs_passphrase and not passphrase:
             raise ValueError(f"{self.venue_label} API keys require the API passphrase as well.")
-        await self._db.kv_set(_DB_KEY_API, self._cipher.encrypt(api_key))
-        await self._db.kv_set(_DB_KEY_SECRET, self._cipher.encrypt(api_secret))
+        await self._db.kv_set(self._key(_DB_KEY_API), self._cipher.encrypt(api_key))
+        await self._db.kv_set(self._key(_DB_KEY_SECRET), self._cipher.encrypt(api_secret))
         if passphrase:
-            await self._db.kv_set(_DB_KEY_PASSPHRASE, self._cipher.encrypt(passphrase))
+            await self._db.kv_set(self._key(_DB_KEY_PASSPHRASE), self._cipher.encrypt(passphrase))
         else:
-            await self._db.kv_delete(_DB_KEY_PASSPHRASE)
+            await self._db.kv_delete(self._key(_DB_KEY_PASSPHRASE))
         with self._lock:
             self._cache = Credentials(api_key, api_secret, passphrase)
 
     async def clear(self) -> None:
-        await self._db.kv_delete(_DB_KEY_API)
-        await self._db.kv_delete(_DB_KEY_SECRET)
-        await self._db.kv_delete(_DB_KEY_PASSPHRASE)
+        await self._db.kv_delete(self._key(_DB_KEY_API))
+        await self._db.kv_delete(self._key(_DB_KEY_SECRET))
+        await self._db.kv_delete(self._key(_DB_KEY_PASSPHRASE))
         with self._lock:
             self._cache = None
 

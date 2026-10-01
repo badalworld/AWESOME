@@ -233,26 +233,27 @@ class TradeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         await self.executor.handle_tick("TEST_USDT", price_from_roi(entry, 30.0, lev, False))
         self.assertEqual(pos.stop_price, stop_before)
 
-    async def test_take_profit_exit(self):
-        """The +200% ROI target is a resting reduce-only order: the venue fills
-        it, the sync loop books the trade. No duplicate market order is sent."""
+    async def test_take_profit_is_a_local_market_exit(self):
+        """No take-profit order rests on the exchange (2026-10 audit): when the
+        mark reaches the target ROI the executor itself sends a reduce-only
+        market close and the trade books at the real fill."""
         pos = await self._open()
         assert pos is not None
         tp = pos.tp_price
-        # price reaches the target; the executor must NOT fire a market order
-        await self.executor.handle_tick("TEST_USDT", tp * 1.0001)
-        self.assertEqual(len(self.executor.positions), 1, "position stays open until the venue fills")
-        # the venue fills the resting target
-        self.market.set_price(tp)
-        await self.broker.close_position("TEST_USDT", pos.side, pos.qty, reason="take_profit")
-        booked = await self.executor.sync_exchange_positions({"TEST_USDT": tp})
-        self.assertTrue(booked, "the sync loop must book the exchange exit")
-        self.assertEqual(len(self.executor.positions), 0)
+        self.assertIsNone((pos.protection or {}).get("tp_order_id"))
+        self.assertIsNone((pos.protection or {}).get("tp_price"))
+        self.market.set_price(tp)          # the venue really is trading at the target
+        await self.executor.handle_tick("TEST_USDT", tp)
+        self.assertEqual(len(self.executor.positions), 0, "executor must close at market")
         trades = await self.db.get_trades(limit=5)
         closed = [t for t in trades if t["status"] == "CLOSED"][0]
         self.assertIn("take_profit", closed["exit_reason"])
-        self.assertAlmostEqual(closed["roi_pct"], 200.0, places=6)
-        self.assertAlmostEqual(closed["exit_price"], tp, places=9)
+        # the paper broker fills at the bid, so a hair under a clean +200%
+        self.assertGreater(closed["roi_pct"], 150.0)
+        self.assertLess(closed["roi_pct"], 200.0 + 1e-6)
+        self.assertAlmostEqual(closed["exit_price"], tp, delta=tp * 0.005)
+        # nothing is left resting for the venue to fill later
+        self.assertEqual(len(await self.broker.positions()), 0)
 
     async def test_state_persists_and_restores(self):
         pos = await self._open()
@@ -364,7 +365,7 @@ class PartialTakeProfitTest(unittest.IsolatedAsyncioTestCase):
         handle = pos.protection or {}
         self.assertEqual(handle.get("kind"), "paper")
         self.assertAlmostEqual(float(handle["stop_price"]), pos.stop_price, places=9)
-        self.assertAlmostEqual(float(handle["tp_price"]), pos.tp_price, places=9)
+        self.assertIsNone(handle.get("tp_price"))   # target is enforced locally
         self.assertGreater(pos.stop_price, pos.entry_price, "trail must have locked profit")
 
         # idempotent: a further run must not take a second slice

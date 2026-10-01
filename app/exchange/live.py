@@ -5,16 +5,20 @@ venue-agnostic — it talks to the normalized :class:`VenueClient` /
 :class:`VenueStream` interfaces, so MEXC, Binance and KuCoin share one
 execution state machine (same rules by construction, not by copy-paste).
 
-Execution strategy (low latency + always protected):
+Execution strategy (market-only, always protected — 2026-10 live audit):
 
 1. ``client.market_order`` with a client id (idempotent retries). When the venue
    supports *attached* protection (MEXC), the stop-loss leg rides in the same
    round trip, so the position is never unprotected — not even for one tick.
-2. Otherwise (or if the venue rejects the attached legs) the executor arms
-   standalone protection immediately: a reduce-only stop order on the exchange
-   plus a reduce-only limit order for the fixed +200 % ROI target.
+2. Otherwise (or if the venue rejects the attached leg) the executor arms
+   standalone protection immediately: a reduce-only *trigger* stop order on the
+   exchange, which is a market order once triggered.
 3. Trailing steps move the stop in a *single* modify call — never
    cancel/replace, so there is no unprotected window.
+4. **No order of ours ever rests on the book.** Entries and exits (stop-loss,
+   trail, +200 % ROI target, manual close) are all market orders; the ROI target
+   is enforced locally by the executor, and any legacy resting take-profit
+   order found on adopt is cancelled.
 """
 from __future__ import annotations
 
@@ -49,9 +53,6 @@ class LiveBroker(Broker):
         ws: Optional[VenueStream] = None,
         *,
         position_mode: int = ONEWAY,
-        entry_order_type: str = "market",
-        exit_order_type: str = "market",
-        ioc_buffer_bps: float = 4.0,
         stop_mode: str = "auto",          # auto | separate (attached is venue-gated)
         telemetry: Optional[LatencyTracker] = None,
     ) -> None:
@@ -61,9 +62,6 @@ class LiveBroker(Broker):
         self.name = f"{self.spec.id}-futures"
         self.clock: Clock = client.clock
         self.position_mode = position_mode
-        self.entry_order_type = entry_order_type.lower()
-        self.exit_order_type = exit_order_type.lower()
-        self.ioc_buffer_bps = ioc_buffer_bps
         self.stop_mode = stop_mode
         self.telemetry = telemetry
 
@@ -220,7 +218,7 @@ class LiveBroker(Broker):
     async def open_position(
         self, symbol: str, side: str, qty: float, leverage: int,
         price_hint: float = 0.0, client_id: str = "",
-        sl_price: Optional[float] = None, tp_price: Optional[float] = None,
+        sl_price: Optional[float] = None,
     ) -> OrderResult:
         attach = self.attached_supported
         # Attached protection is a MEXC capability: the SL/TP legs ride on the
@@ -229,8 +227,7 @@ class LiveBroker(Broker):
             result = await self.client.entry_order_with_protection(
                 symbol=symbol, side=side, qty=qty, leverage=leverage,
                 price_hint=price_hint, client_id=client_id,
-                sl_price=sl_price, tp_price=tp_price,
-                entry_order_type=self.entry_order_type, ioc_buffer_bps=self.ioc_buffer_bps,
+                sl_price=sl_price,
             )
             if not result.ok and self._looks_like_attachment_error(result.error):
                 log.warning("[%s] attached SL/TP rejected for %s (%s) -> separate protection",
@@ -238,33 +235,32 @@ class LiveBroker(Broker):
                 self.attached_supported = False
                 result = await self._plain_entry(symbol, side, qty, leverage, price_hint, client_id)
             result.raw = dict(result.raw or {})
-            result.raw["protection"] = "attached" if result.ok and attach else "separate"
+            # label what was *actually* used: a rejected attachment falls back to
+            # a plain market entry and the standalone protection path
+            result.raw["protection"] = "attached" if (result.ok and self.attached_supported) else "separate"
             return result
         return await self._plain_entry(symbol, side, qty, leverage, price_hint, client_id)
 
     @staticmethod
     def _looks_like_attachment_error(error: str) -> bool:
+        """Only *specific* SL/TP rejections may trigger the fallback entry.
+
+        The fallback places a second order, so it must never fire on a generic
+        "invalid parameter" error: if the first order actually reached the
+        matching engine, a blind retry would double the position. Anything
+        ambiguous fails safe — the entry is dropped and no position is opened.
+        """
         err = (error or "").lower()
         return any(tok in err for tok in (
-            "stoploss", "takeprofit", "stop_loss", "profit", "3001", "priceprotect", "param",
+            "stoploss", "stop_loss", "takeprofit", "take_profit", "priceprotect", "3001",
         ))
 
     async def _plain_entry(
         self, symbol: str, side: str, qty: float, leverage: int,
         price_hint: float, client_id: str,
     ) -> OrderResult:
-        if self.entry_order_type == "ioc_limit" and price_hint:
-            buf = self.ioc_buffer_bps / 10_000.0
-            price = price_hint * (1 + buf) if side == LONG else price_hint * (1 - buf)
-            res = await self.client.limit_order(
-                symbol, side=side, qty=qty, price=price, reduce_only=False, client_id=client_id,
-            )
-            if not res.ok:      # IOC limit that missed -> fall back to market (never leave a naked signal)
-                log.warning("[%s] ioc limit entry rejected on %s (%s) -> market", self.spec.id, symbol, res.error)
-                res = await self.client.market_order(
-                    symbol, side=side, qty=qty, reduce_only=False, leverage=leverage, client_id=client_id,
-                )
-            return res
+        # Market only: an unfilled entry order is a naked signal, and a resting
+        # order is one more thing that can conflict with protection (2026-10 audit).
         return await self.client.market_order(
             symbol, side=side, qty=qty, reduce_only=False, leverage=leverage, client_id=client_id,
         )
@@ -272,18 +268,7 @@ class LiveBroker(Broker):
     async def close_position(
         self, symbol: str, side: str, qty: float, reason: str = "", client_id: str = "",
     ) -> OrderResult:
-        if self.exit_order_type == "ioc_limit":
-            tk = await self.ticker(symbol)
-            if tk and (tk.bid or tk.ask):
-                buf = self.ioc_buffer_bps / 10_000.0
-                ref = tk.bid if side == LONG else tk.ask
-                price = ref * (1 - buf) if side == LONG else ref * (1 + buf)
-                res = await self.client.limit_order(
-                    symbol, side=side, qty=qty, price=price, reduce_only=True, client_id=client_id,
-                )
-                if res.ok:
-                    return res
-                log.warning("[%s] ioc limit exit rejected on %s (%s) -> market", self.spec.id, symbol, res.error)
+        # Market only: exits must never rest as a pending order.
         return await self.client.market_order(
             symbol, side=side, qty=qty, reduce_only=True, client_id=client_id,
         )
@@ -291,8 +276,7 @@ class LiveBroker(Broker):
     # -- protection management ------------------------------------------ #
     async def arm_protection(
         self, *, symbol: str, side: str, qty: float, sl_price: Optional[float],
-        tp_price: Optional[float], entry_order_id: str = "",
-        adopt: bool = False,
+        entry_order_id: str = "", adopt: bool = False,
     ) -> Dict[str, Any]:
         """Create exchange-side protection when it was not attached at entry.
 
@@ -308,6 +292,7 @@ class LiveBroker(Broker):
             if found:
                 handle.update(found)
                 handle["side"] = side
+                await self._drop_stale_tp(symbol, handle)
                 return handle
         if adopt:
             try:
@@ -322,8 +307,7 @@ class LiveBroker(Broker):
                 adopted["adopted"] = True
                 if not adopted.get("stop_price") and sl_price:
                     adopted["stop_price"] = sl_price
-                if not adopted.get("tp_price") and tp_price:
-                    adopted["tp_price"] = tp_price
+                await self._drop_stale_tp(symbol, adopted)
                 log.info("[%s] adopted existing protection on %s (%s)",
                          self.spec.id, symbol, adopted.get("kind"))
                 return adopted
@@ -337,16 +321,36 @@ class LiveBroker(Broker):
                 log.info("[%s] protection armed on %s (%s): stop @ %s", self.spec.id, symbol, side, sl_price)
             else:
                 log.error("[%s] failed to place stop for %s: %s", self.spec.id, symbol, res.error)
-        if tp_price:
-            res = await self.client.limit_order(
-                symbol, side=side, qty=qty, price=tp_price, reduce_only=True,
-            )
-            if res.ok:
-                handle["tp_order_id"] = res.order_id
-                handle["tp_price"] = tp_price
-            else:
-                log.error("[%s] failed to place fixed TP for %s: %s", self.spec.id, symbol, res.error)
+        # No take-profit order is placed: the +200% ROI target is enforced
+        # locally with a reduce-only market close (2026-10 audit). Only the stop
+        # ever rests on the exchange.
         return handle
+
+    async def _drop_stale_tp(self, symbol: str, handle: Dict[str, Any]) -> None:
+        """Cancel any take-profit order left resting by an older version.
+
+        2026-10 live audit: *no* order of ours may rest on the book except the
+        protective stop, and the ROI target is enforced locally with a market
+        close. Adopting a resting TP would silently re-introduce a pending
+        order (and a limit fill), so it is cancelled instead.
+        """
+        stale_tp = handle.pop("tp_order_id", None)
+        tp_kind = str(handle.pop("tp_kind", None) or handle.get("kind") or "plan")
+        handle.pop("tp_price", None)
+        if not stale_tp:
+            return
+        log.warning("[%s] cancelling legacy resting take-profit %s on %s",
+                    self.spec.id, stale_tp, symbol)
+        try:
+            ok = await self.client.cancel_take_profit(
+                symbol, order_id=str(stale_tp), kind=tp_kind,
+            )
+            if not ok:
+                log.warning("[%s] venue refused the take-profit cancel %s on %s",
+                            self.spec.id, stale_tp, symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] could not cancel legacy take-profit %s on %s: %s",
+                        self.spec.id, stale_tp, symbol, exc)
 
     async def move_stop(self, *, symbol: str, handle: Dict[str, Any], new_stop_price: float, qty: float) -> bool:
         kind = (handle or {}).get("kind")
@@ -403,7 +407,10 @@ class LiveBroker(Broker):
                 log.warning("[%s] could not cancel tpsl %s on %s: %s", self.spec.id, stop_id, symbol, exc)
         if handle.get("tp_order_id"):
             try:
-                ok = await self.client.cancel_order_ids(symbol, [str(handle["tp_order_id"])]) or ok
+                ok = await self.client.cancel_take_profit(
+                    symbol, order_id=str(handle["tp_order_id"]),
+                    kind=str(handle.get("tp_kind") or kind or "plan"),
+                ) or ok
             except Exception as exc:  # noqa: BLE001
                 log.warning("[%s] could not cancel resting TP on %s: %s", self.spec.id, symbol, exc)
         return ok

@@ -17,7 +17,9 @@ fix can never silently regress:
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any, Dict, List
 
 from tests._util import isolated_config  # noqa: E402
@@ -36,11 +38,14 @@ from app.exchange.venue import (  # noqa: E402
     ORDER_FILLED,
     ORDER_OPEN,
     ORDER_PARTIAL,
+    VENUES,
     normalize_order_status,
 )
 from app.keystore import CredentialStore  # noqa: E402
 from app.risk.manager import RiskGuard, size_position  # noqa: E402
 from app.utils import Clock  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class _FrozenClock(Clock):
@@ -67,6 +72,14 @@ class NormalizeOrderStatusTest(unittest.TestCase):
                          ORDER_FILLED)
         self.assertEqual(normalize_order_status(filled_qty=0, total_qty=5, is_active=True), ORDER_OPEN)
         self.assertEqual(normalize_order_status(filled_qty=3, total_qty=5, is_active=False), ORDER_PARTIAL)
+
+    def test_resting_venue_words_map_to_open(self):
+        """MEXC says OPEN/PARTIAL, Binance says NEW — all resting, none 'unknown'."""
+        for word in ("OPEN", "NEW", "PARTIAL", "PENDING", "ACTIVE", "UNTRIGGERED", "SENT"):
+            self.assertEqual(
+                normalize_order_status(filled_qty=0, total_qty=10, raw_status=word), ORDER_OPEN,
+                f"{word} must be an open order, not an unknown state",
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -170,7 +183,7 @@ class _StubBinance(BinanceClient):
 class ProtectionLifecycleTest(unittest.TestCase):
     def _broker(self) -> tuple[LiveBroker, _StubBinance]:
         client = _StubBinance()
-        broker = LiveBroker(client, None, entry_order_type="market")
+        broker = LiveBroker(client, None)
         return broker, client
 
     def test_adopt_existing_protection_instead_of_duplicating(self):
@@ -180,14 +193,16 @@ class ProtectionLifecycleTest(unittest.TestCase):
             {"orderId": 12, "type": "LIMIT", "price": "200.0", "reduceOnly": True},
         ]]
         handle = asyncio.run(broker.arm_protection(
-            symbol="SOLUSDT", side=LONG, qty=1, sl_price=95.0, tp_price=200.0, adopt=True,
+            symbol="SOLUSDT", side=LONG, qty=1, sl_price=95.0, adopt=True,
         ))
         self.assertEqual(handle["kind"], "plan")
         self.assertTrue(handle.get("adopted"))
         self.assertEqual(handle["stop_order_id"], "11")
-        self.assertEqual(handle["tp_order_id"], "12")
-        # exactly one query, zero order placements
-        self.assertEqual([c["method"] for c in client.calls], ["GET"])
+        # 2026-10 audit: the legacy resting reduce-only LIMIT take-profit must be
+        # *cancelled*, never adopted (no pending orders anywhere)
+        self.assertIsNone(handle.get("tp_order_id"))
+        self.assertIsNone(handle.get("tp_price"))
+        self.assertEqual([c["method"] for c in client.calls], ["GET", "DELETE"])
         self.assertNotIn("/fapi/v1/order", [c["path"] for c in client.calls if c["method"] == "POST"])
 
     def test_adopt_falls_back_to_placing_when_nothing_rests(self):
@@ -204,7 +219,7 @@ class ProtectionLifecycleTest(unittest.TestCase):
 
         client.stop_order = fake_stop  # type: ignore[assignment]
         handle = asyncio.run(broker.arm_protection(
-            symbol="SOLUSDT", side=LONG, qty=1, sl_price=95.0, tp_price=None, adopt=True,
+            symbol="SOLUSDT", side=LONG, qty=1, sl_price=95.0, adopt=True,
         ))
         self.assertEqual(placed, ["stop"])
         self.assertEqual(handle["kind"], "plan")
@@ -439,7 +454,7 @@ class PaperRegressionTest(unittest.TestCase):
         feed = SyntheticFeed(history_bars=30, tick_seconds=0.05)
         broker = PaperBroker(SyntheticMarketAdapter(feed), name="paper", starting_equity=20.0)
         handle = asyncio.run(broker.arm_protection(
-            symbol=list(feed.symbols)[0], side=LONG, qty=1, sl_price=1.0, tp_price=2.0, adopt=True,
+            symbol=list(feed.symbols)[0], side=LONG, qty=1, sl_price=1.0, adopt=True,
         ))
         self.assertEqual(handle["kind"], "paper")
 
@@ -447,6 +462,164 @@ class PaperRegressionTest(unittest.TestCase):
         feed = SyntheticFeed(history_bars=20, tick_seconds=0.05)
         broker = PaperBroker(SyntheticMarketAdapter(feed), name="kucoin-paper", starting_equity=20.0)
         self.assertEqual(broker.diagnostics()["venue"], "kucoin-paper")
+
+# --------------------------------------------------------------------------- #
+#  venue payload dialects, settings surface, isolation (2026-10 audit pass)
+# --------------------------------------------------------------------------- #
+class BinanceStatusPayloadTest(unittest.TestCase):
+    """Binance phrases fills as status/executedQty/avgPrice."""
+
+    def _client(self, row: Dict[str, Any]) -> BinanceClient:
+        client = BinanceClient(_FrozenClock())
+        rows = [row]
+
+        async def fake_request(method: str, path: str, **kw: Any) -> Any:  # type: ignore[override]
+            return rows.pop(0) if rows else {}
+
+        client._request = fake_request  # type: ignore[assignment]
+        return client
+
+    def test_filled_order_reports_price_and_size(self) -> None:
+        client = self._client({"status": "FILLED", "executedQty": "3", "origQty": "3", "avgPrice": "101.5"})
+        got = asyncio.run(client.order_status("SOLUSDT", order_id="1"))
+        assert got is not None
+        self.assertEqual(got["status"], ORDER_FILLED)
+        self.assertAlmostEqual(got["filled_qty"], 3.0)
+        self.assertAlmostEqual(got["avg_price"], 101.5)
+
+    def test_partial_fill_is_visible_so_the_position_size_can_be_corrected(self) -> None:
+        client = self._client({"status": "PARTIALLY_FILLED", "executedQty": "1.5", "origQty": "3", "avgPrice": "100"})
+        got = asyncio.run(client.order_status("SOLUSDT", client_id="ao-1"))
+        assert got is not None
+        self.assertEqual(got["status"], ORDER_PARTIAL)
+        self.assertAlmostEqual(got["filled_qty"], 1.5)
+
+
+class KuCoinStatusPayloadTest(unittest.TestCase):
+    """KuCoin has no status string on older contracts: isActive decides."""
+
+    def _client(self, row: Dict[str, Any]) -> KuCoinClient:
+        client = KuCoinClient(_FrozenClock(), api_key="key", api_secret="secret", passphrase="pass")
+        rows = [row]
+
+        async def fake_request(method: str, path: str, **kw: Any) -> Any:  # type: ignore[override]
+            return rows.pop(0) if rows else {}
+
+        client._request = fake_request  # type: ignore[assignment]
+        return client
+
+    def test_cancel_flag_beats_deal_size(self) -> None:
+        client = self._client({"size": 5, "dealSize": 0, "isActive": False, "cancelExist": True})
+        got = asyncio.run(client.order_status("XBTUSDTM", order_id="1"))
+        assert got is not None
+        self.assertEqual(got["status"], ORDER_CANCELED)
+
+    def test_filled_deal_size_is_a_fill(self) -> None:
+        client = self._client({"size": 5, "dealSize": 5, "isActive": False, "avgDealPrice": "101.25"})
+        got = asyncio.run(client.order_status("XBTUSDTM", order_id="2"))
+        assert got is not None
+        self.assertEqual(got["status"], ORDER_FILLED)
+        self.assertAlmostEqual(got["avg_price"], 101.25)
+
+
+class SmallAccountBudgetTest(unittest.TestCase):
+    """A $20 book must reach its intended 8%/10x size without rounding up."""
+
+    def test_intended_size_passes_on_a_20_dollar_book(self) -> None:
+        spec = ContractSpec(symbol="SOL_USDT", min_vol=1, vol_unit=1, contract_size=0.1, min_notional=5.0)
+        s = size_position(20.0, 25.0, spec, equity_pct=8.0, leverage=10, min_notional_usd=5.0)
+        self.assertTrue(s.ok, s.reason)
+        self.assertAlmostEqual(s.margin_usd, 1.5, places=6)      # 6 lots x $2.50 = $15 notional
+        self.assertAlmostEqual(s.notional_usd, 15.0, places=6)
+
+
+class SettingsSurfaceTest(unittest.TestCase):
+    """The dead order-type / exchange-side-TP knobs must be gone for good."""
+
+    REMOVED = (
+        "exchange.entry_order_type",
+        "exchange.exit_order_type",
+        "exchange.ioc_limit_buffer_bps",
+        "takeprofit.exchange_side",
+        "takeprofit.close_remainder_on_tp",
+    )
+
+    def test_validators_no_longer_accept_the_removed_keys(self) -> None:
+        from app.config import VALIDATORS
+
+        for key in self.REMOVED:
+            self.assertNotIn(key, VALIDATORS)
+
+    def test_config_file_and_dashboard_are_clean_of_them(self) -> None:
+        for rel in ("config.toml", "app/web/static/app.js", "app/web/static/index.html"):
+            text = (ROOT / rel).read_text()
+            for needle in ("entry_order_type", "exit_order_type", "ioc_limit", "exchange_side"):
+                self.assertNotIn(needle, text, f"{rel} still mentions {needle}")
+
+    def test_no_client_can_place_a_limit_order(self) -> None:
+        from app.exchange.venue import VenueClient
+
+        self.assertFalse(hasattr(VenueClient, "limit_order"))
+        for cls in (BinanceClient, KuCoinClient, MexcVenueClient):
+            self.assertFalse(hasattr(cls, "limit_order"), cls.__name__)
+        for path in (ROOT / "app").rglob("*.py"):
+            self.assertNotIn("limit_order", path.read_text(), str(path))
+
+
+class MissingProtectionTest(unittest.TestCase):
+    """A restart with nothing resting must place exactly one stop."""
+
+    def test_missing_protection_is_placed_exactly_once(self) -> None:
+        class _Client(BinanceClient):
+            def __init__(self) -> None:
+                super().__init__(_FrozenClock())
+                self.placed: List[Dict[str, Any]] = []
+
+            async def _request(self, method: str, path: str, **kw: Any) -> Any:  # type: ignore[override]
+                if path == "/fapi/v1/openOrders":
+                    return []
+                if path == "/fapi/v1/order" and method == "POST":
+                    self.placed.append(dict(kw.get("params") or kw.get("body") or {}))
+                    return {"orderId": 42}
+                return {}
+
+        client = _Client()
+        broker = LiveBroker(client, None)
+        handle = asyncio.run(broker.arm_protection(
+            symbol="SOLUSDT", side=LONG, qty=1, sl_price=95.0, adopt=True,
+        ))
+        self.assertEqual(len(client.placed), 1, "one stop, not zero and not two")
+        self.assertTrue(handle.get("stop_order_id"))
+
+
+class PerVenueIsolationTest(unittest.TestCase):
+    """Venues must be isolated by construction, not by convention."""
+
+    def test_venue_specs_are_distinct(self) -> None:
+        self.assertEqual(set(VENUES), {"mexc", "binance", "kucoin"})
+        self.assertIsNot(VENUES["mexc"], VENUES["binance"])
+        self.assertTrue(VENUES["mexc"].supports_attached_protection)
+        self.assertFalse(VENUES["binance"].supports_attached_protection)
+        self.assertTrue(VENUES["kucoin"].needs_passphrase)
+
+    def test_credentials_are_stored_per_venue_even_in_one_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "isolation.db")
+            try:
+                stores = {
+                    v: CredentialStore(db, Path(tmp) / ".secrets", venue_label=v, venue_id=v)
+                    for v in VENUES
+                }
+                asyncio.run(stores["mexc"].save("mexc-api-key-0001", "mexc-api-secret-0001"))
+                asyncio.run(stores["binance"].save("binance-api-key-0002", "binance-api-secret-0002"))
+                self.assertIsNotNone(asyncio.run(stores["mexc"].load()))
+                self.assertIsNotNone(asyncio.run(stores["binance"].load()))
+                self.assertIsNone(asyncio.run(stores["kucoin"].load()),
+                                  "a venue must never read another venue's credentials")
+                self.assertEqual(asyncio.run(stores["mexc"].load()).api_key, "mexc-api-key-0001")
+                self.assertEqual(asyncio.run(stores["binance"].load()).api_key, "binance-api-key-0002")
+            finally:
+                db.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

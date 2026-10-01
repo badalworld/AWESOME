@@ -518,26 +518,6 @@ class KuCoinClient(BaseHTTPVenueClient):
             self._leverage_hint[symbol] = int(body["leverage"])
         return await self._order(body)
 
-    async def limit_order(
-        self, symbol: str, *, side: str, qty: float, price: float,
-        reduce_only: bool, client_id: str = "",
-    ) -> OrderResult:
-        body: Dict[str, Any] = {
-            "clientOid": client_id or uuid.uuid4().hex[:32],
-            "symbol": symbol,
-            "side": self._side(side, reduce_only),
-            "type": "limit",
-            "price": str(self._round_price(symbol, price)),
-            "size": self._round_qty(symbol, qty),
-            "timeInForce": "GTC",
-            "reduceOnly": bool(reduce_only),
-            "marginMode": "ISOLATED",
-            "positionSide": "BOTH",
-        }
-        if not reduce_only:
-            body["leverage"] = str(max(1, int(self._leverage_hint.get(symbol, 1))))
-        return await self._order(body)
-
     async def stop_order(
         self, symbol: str, *, side: str, qty: float, trigger_price: float,
         reduce_only: bool = True, client_id: str = "",

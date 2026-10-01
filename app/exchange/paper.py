@@ -420,7 +420,7 @@ class PaperBroker(Broker):
     async def open_position(
         self, symbol: str, side: str, qty: float, leverage: int,
         price_hint: float = 0.0, client_id: str = "",
-        sl_price: Optional[float] = None, tp_price: Optional[float] = None,
+        sl_price: Optional[float] = None,
     ) -> OrderResult:
         started = time.perf_counter()
         mark = await self.mark_price(symbol)
@@ -458,7 +458,6 @@ class PaperBroker(Broker):
             "symbol": symbol,
             "entry_order_id": order_id,
             "stop_price": sl_price,
-            "tp_price": tp_price,
             "tpsl_id": f"paper-tpsl-{self._seq}",
         }
         if self._cb_order:
@@ -510,13 +509,11 @@ class PaperBroker(Broker):
     # -- protection ----------------------------------------------------- #
     async def arm_protection(
         self, *, symbol: str, side: str, qty: float, sl_price: Optional[float],
-        tp_price: Optional[float], entry_order_id: str = "", adopt: bool = False,
+        entry_order_id: str = "", adopt: bool = False,
     ) -> Dict[str, Any]:
         handle = self._protection.get(symbol) or {"kind": "paper", "symbol": symbol}
         if sl_price is not None:
             handle["stop_price"] = sl_price
-        if tp_price is not None:
-            handle["tp_price"] = tp_price
         handle["entry_order_id"] = entry_order_id or handle.get("entry_order_id", "")
         self._protection[symbol] = handle
         return handle
@@ -532,7 +529,6 @@ class PaperBroker(Broker):
         h = self._protection.get(symbol)
         if h:
             h["stop_price"] = None
-            h["tp_price"] = None
         return True
 
     def _evaluate_protection(self, symbol: str, tk: Ticker) -> None:
@@ -545,15 +541,14 @@ class PaperBroker(Broker):
         if mark <= 0:
             return
         stop = handle.get("stop_price")
-        tp = handle.get("tp_price")
         is_long = pos["side"] == LONG
         hit_reason = None
         if stop:
             if (is_long and mark <= stop) or (not is_long and mark >= stop):
                 hit_reason = "stop_loss"
-        if hit_reason is None and tp:
-            if (is_long and mark >= tp) or (not is_long and mark <= tp):
-                hit_reason = "take_profit"
+        # The take-profit is never a resting exchange order (2026-10 audit): the
+        # executor enforces it locally with a reduce-only market close, exactly
+        # like it does live, so paper and live exercise the same code path.
         if hit_reason:
             self._triggered.add(symbol)
             asyncio.create_task(self._force_close(symbol, hit_reason, mark))

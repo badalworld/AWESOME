@@ -660,7 +660,6 @@ const FIELD_GROUPS = {
     ['stoploss.local_watchdog', 'Local SL watchdog', 'bool'],
     ['stoploss.watchdog_grace_bps', 'Watchdog grace (bps)', 'number', 1],
     ['takeprofit.tp_roi_pct', 'Take profit (ROI %)', 'number', 5],
-    ['takeprofit.exchange_side', 'Exchange-side TP order', 'bool'],
     ['takeprofit.partial_tp_enabled', 'Partial TP (bank part early)', 'bool'],
     ['takeprofit.partial_tp_roi_pct', 'Partial TP at ROI (%)', 'number', 5],
     ['takeprofit.partial_tp_fraction', 'Partial TP fraction (0.1-0.9)', 'number', 0.05],
@@ -751,7 +750,6 @@ const VENUE_FIELDS = [
   ['recv_window_ms', 'recv window (ms)', 'number', 500],
   ['taker_fee', 'taker fee (fraction)', 'number', 0.0001],
   ['paper_data_source', 'paper data source', 'select', ['auto', 'live', 'synthetic']],
-  ['entry_order_type', 'entry order type', 'select', ['market', 'ioc_limit']],
 ];
 
 function buildVenueForm(venueCfg) {
@@ -859,7 +857,6 @@ async function loadSettings() {
   $('#cfgMode').value = data.mode || 'paper';
   $('#cfgPaperSource').value = state.effective['exchange.paper_data_source'] || 'auto';
   $('#cfgPaperEquity').value = state.effective['account.paper_starting_equity'];
-  $('#cfgEntryType').value = state.effective['exchange.entry_order_type'] || 'market';
   const brand = $('#brandVenue');
   if (brand) brand.textContent = venueLabel(state.venue);
 }
@@ -1089,7 +1086,6 @@ function initControls() {
       [`venues.${vid}.mode`]: $('#cfgMode').value,
       [`venues.${vid}.paper_data_source`]: $('#cfgPaperSource').value,
       'account.paper_starting_equity': Number($('#cfgPaperEquity').value || 1000),
-      [`venues.${vid}.entry_order_type`]: $('#cfgEntryType').value,
     };
     try {
       await vapi('/settings', { method: 'PUT', body: JSON.stringify(patch) });

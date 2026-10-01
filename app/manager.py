@@ -71,6 +71,7 @@ class VenueManager:
             keystore = CredentialStore(
                 db, self.data_dir / ".secrets",
                 venue_label=spec.label, needs_passphrase=spec.needs_passphrase,
+                venue_id=vid,
             )
             engine = TradingEngine(vcfg, db, keystore, venue_id=vid, base_cfg=self.cfg)
             self.ctx[vid] = VenueContext(

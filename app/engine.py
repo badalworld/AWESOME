@@ -198,9 +198,6 @@ class TradingEngine:
                 client,
                 self._make_stream(client, ws_url),
                 position_mode=int(cfg.get("exchange.position_mode", 1)),
-                entry_order_type=str(cfg.get("exchange.entry_order_type", "market")),
-                exit_order_type=str(cfg.get("exchange.exit_order_type", "market")),
-                ioc_buffer_bps=float(cfg.get("exchange.ioc_limit_buffer_bps", 4)),
                 stop_mode=str(cfg.get("stoploss.mode", "auto")),
                 telemetry=self.telemetry,
             )

@@ -17,7 +17,6 @@ SIDE_CLOSE_SHORT = 2
 SIDE_OPEN_SHORT = 3
 SIDE_CLOSE_LONG = 4
 
-ORDER_LIMIT = 1
 ORDER_IOC = 3
 ORDER_MARKET = 5
 
@@ -196,16 +195,16 @@ class Broker(ABC):
     async def open_position(
         self, symbol: str, side: str, qty: float, leverage: int,
         price_hint: float = 0.0, client_id: str = "",
-        sl_price: Optional[float] = None, tp_price: Optional[float] = None,
+        sl_price: Optional[float] = None,
     ) -> OrderResult:
         raise NotImplementedError
 
     # protection management (exchange-side stop / target lifecycle) ------- #
     async def arm_protection(
         self, *, symbol: str, side: str, qty: float, sl_price: Optional[float],
-        tp_price: Optional[float], entry_order_id: str = "",
+        entry_order_id: str = "", adopt: bool = False,
     ) -> Dict[str, Any]:
-        """Ensure a stop and target exist for the position; returns a handle."""
+        """Ensure a protective stop exists for the position; returns a handle."""
         return {"kind": "none", "symbol": symbol}
 
     async def move_stop(

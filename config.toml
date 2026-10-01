@@ -64,9 +64,10 @@ retry_attempts = 3
 retry_backoff_ms = 120
 position_mode = 1            # 1 = Hedge (MEXC default), 2 = One-way. Auto-detected on boot.
 paper_data_source = "auto"   # auto | live | synthetic  (paper mode market data)
-entry_order_type = "market"  # "market" (fastest fill) | "ioc_limit" (caps slippage)
-ioc_limit_buffer_bps = 4     # slippage buffer when entry_order_type = ioc_limit
-exit_order_type = "market"
+# Execution is ALWAYS market (see the 2026-10 live audit): entries and exits are
+# sent as market orders so nothing can rest unfilled, and no limit order is ever
+# placed. The only orders that ever rest on the exchange are the protective
+# trigger orders described under [stoploss]/[trailing].
 time_sync_interval_s = 300   # re-sync clock offset vs exchange server
 latency_telemetry = true
 
@@ -119,8 +120,9 @@ max_sl_roi_pct = 150.0          # ...or wider than this ROI%
 # -----------------------------------------------------------------------------
 [takeprofit]
 tp_roi_pct = 200.0
-exchange_side = true            # place reduce-only limit on the exchange
-close_remainder_on_tp = true    # if partially filled, close the rest with market
+# The target is enforced locally: when the mark reaches the target ROI the bot
+# sends a reduce-only *market* close. No resting take-profit limit order is ever
+# placed (2026-10 live audit).
 
 # OPTIONAL partial take-profit (off by default). Banks a fraction of the position
 # at a nearer target so the trade is not a coin flip against a 3xATR stop: with

@@ -38,10 +38,7 @@ VALIDATORS: Dict[str, Any] = {
     "app.log_level": ("enum", ["DEBUG", "INFO", "WARNING", "ERROR"]),
     "exchange.recv_window_ms": _num(1000, 60000),
     "exchange.request_timeout_s": _num(0.5, 30),
-    "exchange.entry_order_type": ("enum", ["market", "ioc_limit"]),
     "exchange.paper_data_source": ("enum", ["auto", "live", "synthetic"]),
-    "exchange.ioc_limit_buffer_bps": _num(0, 100),
-    "exchange.exit_order_type": ("enum", ["market", "ioc_limit"]),
     "exchange.set_leverage_on_entry": ("bool",),
     "exchange.position_mode": ("enum", [1, 2]),
     # account
@@ -70,8 +67,7 @@ VALIDATORS: Dict[str, Any] = {
     "stoploss.max_sl_roi_pct": _num(1, 5000),
     # takeprofit
     "takeprofit.tp_roi_pct": _num(5, 100000),
-    "takeprofit.exchange_side": ("bool",),
-    "takeprofit.close_remainder_on_tp": ("bool",),
+
     # optional partial take-profit: bank half the position at a nearer target and
     # let the rest run on the trailing stop (off by default -- the shipped
     # behaviour is the fixed +200% ROI target + stepped trail)
@@ -152,9 +148,7 @@ VENUE_VALIDATORS: Dict[str, Any] = {
     "retry_backoff_ms": _num(10, 5000),
     "position_mode": ("enum", [1, 2]),
     "paper_data_source": ("enum", ["auto", "live", "synthetic"]),
-    "entry_order_type": ("enum", ["market", "ioc_limit"]),
-    "exit_order_type": ("enum", ["market", "ioc_limit"]),
-    "ioc_limit_buffer_bps": _num(0, 100),
+
     "time_sync_interval_s": _num(5, 3600),
     "taker_fee": _num(0, 0.01),
     "maker_fee": _num(0, 0.01),

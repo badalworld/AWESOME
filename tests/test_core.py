@@ -452,7 +452,7 @@ class TestPaperBroker(unittest.IsolatedAsyncioTestCase):
             symbol = "SOL_USDT"
             mark = await broker.mark_price(symbol)
             res = await broker.open_position(symbol, LONG, qty=1.0, leverage=10,
-                                             sl_price=mark * 0.97, tp_price=mark * 1.02)
+                                             sl_price=mark * 0.97)
             self.assertTrue(res.ok, res.error)
             entry = res.price
             self.assertGreater(entry, 0)
@@ -475,7 +475,7 @@ class TestPaperBroker(unittest.IsolatedAsyncioTestCase):
             mark = await broker.mark_price(symbol)
             # stop just above the current market for a long => triggered by the tick engine
             await broker.open_position(symbol, LONG, qty=1000.0, leverage=10,
-                                       sl_price=mark * 1.0001, tp_price=mark * 5)
+                                       sl_price=mark * 1.0001)
             for _ in range(60):
                 await asyncio.sleep(0.05)
                 if not await broker.positions():

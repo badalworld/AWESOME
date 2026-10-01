@@ -114,9 +114,9 @@ winner only adds 3.04%, and the mix does not compound.  With 8% of equity at
    implemented as `takeprofit.partial_tp_enabled` (opt-in, off by default;
    see docs/RISK.md). Until the average winner clears the average loser, the
    required win rate stays above 46%.
-2. **Treat the +200% ROI TP as a lottery ticket, not the exit.** Keep it on the
-   exchange as a reduce-only order (it costs nothing and catches the tail), but
-   plan expectancy off the trailing ladder.
+2. **Treat the +200% ROI TP as a lottery ticket, not the exit.** The bot enforces
+   it with a reduce-only *market* close when the mark reaches it (no order rests on
+   the book), so plan expectancy off the trailing ladder, not off the target.
 3. **Cut concurrency.** 10 positions x 80% notional each = 8x equity of notional
    in assets that are 0.8-correlated. A single alt flush stops out the whole book
    at once: 10 losers = -22.8% of equity in one

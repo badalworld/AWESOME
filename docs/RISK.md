@@ -48,7 +48,7 @@ market-closes on a stop breach without waiting for the venue's trigger.
 
 ## 4. Take profit = +200% ROI
 
-Placed as a **reduce-only limit** order at `entry × (1 ± 200/(100×L))`.
+Enforced **locally**: when the mark reaches `entry × (1 ± 200/(100×L))` the executor sends a reduce-only **market** close. No take-profit order is ever placed on the book — the only order that rests on the exchange is the protective stop (a market order once triggered).
 
 Expected-value arithmetic at 8% margin / 10x:
 
@@ -76,7 +76,7 @@ partial_tp_fraction = 0.5     # half of the position (0.1 - 0.9)
 ```
 
 * the slice is closed **reduce-only at market** in one order; the remainder keeps the same stop and
-  target levels, re-armed at the new size (a resting stop for the old size would over-close on some
+  target levels, re-armed at the new size (an oversized stop for the old size would over-close on some
   venues and be rejected on others);
 * it fires **once** per trade, is floored to the venue's lot size, and is skipped if the remainder
   would fall below the venue minimum;

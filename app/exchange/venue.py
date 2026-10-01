@@ -190,6 +190,12 @@ def normalize_order_status(*, filled_qty: float, total_qty: float = 0.0,
         return ORDER_CANCELED
     if state in ("REJECTED", "FAILED", "ERROR"):
         return ORDER_REJECTED
+    if state in ("OPEN", "NEW", "PENDING", "ACTIVE", "LIVE", "UNTRIGGERED", "SENT", "PARTIAL"):
+        # MEXC reports state 1/2 as OPEN/PARTIAL, Binance as NEW/PARTIALLY_FILLED;
+        # both are resting orders whose fill is tracked by filled_qty below.
+        if total_qty and filled_qty:
+            return ORDER_FILLED if filled_qty >= total_qty * 0.999 else ORDER_PARTIAL
+        return ORDER_OPEN
     if total_qty and filled_qty:
         if filled_qty >= total_qty * 0.999:
             return ORDER_FILLED
@@ -268,19 +274,11 @@ class VenueClient(ABC):
         leverage: int = 0, client_id: str = "",
     ) -> OrderResult: ...
 
-    @abstractmethod
-    async def limit_order(
-        self, symbol: str, *, side: str, qty: float, price: float,
-        reduce_only: bool, client_id: str = "",
-    ) -> OrderResult: ...
-
     async def entry_order_with_protection(
         self, *, symbol: str, side: str, qty: float, leverage: int = 0,
         price_hint: float = 0.0, client_id: str = "", sl_price: Optional[float] = None,
-        tp_price: Optional[float] = None, entry_order_type: str = "market",
-        ioc_buffer_bps: float = 4.0,
     ) -> OrderResult:
-        """Entry order with SL/TP attached in the same round trip.
+        """Market entry with the stop-loss attached in the same round trip.
 
         Only venues that can do this (MEXC) override it. The default is a plain
         market entry; the executor then arms standalone protection.
@@ -334,6 +332,16 @@ class VenueClient(ABC):
 
     async def cancel_order_ids(self, symbol: str, order_ids: List[str]) -> bool:
         return False
+
+    async def cancel_take_profit(self, symbol: str, *, order_id: str, kind: str = "plan") -> bool:
+        """Cancel a *legacy* resting take-profit order. Never places anything.
+
+        Only ever used by the repair/adopt path: the live bot enforces the ROI
+        target locally with a market close, so a take-profit order that already
+        rests on the exchange belongs to an older version (or was placed by
+        hand) and must not survive the "no pending orders" audit rule.
+        """
+        return await self.cancel_order_ids(symbol, [str(order_id)])
 
     async def attached_protection(self, symbol: str, entry_order_id: str) -> Optional[Dict[str, Any]]:
         """Look up exchange-side SL/TP attached to the entry order, if supported."""

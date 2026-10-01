@@ -433,27 +433,6 @@ class BinanceClient(BaseHTTPVenueClient):
             body["newClientOrderId"] = client_id
         return await self._order(body)
 
-    async def limit_order(
-        self, symbol: str, *, side: str, qty: float, price: float,
-        reduce_only: bool, client_id: str = "",
-    ) -> OrderResult:
-        body: Dict[str, Any] = {
-            "symbol": symbol,
-            "side": self._order_side(side, reduce_only),
-            "type": "LIMIT",
-            "timeInForce": "GTC",
-            "quantity": self._qty(symbol, qty),
-            "price": self._price(symbol, price),
-            "newOrderRespType": "RESULT",
-        }
-        if self._dual_side:
-            body["positionSide"] = self._position_side(side)
-        elif reduce_only:
-            body["reduceOnly"] = "true"
-        if client_id:
-            body["newClientOrderId"] = client_id
-        return await self._order(body)
-
     async def stop_order(
         self, symbol: str, *, side: str, qty: float, trigger_price: float,
         reduce_only: bool = True, client_id: str = "",
