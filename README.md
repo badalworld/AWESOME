@@ -1,0 +1,2 @@
+# AWESOME
+Trading Agent
