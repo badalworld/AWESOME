@@ -16,7 +16,7 @@ import random
 import time
 from typing import Dict, List, Optional, Tuple
 
-from .base import Candle, ContractSpec, Ticker
+from .base import DEFAULT_TAKER_FEE, Candle, ContractSpec, Ticker
 
 INTERVAL_SECONDS = {
     "Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800,
@@ -50,7 +50,7 @@ class SyntheticSymbol:
         self.contract_size = contract_size
         self.price_step = price_step
         self.max_leverage = max_leverage
-        self.taker_fee = 0.0006
+        self.taker_fee = DEFAULT_TAKER_FEE
 
         # GARCH-lite state (EWMA of squared returns -> volatility clustering)
         self._base_sigma = annual_vol / math.sqrt(365 * 24 * 3600 / tick_seconds)
@@ -60,8 +60,6 @@ class SyntheticSymbol:
         self._spread_bps = max(0.8, self.rnd.uniform(1.0, 6.0))
 
         self.bid, self.ask = self._touch()
-        self.volume24 = 0.0
-        self.amount24 = 0.0
 
         self.candles: Dict[str, List[Candle]] = {}
         self._partial: Dict[str, Candle] = {}
@@ -147,7 +145,7 @@ class SyntheticSymbol:
         # leave the simulator exactly at the last close
         self.price = self.candles[interval][-1].c if self.candles.get(interval) else self.price
 
-    def aggregate(self, source: str, target: str, factor: int) -> None:
+    def aggregate(self, source: str, target: str) -> None:
         """Build a higher timeframe series from a base series (no re-simulation)."""
         base = self.candles.get(source) or []
         if not base:
@@ -236,7 +234,6 @@ class SyntheticFeed:
         self.contracts: Dict[str, ContractSpec] = {}
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
-        self._subs: Dict[str, set] = {}
         self._intervals: set = {"Min5", "Min15"}
         for i, (sym, price, vol) in enumerate(self.DEFS):
             step = 10 ** -max(1, min(8, int(-math.floor(math.log10(price))) + 3)) if price < 1 else 0.1
@@ -251,7 +248,7 @@ class SyntheticFeed:
             # sub-step count keeps the boot fast (12 points per bar is plenty)
             s.seed_history("Min15", htf_history_bars, ticks_per_bar=12)
             # 1h context is aggregated, not re-simulated (cheap, coherent)
-            s.aggregate("Min15", "Min60", 4)
+            s.aggregate("Min15", "Min60")
             self.symbols[sym] = s
             self.contracts[sym] = ContractSpec(
                 symbol=sym,
@@ -264,7 +261,7 @@ class SyntheticFeed:
                 max_vol=5_000_000.0,
                 max_leverage=s.max_leverage,
                 min_leverage=1,
-                taker_fee=0.0006,
+                taker_fee=DEFAULT_TAKER_FEE,
                 maker_fee=0.0002,
                 api_allowed=True,
                 state=0,
@@ -297,9 +294,6 @@ class SyntheticFeed:
                 sim.tick(now, intervals)
             await asyncio.sleep(self.tick_seconds)
 
-    # -- data api -------------------------------------------------------- #
-    def set_intervals(self, intervals: List[str]) -> None:
-        self._intervals.update(intervals)
 
     def add_interval(self, interval: str) -> None:
         if interval not in self.symbols[list(self.symbols)[0]].candles:
@@ -307,9 +301,6 @@ class SyntheticFeed:
                 sim.seed_history(interval, 150)
         self._intervals.add(interval)
 
-    def seeded(self, symbol: str, interval: str) -> bool:
-        sim = self.symbols.get(symbol)
-        return bool(sim and sim.candles.get(interval))
 
     def klines(self, symbol: str, interval: str, limit: int = 300) -> List[Candle]:
         sim = self.symbols.get(symbol)

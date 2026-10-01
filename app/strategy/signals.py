@@ -73,7 +73,6 @@ class SignalEngine:
         htf_candles: Optional[Dict[str, Sequence[Candle]]] = None,
         depth_usd: float = 0.0,
         order_notional_usd: float = 0.0,
-        require_fresh_bar: bool = True,
     ) -> Optional[Signal]:
         p = self._params()
         if len(candles_5m) < max(60, p.get("ao_slow", 34) + 10):

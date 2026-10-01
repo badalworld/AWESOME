@@ -44,8 +44,6 @@ from .base import (
 log = logging.getLogger("mexc")
 
 # MEXC kline `interval` values
-KLINE_INTERVALS = {"Min1", "Min5", "Min15", "Min30", "Min60", "Hour4", "Hour8", "Day1", "Week1", "Month1"}
-
 # Error codes worth an automatic retry (transient / rate limits)
 RETRYABLE_CODES = {429, 500, 502, 503, 504, 1001, 1002, 700001}
 
@@ -394,12 +392,6 @@ class MeXCClient:
                     return int(item["positionMode"])
         return 1
 
-    async def change_position_mode(self, mode: int) -> bool:
-        payload = await self._request(
-            "POST", "/api/v1/private/position/change_position_mode",
-            body={"positionMode": int(mode)}, signed=True, lane="order",
-        )
-        return bool(payload.get("success", True))
 
     # ------------------------------------------------------------------ #
     #  private: orders
@@ -482,13 +474,6 @@ class MeXCClient:
         data = payload.get("data")
         return data if isinstance(data, dict) else None
 
-    async def open_orders(self, page_size: int = 100) -> List[Dict[str, Any]]:
-        payload = await self._request(
-            "GET", "/api/v1/private/order/list/open_orders",
-            params={"page_num": 1, "page_size": page_size}, signed=True, lane="query",
-        )
-        data = payload.get("data") or []
-        return list(data)
 
     async def cancel_orders(self, order_ids: List[str]) -> List[Dict[str, Any]]:
         if not order_ids:
@@ -500,17 +485,6 @@ class MeXCClient:
         )
         data = payload.get("data") or []
         return list(data)
-
-    async def cancel_all_orders(self, symbol: str) -> bool:
-        try:
-            payload = await self._request(
-                "POST", "/api/v1/private/order/cancel_all",
-                body={"symbol": symbol}, signed=True, lane="order",
-            )
-            return bool(payload.get("success", True))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("cancel_all_orders(%s) failed: %s", symbol, exc)
-            return False
 
     # ------------------------------------------------------------------ #
     #  private: leverage
@@ -572,25 +546,6 @@ class MeXCClient:
             "POST", "/api/v1/private/planorder/change_stop_order", body=body, signed=True, lane="order"
         )
         return bool(payload.get("success", True))
-
-    async def cancel_tpsl(self, symbol: str, tpsl_ids: List[Any]) -> bool:
-        if not tpsl_ids:
-            return True
-        ids = [int(i) if str(i).isdigit() else i for i in tpsl_ids]
-        for body in (
-            {"symbol": symbol, "orderIds": ids},
-            {"orders": [{"symbol": symbol, "orderId": i} for i in ids]},
-        ):
-            try:
-                payload = await self._request(
-                    "POST", "/api/v1/private/stoporder/cancel", body=body, signed=True, lane="order"
-                )
-                if payload.get("success", True):
-                    return True
-            except Exception:  # noqa: BLE001
-                continue
-        log.warning("could not cancel TP/SL orders %s on %s (will rely on local watchdog)", ids, symbol)
-        return False
 
     async def place_plan_order(
         self,
@@ -678,14 +633,6 @@ class MeXCClient:
         )
         return bool(payload.get("success", True))
 
-    async def plan_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        params = {"symbol": symbol} if symbol else None
-        payload = await self._request(
-            "GET", "/api/v1/private/planorder/list/orders", params=params, signed=True, lane="query"
-        )
-        data = payload.get("data") or []
-        return list(data)
-
     # ------------------------------------------------------------------ #
     def diagnostics(self) -> Dict[str, Any]:
         return {
@@ -742,7 +689,6 @@ class MeXCWebSocket:
         self._stop = asyncio.Event()
         self._kline_subs: set = set()       # (symbol, interval)
         self._tick_subs: set = set()        # symbol
-        self._deal_subs: set = set()        # symbol
         self._lock = asyncio.Lock()
         self.connected = False
         self.logged_in = False
@@ -764,26 +710,6 @@ class MeXCWebSocket:
             self._tick_subs.update(new)
         for symbol in new:
             await self._send({"method": "sub.ticker", "param": {"symbol": symbol}})
-
-    async def unsubscribe_all(self) -> None:
-        async with self._lock:
-            klines = list(self._kline_subs)
-            ticks = list(self._tick_subs)
-            self._kline_subs.clear()
-            self._tick_subs.clear()
-        for symbol, _iv in klines:
-            await self._send({"method": "unsub.kline", "param": {"symbol": symbol}})
-        for symbol in ticks:
-            await self._send({"method": "unsub.ticker", "param": {"symbol": symbol}})
-
-    async def unsubscribe(self, symbols: List[str]) -> None:
-        async with self._lock:
-            for s in symbols:
-                self._tick_subs.discard(s)
-                self._kline_subs = {(sym, iv) for (sym, iv) in self._kline_subs if sym != s}
-        for s in symbols:
-            await self._send({"method": "unsub.kline", "param": {"symbol": s}})
-            await self._send({"method": "unsub.ticker", "param": {"symbol": s}})
 
     # -- lifecycle ------------------------------------------------------- #
     async def start(self) -> None:

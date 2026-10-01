@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 from ..exchange.base import Candle
-from ..utils import safe_div
 from . import indicators as ind
 
 LONG = "LONG"
@@ -254,10 +253,3 @@ def score_divergence(div: Divergence) -> float:
     return round(100.0 * (0.45 * magnitude + 0.20 * price_leg + 0.20 * freshness + 0.15 * kind_bonus), 2)
 
 
-def divergence_distance_score(div: Divergence, atr: float, price: float) -> float:
-    """How far price still is from the invalidation level (used by ranking)."""
-    if atr <= 0:
-        return 0.0
-    if div.side == LONG:
-        return safe_div(price - div.p2_price, atr, 0.0)
-    return safe_div(div.p2_price - price, atr, 0.0)

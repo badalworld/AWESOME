@@ -26,7 +26,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from ..exchange.base import LONG, ContractSpec, OrderResult, Position
+from ..exchange.base import DEFAULT_TAKER_FEE, LONG, ContractSpec, OrderResult, Position
 from ..risk.manager import (
     RiskGuard,
     build_plan,
@@ -65,7 +65,6 @@ class ManagedPosition:
     trough_roi_pct: float = 0.0
     trail_active: bool = False
     trail_step_index: int = -1
-    last_trail_ts: float = 0.0
     last_persist_ts: float = 0.0
     signal_id: Optional[int] = None
     fees_usd: float = 0.0
@@ -411,7 +410,6 @@ class Executor:
                     pos.stop_roi_pct = decision.stop_roi
                     pos.trail_step_index = decision.step_index
                     pos.trail_active = True
-                    pos.last_trail_ts = time.time()
                     await self.db.update_trade(pos.trade_id, {
                         "stop_price": pos.stop_price,
                         "stop_order_id": str((pos.protection or {}).get("stop_order_id")
@@ -798,9 +796,9 @@ class Executor:
     async def _taker_fee(self, symbol: str) -> float:
         try:
             spec = (await self.broker.contracts()).get(symbol)
-            return spec.taker_fee if spec else 0.0006
+            return spec.taker_fee if spec else DEFAULT_TAKER_FEE
         except Exception:  # noqa: BLE001
-            return 0.0006
+            return DEFAULT_TAKER_FEE
 
     def _emit(self, event: str, payload: Dict[str, Any]) -> None:
         if self.on_event:

@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from ..utils import Clock
 from .base import (
+    DEFAULT_TAKER_FEE,
     LONG,
     OPEN_ISOLATED,
     AccountSnapshot,
@@ -93,7 +94,7 @@ class MeXCPublicMarketAdapter:
                     min_vol=float(item.get("minVol", 1) or 1),
                     max_vol=float(item.get("maxVol", 1e9) or 1e9),
                     max_leverage=int(item.get("maxLeverage", 100) or 100),
-                    taker_fee=float(item.get("takerFeeRate", 0.0006) or 0.0006),
+                    taker_fee=float(item.get("takerFeeRate", DEFAULT_TAKER_FEE) or DEFAULT_TAKER_FEE),
                     maker_fee=float(item.get("makerFeeRate", 0.0002) or 0.0002),
                     api_allowed=bool(item.get("apiAllowed", True)),
                     state=int(item.get("state", 0) or 0),
@@ -156,7 +157,6 @@ class PaperBroker(Broker):
 
     name = "paper"
     mode = "paper"
-    supports_exchange_stops = True   # simulated, but the flow is identical
 
     def __init__(
         self,
@@ -290,9 +290,6 @@ class PaperBroker(Broker):
         self._subscribed.update(symbols)
         await self.market.subscribe(symbols, interval)
 
-    async def unsubscribe_all(self) -> None:
-        self._subscribed.clear()
-
     # -- account -------------------------------------------------------- #
     def _unrealized(self) -> float:
         total = 0.0
@@ -377,7 +374,7 @@ class PaperBroker(Broker):
             return OrderResult(ok=False, error=f"position already open for {symbol}")
         spec = (await self.contracts()).get(symbol)
         contract_size = spec.contract_size if spec else 1.0
-        fee_rate = spec.taker_fee if spec else 0.0006
+        fee_rate = spec.taker_fee if spec else DEFAULT_TAKER_FEE
         fill = self._fill_price(symbol, side == LONG, mark)
         notional = fill * qty * contract_size
         margin = notional / max(1, leverage)
@@ -431,7 +428,7 @@ class PaperBroker(Broker):
         mark = await self.mark_price(symbol)
         fill = self._fill_price(symbol, pos["side"] != LONG, mark)
         spec = (await self.contracts()).get(symbol)
-        fee_rate = spec.taker_fee if spec else 0.0006
+        fee_rate = spec.taker_fee if spec else DEFAULT_TAKER_FEE
         close_fee = fill * qty * pos["contract_size"] * fee_rate
         pnl = self._pnl({**pos, "qty": qty}, fill) - close_fee
         self.realized += pnl
@@ -520,57 +517,6 @@ class PaperBroker(Broker):
 
     def set_close_callback(self, cb) -> None:
         self._closed_callback = cb
-
-    async def place_stop_order(
-        self, symbol: str, side: str, qty: float, trigger_price: float,
-        limit_price: float = 0.0, client_id: str = "",
-    ) -> OrderResult:
-        handle = self._protection.setdefault(symbol, {"kind": "paper", "symbol": symbol})
-        handle["stop_price"] = trigger_price
-        return OrderResult(ok=True, order_id=f"paper-sl-{self._seq}", price=trigger_price, vol=qty,
-                           status="placed", raw={"simulated": True})
-
-    async def place_tp_order(self, symbol: str, side: str, qty: float, price: float, client_id: str = "") -> OrderResult:
-        handle = self._protection.setdefault(symbol, {"kind": "paper", "symbol": symbol})
-        handle["tp_price"] = price
-        return OrderResult(ok=True, order_id=f"paper-tp-{self._seq}", price=price, vol=qty,
-                           status="placed", raw={"simulated": True})
-
-    async def modify_stop_order(self, symbol: str, order_id: str, trigger_price: float, limit_price: float = 0.0) -> OrderResult:
-        handle = self._protection.setdefault(symbol, {"kind": "paper", "symbol": symbol})
-        handle["stop_price"] = trigger_price
-        return OrderResult(ok=True, order_id=order_id, price=trigger_price, raw={"simulated": True})
-
-    async def cancel_stop_order(self, symbol: str, order_id: str) -> bool:
-        handle = self._protection.get(symbol)
-        if handle:
-            handle["stop_price"] = None
-        return True
-
-    async def cancel_order(self, order_id: str) -> bool:
-        return True
-
-    async def cancel_all_orders(self, symbol: str) -> bool:
-        handle = self._protection.get(symbol)
-        if handle:
-            handle["stop_price"] = None
-            handle["tp_price"] = None
-        return True
-
-    async def open_orders(self, symbol: str) -> List[Dict[str, Any]]:
-        handle = self._protection.get(symbol)
-        if not handle:
-            return []
-        out = []
-        if handle.get("stop_price"):
-            out.append({"orderId": handle.get("stop_order_id") or "paper-sl",
-                        "symbol": symbol, "reduceOnly": True, "price": handle["stop_price"],
-                        "state": 2, "simulated": True})
-        if handle.get("tp_price"):
-            out.append({"orderId": handle.get("tp_order_id") or "paper-tp",
-                        "symbol": symbol, "reduceOnly": True, "price": handle["tp_price"],
-                        "state": 2, "simulated": True})
-        return out
 
     def diagnostics(self) -> Dict[str, Any]:
         """Same shape as the live broker so the dashboard shows real values

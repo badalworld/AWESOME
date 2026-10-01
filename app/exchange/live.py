@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..utils import Clock, LatencyTracker, round_to_step
 from .base import (
+    DEFAULT_TAKER_FEE,
     LONG,
     OPEN_ISOLATED,
     ORDER_IOC,
@@ -49,7 +50,6 @@ log = logging.getLogger("live-broker")
 class LiveBroker(Broker):
     name = "mexc-futures"
     mode = "live"
-    supports_exchange_stops = True
 
     def __init__(
         self,
@@ -105,13 +105,11 @@ class LiveBroker(Broker):
             await self.ws.stop()
         await self.client.close()
 
-    async def set_callbacks(self, on_kline=None, on_tick=None, on_position=None, on_order=None) -> None:
+    async def set_callbacks(self, on_kline=None, on_tick=None, on_order=None) -> None:
         self._cb_kline = on_kline
         self._cb_tick = on_tick
-        self._cb_position = on_position
         self._cb_order = on_order
         if self.ws:
-            self.ws.on_position = on_position
             self.ws.on_order = on_order
 
     def _on_kline(self, symbol: str, interval: str, candle: Candle, is_closed: bool) -> None:
@@ -166,7 +164,7 @@ class LiveBroker(Broker):
                     max_vol=float(item.get("maxVol", 1e9) or 1e9),
                     max_leverage=int(item.get("maxLeverage", 100) or 100),
                     min_leverage=int(item.get("minLeverage", 1) or 1),
-                    taker_fee=float(item.get("takerFeeRate", 0.0006) or 0.0006),
+                    taker_fee=float(item.get("takerFeeRate", DEFAULT_TAKER_FEE) or DEFAULT_TAKER_FEE),
                     maker_fee=float(item.get("makerFeeRate", 0.0002) or 0.0002),
                     api_allowed=bool(item.get("apiAllowed", True)),
                     state=int(item.get("state", 0) or 0),
@@ -256,10 +254,6 @@ class LiveBroker(Broker):
             return
         await self.ws.subscribe_klines(symbols, interval)
         await self.ws.subscribe_ticks(symbols)
-
-    async def unsubscribe_all(self) -> None:
-        if self.ws:
-            await self.ws.unsubscribe_all()
 
     # ------------------------------------------------------------------ #
     #  account
@@ -491,73 +485,10 @@ class LiveBroker(Broker):
             if kind == "plan" and handle.get("stop_order_id"):
                 return await self.client.cancel_plan_orders(symbol, [str(handle["stop_order_id"])])
             if handle.get("tp_order_id"):
-                return await self.cancel_order(str(handle["tp_order_id"]))
+                return await self.client.cancel_orders([str(handle["tp_order_id"])])
         except Exception as exc:  # noqa: BLE001
             log.debug("release_stop(%s) failed: %s", symbol, exc)
         return False
-
-    # -- interface ------------------------------------------------------ #
-    async def place_stop_order(
-        self, symbol: str, side: str, qty: float, trigger_price: float,
-        limit_price: float = 0.0, client_id: str = "",
-    ) -> OrderResult:
-        is_long = side == LONG
-        return await self.client.place_plan_order(
-            symbol=symbol, vol=qty,
-            side=SIDE_CLOSE_LONG if is_long else SIDE_CLOSE_SHORT,
-            trigger_price=trigger_price,
-            trigger_type=2 if is_long else 1,
-            order_type=ORDER_MARKET,
-            trend=self.trigger_trend,
-            reduce_only=True,
-            open_type=self.open_type,
-            position_mode=self.position_mode,
-        )
-
-    async def place_tp_order(
-        self, symbol: str, side: str, qty: float, price: float, client_id: str = "",
-    ) -> OrderResult:
-        return await self.client.create_order(
-            symbol=symbol, vol=qty,
-            side=SIDE_CLOSE_LONG if side == LONG else SIDE_CLOSE_SHORT,
-            order_type=ORDER_LIMIT, price=price, open_type=self.open_type,
-            reduce_only=True, position_mode=self.position_mode,
-        )
-
-    async def modify_stop_order(
-        self, symbol: str, order_id: str, trigger_price: float, limit_price: float = 0.0,
-    ) -> OrderResult:
-        try:
-            ok = await self.client.modify_plan_order(
-                symbol=symbol, order_id=str(order_id), trigger_price=trigger_price,
-                execute_price=limit_price or trigger_price, order_type=ORDER_MARKET,
-                trigger_type=2, trend=self.trigger_trend,
-            )
-            return OrderResult(ok=ok, order_id=order_id, raw={"modified": ok})
-        except Exception as exc:  # noqa: BLE001
-            return OrderResult(ok=False, error=str(exc))
-
-    async def cancel_stop_order(self, symbol: str, order_id: str) -> bool:
-        try:
-            return await self.client.cancel_plan_orders(symbol, [str(order_id)])
-        except Exception:  # noqa: BLE001
-            return False
-
-    async def cancel_order(self, order_id: str) -> bool:
-        try:
-            return bool(await self.client.cancel_orders([str(order_id)]))
-        except Exception:  # noqa: BLE001
-            return False
-
-    async def cancel_all_orders(self, symbol: str) -> bool:
-        return await self.client.cancel_all_orders(symbol)
-
-    async def open_orders(self, symbol: str) -> List[Dict[str, Any]]:
-        try:
-            orders = await self.client.open_orders()
-            return [o for o in orders if o.get("symbol") == symbol]
-        except Exception:  # noqa: BLE001
-            return []
 
     async def sync_time(self) -> None:
         await self.client.sync_time()

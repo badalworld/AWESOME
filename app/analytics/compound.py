@@ -44,7 +44,6 @@ class CompoundInputs:
     win_rate: float = 0.45
     trades_per_day: float = 8.0
     fee_pct_of_margin: float = 0.0        # round-trip fee drag expressed in margin %
-    max_concurrent: int = 10
     runs: int = 20_000
     seed: int = 12345
     empirical_rois: Optional[List[float]] = None   # closed-trade ROI% history
@@ -98,7 +97,7 @@ def monte_carlo(inp: CompoundInputs) -> Dict[str, Any]:
         peak = equity
         max_dd = 0.0
         hit = False
-        path: List[float] = [] if run < 40 else []  # keep a few paths for charting
+        path: List[float] = []          # a few paths are kept for charting
         for i in range(trades_per_run):
             roi = _sample_roi(inp, rnd, empirical)
             equity *= inp.equity_multiplier(roi)

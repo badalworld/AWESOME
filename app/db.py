@@ -110,13 +110,6 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS idx_orders_ts ON orders(ts);
 
-CREATE TABLE IF NOT EXISTS candles (
-    symbol   TEXT NOT NULL,
-    interval TEXT NOT NULL DEFAULT 'Min5',
-    ts       INTEGER NOT NULL,
-    o REAL, h REAL, l REAL, c REAL, v REAL,
-    PRIMARY KEY (symbol, interval, ts)
-);
 """
 
 
@@ -143,7 +136,9 @@ class Database:
             cols = [r[1] for r in self._conn.execute("PRAGMA table_info(candles)").fetchall()]
         except sqlite3.Error:
             return
-        if cols and "interval" not in cols:
+        if cols:
+            # `candles` was a write-only cache in an early revision; it is not
+            # part of the live trading state, so dropping it is always safe.
             self._conn.execute("DROP TABLE candles")
             self._conn.commit()
 
@@ -160,13 +155,6 @@ class Database:
     async def exec(self, sql: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
         return await asyncio.to_thread(self._exec, sql, params)
 
-    def _query_one(self, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
-        rows = self._exec(sql, params)
-        return rows[0] if rows else None
-
-    async def _query_one_async(self, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
-        rows = await self.exec(sql, params)
-        return rows[0] if rows else None
 
     # ------------------------------------------------------------------ #
     #  key/value state (restart-safe bot state, credentials, counters)
@@ -216,12 +204,6 @@ class Database:
         sql = f"UPDATE trades SET {','.join(f'{c}=?' for c in cols)} WHERE id=?"
         await self.exec(sql, [patch[c] for c in cols] + [trade_id])
 
-    async def update_trade_by_uid(self, uid: str, patch: Dict[str, Any]) -> None:
-        if not patch:
-            return
-        cols = list(patch.keys())
-        sql = f"UPDATE trades SET {','.join(f'{c}=?' for c in cols)} WHERE trade_uid=?"
-        await self.exec(sql, [patch[c] for c in cols] + [uid])
 
     async def get_open_trades(self) -> List[Dict[str, Any]]:
         rows = await self.exec("SELECT * FROM trades WHERE status='OPEN' ORDER BY opened_at")
@@ -257,12 +239,6 @@ class Database:
         )
         return [dict(r) for r in rows]
 
-    async def last_closed_trade(self, symbol: str) -> Optional[Dict[str, Any]]:
-        row = await self._query_one_async(
-            "SELECT * FROM trades WHERE symbol=? AND status='CLOSED' ORDER BY closed_at DESC LIMIT 1",
-            (symbol,),
-        )
-        return dict(row) if row else None
 
     async def trade_stats(self) -> Dict[str, Any]:
         rows = await self.exec(
@@ -290,22 +266,6 @@ class Database:
             "worst_roi": round(base.get("worst_roi") or 0.0, 2),
         }
 
-    async def trade_stats_map(self) -> Dict[str, Dict[str, Any]]:
-        """Per-symbol closed-trade statistics (used by the quality scorer)."""
-        rows = await self.exec(
-            """SELECT symbol, COUNT(*) n, SUM(CASE WHEN realized_pnl>0 THEN 1 ELSE 0 END) wins,
-                      SUM(realized_pnl) pnl
-               FROM trades WHERE status='CLOSED' GROUP BY symbol"""
-        )
-        out: Dict[str, Dict[str, Any]] = {}
-        for r in rows:
-            n = r["n"] or 0
-            out[r["symbol"]] = {
-                "trades": n,
-                "win_rate": round(100.0 * (r["wins"] or 0) / n, 2) if n else 0.0,
-                "pnl": round(r["pnl"] or 0.0, 4),
-            }
-        return out
 
     # ------------------------------------------------------------------ #
     #  signals
@@ -338,9 +298,6 @@ class Database:
         rows = await self.exec(sql, params)
         return [dict(r) for r in rows]
 
-    async def last_signal_ts(self, symbol: str) -> float:
-        row = await self._query_one_async("SELECT MAX(ts) AS t FROM signals WHERE symbol=?", (symbol,))
-        return float(row["t"]) if row and row["t"] else 0.0
 
     # ------------------------------------------------------------------ #
     #  equity curve
@@ -352,17 +309,6 @@ class Database:
             [snap.get(c) for c in cols],
         )
 
-    async def get_equity_curve(self, limit: int = 2880, since: Optional[float] = None) -> List[Dict[str, Any]]:
-        if since:
-            rows = await self.exec(
-                "SELECT * FROM equity WHERE ts >= ? ORDER BY ts LIMIT ?", (since, limit)
-            )
-        else:
-            rows = await self.exec(
-                "SELECT * FROM equity ORDER BY ts DESC LIMIT ?", (limit,)
-            )
-            rows = list(reversed(rows))
-        return [dict(r) for r in rows]
 
     async def downsample_equity(self, max_points: int = 400) -> List[Dict[str, Any]]:
         rows = await self.exec("SELECT ts, equity, open_positions FROM equity ORDER BY ts")
@@ -409,27 +355,6 @@ class Database:
             "avg": round(sum(vals) / len(vals), 2),
         }
 
-    # ------------------------------------------------------------------ #
-    #  candles (local cache, used by the paper engine & backtests)
-    # ------------------------------------------------------------------ #
-    async def upsert_candles(self, symbol: str, interval: str, rows: List[Sequence[Any]]) -> None:
-        if not rows:
-            return
-        with self._lock:
-            self._conn.executemany(
-                "INSERT INTO candles(symbol,interval,ts,o,h,l,c,v) VALUES(?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(symbol,interval,ts) DO UPDATE SET "
-                "o=excluded.o,h=excluded.h,l=excluded.l,c=excluded.c,v=excluded.v",
-                [(symbol, interval, *r[:6]) for r in rows],
-            )
-            self._conn.commit()
-
-    async def get_candles(self, symbol: str, interval: str = "Min5", limit: int = 500) -> List[sqlite3.Row]:
-        rows = await self.exec(
-            "SELECT ts,o,h,l,c,v FROM candles WHERE symbol=? AND interval=? ORDER BY ts DESC LIMIT ?",
-            (symbol, interval, limit),
-        )
-        return list(reversed(rows))
 
     # ------------------------------------------------------------------ #
     async def housekeeping(self, keep_days: int = 30) -> None:

@@ -68,7 +68,6 @@ class TradingEngine:
         self.tickers: Dict[str, Ticker] = {}
         self.market_data_source = "unknown"
         self.last_account = None
-        self.last_universe_scan = 0.0
         self.recent_signals: List[Dict[str, Any]] = []
         self.event_log: List[Dict[str, Any]] = []
         self._tasks: List[asyncio.Task] = []
@@ -79,8 +78,6 @@ class TradingEngine:
         self._candle_ts: Dict[str, int] = {}
         self._compound_cache: Dict[str, Any] = {}
         self._compound_ts = 0.0
-        self._equity_cache: List[Dict[str, Any]] = []
-        self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
@@ -504,7 +501,6 @@ class TradingEngine:
                     await self.guard.update_equity(account.equity)
                 if self.cfg.mode == "paper" and hasattr(self.broker, "starting_equity"):
                     await self.db.kv_set_json("paper.equity", self.broker.starting_equity + self.broker.realized)
-                self._equity_cache = await self.db.get_equity_curve(limit=2000)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001

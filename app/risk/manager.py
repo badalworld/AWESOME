@@ -273,7 +273,6 @@ def evaluate_trailing(
 class GuardDecision:
     allowed: bool
     reason: str = ""
-    detail: Dict[str, Any] = field(default_factory=dict)
 
 
 class RiskGuard:
@@ -288,7 +287,6 @@ class RiskGuard:
         self.day_start_equity: Optional[float] = None
         self.equity_peak: Optional[float] = None
         self.cooldowns: Dict[str, float] = {}      # symbol -> unix ts until cooldown ends
-        self._last_sync = 0.0
 
     # -- persistence ----------------------------------------------------- #
     async def load(self) -> None:

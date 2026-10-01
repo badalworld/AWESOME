@@ -18,13 +18,10 @@ SIDE_OPEN_SHORT = 3
 SIDE_CLOSE_LONG = 4
 
 ORDER_LIMIT = 1
-ORDER_POST_ONLY = 2
 ORDER_IOC = 3
-ORDER_FOK = 4
 ORDER_MARKET = 5
 
 OPEN_ISOLATED = 1
-OPEN_CROSS = 2
 
 
 @dataclass(slots=True)
@@ -45,6 +42,11 @@ class Candle:
         return self.h - self.l
 
 
+# Fallback taker fee used when a venue does not report one. Kept in exactly one
+# place: P&L accounting in live and paper must never disagree about fees.
+DEFAULT_TAKER_FEE = 0.0006
+
+
 @dataclass(slots=True)
 class ContractSpec:
     symbol: str
@@ -57,7 +59,7 @@ class ContractSpec:
     max_vol: float = 1_000_000.0
     max_leverage: int = 100
     min_leverage: int = 1
-    taker_fee: float = 0.0006
+    taker_fee: float = DEFAULT_TAKER_FEE
     maker_fee: float = 0.0002
     api_allowed: bool = True
     state: int = 0
@@ -142,7 +144,6 @@ class Broker(ABC):
 
     name: str = "abstract"
     mode: str = "paper"
-    supports_exchange_stops: bool = False
 
     # lifecycle -------------------------------------------------------- #
     @abstractmethod
@@ -170,19 +171,14 @@ class Broker(ABC):
     @abstractmethod
     async def subscribe(self, symbols: List[str], interval: str = "Min5") -> None: ...
 
-    @abstractmethod
-    async def unsubscribe_all(self) -> None: ...
-
     async def set_callbacks(
         self,
         on_kline: Optional[KlineCallback] = None,
         on_tick: Optional[TickCallback] = None,
-        on_position: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_order: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self._cb_kline = on_kline
         self._cb_tick = on_tick
-        self._cb_position = on_position
         self._cb_order = on_order
 
     # account ---------------------------------------------------------- #
@@ -224,34 +220,6 @@ class Broker(ABC):
     async def close_position(
         self, symbol: str, side: str, qty: float, reason: str = "", client_id: str = "",
     ) -> OrderResult: ...
-
-    @abstractmethod
-    async def place_stop_order(
-        self, symbol: str, side: str, qty: float, trigger_price: float,
-        limit_price: float = 0.0, client_id: str = "",
-    ) -> OrderResult: ...
-
-    @abstractmethod
-    async def place_tp_order(
-        self, symbol: str, side: str, qty: float, price: float, client_id: str = "",
-    ) -> OrderResult: ...
-
-    @abstractmethod
-    async def modify_stop_order(
-        self, symbol: str, order_id: str, trigger_price: float, limit_price: float = 0.0,
-    ) -> OrderResult: ...
-
-    @abstractmethod
-    async def cancel_stop_order(self, symbol: str, order_id: str) -> bool: ...
-
-    @abstractmethod
-    async def cancel_order(self, order_id: str) -> bool: ...
-
-    @abstractmethod
-    async def cancel_all_orders(self, symbol: str) -> bool: ...
-
-    @abstractmethod
-    async def open_orders(self, symbol: str) -> List[Dict[str, Any]]: ...
 
     # diagnostics ------------------------------------------------------ #
     def diagnostics(self) -> Dict[str, Any]:

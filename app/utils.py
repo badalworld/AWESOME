@@ -46,11 +46,6 @@ class Clock:
     def now_ms(self) -> int:
         return int(time.time() * 1000.0 + self._offset_ms)
 
-    @staticmethod
-    def utc_now() -> float:
-        return time.time()
-
-
 # --------------------------------------------------------------------------- #
 #  Numerics
 # --------------------------------------------------------------------------- #
@@ -58,33 +53,10 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def floor_to_step(value: float, step: float) -> float:
-    if step <= 0:
-        return value
-    return math.floor(round(value / step, 9)) * step
-
-
 def round_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
     return round(round(value / step, 9)) * step
-
-
-def decimals_from_step(step: float) -> int:
-    if step <= 0:
-        return 8
-    text = f"{step:.12f}".rstrip("0")
-    return len(text.split(".")[1]) if "." in text else 0
-
-
-def fmt_price(value: float, step: float) -> str:
-    return f"{round_to_step(value, step):.{decimals_from_step(step)}f}"
-
-
-def pct_change(new: float, old: float) -> float:
-    if old == 0:
-        return 0.0
-    return (new - old) / old * 100.0
 
 
 def safe_div(a: float, b: float, default: float = 0.0) -> float:
@@ -110,16 +82,6 @@ def mean(values: Iterable[float]) -> float:
     return sum(vals) / len(vals) if vals else 0.0
 
 
-def stdev(values: List[float]) -> float:
-    if len(values) < 2:
-        return 0.0
-    m = mean(values)
-    return math.sqrt(sum((v - m) ** 2 for v in values) / (len(values) - 1))
-
-
-# --------------------------------------------------------------------------- #
-#  ROI <-> price conversion (leveraged ROI on margin, exactly as specified)
-# --------------------------------------------------------------------------- #
 def price_from_roi(entry: float, roi_pct: float, leverage: float, is_long: bool) -> float:
     """ROI% = price_move% * leverage  =>  price_move% = ROI / leverage."""
     move = roi_pct / (100.0 * leverage)
