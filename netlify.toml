@@ -1,6 +1,8 @@
 # This repo is a Python (FastAPI) trading engine, not a Hugo site. Netlify only
 # serves the static dashboard; the engine and its /api must be self-hosted
 # (see docs/DEPLOYMENT.md). No build step is needed.
+# /api/* is forwarded to the engine by netlify/edge-functions/engine-proxy.ts;
+# set the ENGINE_URL environment variable to your server's IP (e.g. http://203.0.113.10:8080).
 [build]
   command = "echo 'No build step: publishing static dashboard'"
   publish = "app/web/static"
