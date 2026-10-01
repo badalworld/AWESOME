@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
-from ..utils import Clock, LatencyTracker
+from ..utils import Clock, ExchangeRequestTracker, LatencyTracker
 from .base import (
     DEFAULT_TAKER_FEE,
     LONG,
@@ -120,6 +120,7 @@ class MeXCClient:
         self._query_lane = RateLimiter(rate_per_sec=9.0, burst=6)
         self._public_lane = RateLimiter(rate_per_sec=25.0, burst=20)
         self.stats: Dict[str, Any] = {"requests": 0, "errors": 0, "retries": 0, "last_error": ""}
+        self.request_tracker = ExchangeRequestTracker()
 
     # ------------------------------------------------------------------ #
     #  lifecycle
@@ -229,6 +230,7 @@ class MeXCClient:
             started = time.perf_counter()
             try:
                 self.stats["requests"] += 1
+                self.request_tracker.record_request()
                 resp = await self._client.request(
                     method.upper(),
                     path,
@@ -238,6 +240,7 @@ class MeXCClient:
                     timeout=timeout or self._timeout,
                 )
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
+                self.request_tracker.record_response(resp.status_code, getattr(resp, "headers", {}), elapsed_ms)
                 if self.telemetry is not None:
                     await self.telemetry.record(elapsed_ms)
 
@@ -254,13 +257,20 @@ class MeXCClient:
                 if isinstance(payload, dict) and payload.get("success") is False:
                     code = payload.get("code")
                     msg = payload.get("message") or payload.get("msg") or ""
-                    if code in RETRYABLE_CODES:
+                    if ExchangeRequestTracker.is_rate_limit_code(code):
+                        self.request_tracker.record_rate_limit()
+                    else:
+                        self.request_tracker.record_error()
+                    if code in RETRYABLE_CODES or str(code) in {str(c) for c in RETRYABLE_CODES}:
                         raise _RetryableError(f"code={code} {msg}")
                     raise _FatalError(f"code={code} {msg}")
                 return payload if isinstance(payload, dict) else {"success": True, "data": payload}
             except (_RetryableError, httpx.TransportError, httpx.TimeoutException) as exc:
                 last_err = exc
                 self.stats["retries"] += 1
+                self.request_tracker.record_retry()
+                if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+                    self.request_tracker.record_network_error()
                 if attempt >= self.retry_attempts:
                     break
                 # jittered backoff keeps retries from synchronising across symbols
@@ -711,7 +721,13 @@ class MeXCClient:
             "clock_rtt_ms": round(self.clock.rtt_ms, 2),
             "clock_age_s": round(self.clock.age_s, 1) if self.clock.age_s != float("inf") else None,
             "credentials": bool(self.api_key and self.api_secret),
-            "stats": dict(self.stats),
+            "stats": {
+                "requests": self.stats.get("requests", 0),
+                "errors": self.stats.get("errors", 0),
+                "retries": self.stats.get("retries", 0),
+                "last_error": bool(self.stats.get("last_error")),
+            },
+            "api_usage": self.request_tracker.snapshot(),
         }
 
 

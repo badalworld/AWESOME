@@ -26,10 +26,11 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from ..exchange.base import DEFAULT_TAKER_FEE, LONG, ContractSpec, OrderResult, Position
+from ..exchange.base import DEFAULT_TAKER_FEE, LONG, SHORT, ContractSpec, OrderResult, Position
 from ..exchange.venue import ORDER_CANCELED, ORDER_FILLED, ORDER_REJECTED
 from ..risk.manager import (
     RiskGuard,
+    Sizing,
     build_plan,
     evaluate_trailing,
     size_position,
@@ -200,6 +201,46 @@ class Executor:
         intent.update(changes, updated_at=time.time())
         await self.db.kv_set_json("execution.pending_entry", intent)
 
+    async def recovery_incident(self) -> Optional[Dict[str, Any]]:
+        raw = await self.db.kv_get("execution.recovery_incident")
+        if raw is None:
+            return None
+        try:
+            incident = json.loads(raw)
+            if not isinstance(incident, dict) or not incident.get("reason"):
+                raise ValueError("invalid recovery incident")
+            return incident
+        except (ValueError, TypeError):
+            return {"phase": "corrupt", "reason": "recovery incident needs operator reconciliation"}
+
+    async def _latch_recovery_incident(self, symbol: str, reason: str,
+                                       details: Optional[Dict[str, Any]] = None) -> None:
+        now = time.time()
+        incident = await self.recovery_incident()
+        event = {"symbol": symbol, "reason": reason, "details": details or {}, "created_at": now}
+        if incident is None:
+            incident = {"phase": "recovery", "symbol": symbol, "reason": reason,
+                        "details": details or {}, "created_at": now, "events": [event], "latest": event}
+        else:
+            events = incident.get("events")
+            if not isinstance(events, list):
+                events = []
+            duplicate = next((i for i, row in enumerate(events)
+                              if isinstance(row, dict) and row.get("symbol") == symbol
+                              and row.get("reason") == reason), None)
+            if duplicate is None:
+                events.append(event)
+            else:
+                events[duplicate] = event
+            incident["events"] = events[-100:]
+            incident["latest"] = event
+            incident["updated_at"] = now
+        try:
+            await self.db.kv_set_json("execution.recovery_incident", incident)
+        except Exception:
+            log.exception("could not persist recovery incident for %s", symbol)
+        await self.guard.halt(f"recovery incident on {symbol}: {reason}")
+
     def _valid_protection(self, handle) -> bool:
         if not isinstance(handle, dict):
             return False
@@ -269,9 +310,12 @@ class Executor:
         cfg = self.cfg
         async with self._lock:
             symbol = signal.symbol
-            if await self.pending_entry() is not None:
-                await self.guard.halt("unresolved entry journal; operator reconciliation required")
-                await self._mark_signal(signal, "rejected", self.guard.halt_reason)
+            pending = await self.pending_entry()
+            incident = await self.recovery_incident()
+            if pending is not None or incident is not None:
+                reason = "unresolved entry journal; operator reconciliation required" if pending else str(incident.get("reason"))
+                await self.guard.halt(reason)
+                await self._mark_signal(signal, "rejected", reason)
                 return None
             if symbol in self.positions:
                 log.info("skip %s: already managing a position", symbol)
@@ -945,7 +989,9 @@ class Executor:
         if await self.pending_entry() is not None:
             await self.guard.halt("unresolved entry journal on restart; operator reconciliation required")
         open_trades = await self.db.get_open_trades()
-        exchange_positions: Dict[str, Position] = {p.symbol: p for p in await self.broker.positions()}
+        exchange_positions: Dict[str, Position] = {
+            p.symbol: p for p in await self.broker.positions() if p.hold_vol > 0
+        }
         contracts = await self.broker.contracts()
 
         # 1) restore known positions
@@ -977,7 +1023,7 @@ class Executor:
                 continue
             managed = self._from_state(state, row, live, contracts)
             self.positions[symbol] = managed
-            # repair protection if the exchange has no resting stop
+            # Reconcile/adopt the exchange-side stop before allowing new entries.
             try:
                 handle = await self.broker.arm_protection(
                     symbol=symbol, side=managed.side, qty=managed.qty,
@@ -985,62 +1031,130 @@ class Executor:
                     entry_order_id=managed.entry_order_id,
                     adopt=True,
                 )
-                managed.protection = handle or managed.protection
+                if not self._valid_protection(handle):
+                    managed.protection = {}
+                    await self._latch_recovery_incident(
+                        symbol, "restored position has no verified active stop",
+                        {"side": managed.side, "qty": managed.qty, "entry_price": managed.entry_price,
+                         "leverage": managed.leverage, "last_stop_price": managed.stop_price},
+                    )
+                else:
+                    managed.protection = handle
+                    managed.stop_price = float(handle["stop_price"])
             except Exception as exc:  # noqa: BLE001
-                log.warning("protection repair failed for %s: %s", symbol, exc)
+                managed.protection = {}
+                await self._latch_recovery_incident(
+                    symbol, f"stop repair failed ({type(exc).__name__})",
+                    {"side": managed.side, "qty": managed.qty, "entry_price": managed.entry_price,
+                     "leverage": managed.leverage, "last_stop_price": managed.stop_price},
+                )
+                log.exception("protection repair failed for %s", symbol)
+            await self._persist(managed)
             log.info("restored position %s %s entry=%.8g peak=%.1f%% stop=%s",
                      managed.side, symbol, managed.entry_price, managed.peak_roi_pct, managed.stop_price)
 
-        # 2) adopt orphans (position exists on the exchange, not in our DB)
+        # 2) adopt orphan exposure only from authoritative exchange data. Never
+        # invent contract geometry or ATR to make an unmanaged position look safe.
         for symbol, live in exchange_positions.items():
             if symbol in self.positions:
                 continue
             spec = contracts.get(symbol)
+            numeric = (live.hold_vol, live.open_avg_price, live.im)
+            if (spec is None or not all(math.isfinite(v) for v in numeric)
+                    or live.hold_vol <= 0 or live.open_avg_price <= 0 or live.im <= 0
+                    or live.side not in (LONG, SHORT) or live.leverage < 1
+                    or not math.isfinite(spec.contract_size) or spec.contract_size <= 0):
+                await self._latch_recovery_incident(
+                    symbol, "orphan position has invalid or missing contract/account data",
+                    {"side": live.side, "qty": live.hold_vol, "entry_price": live.open_avg_price,
+                     "leverage": live.leverage, "margin_usd": live.im,
+                     "contract_size": spec.contract_size if spec else None},
+                )
+                continue
+
+            candles = []
             atr_price = 0.0
             try:
                 candles = await self.broker.klines(symbol, "Min5", 60)
                 from ..strategy import indicators as ind
 
                 atr_series = [v for v in ind.atr([c.h for c in candles], [c.l for c in candles],
-                                                 [c.c for c in candles], 14) if v is not None]
+                                                 [c.c for c in candles], 14)
+                              if v is not None and math.isfinite(v) and v > 0]
                 atr_price = atr_series[-1] if atr_series else 0.0
-            except Exception:  # noqa: BLE001
-                pass
-            if atr_price <= 0:
-                atr_price = live.open_avg_price * 0.01
-            mult = float(self.cfg.get("stoploss.atr_multiplier", 3.0))
-            sl = live.open_avg_price - mult * atr_price if live.side == LONG else live.open_avg_price + mult * atr_price
-            tp = live.open_avg_price * (1 + float(self.cfg.get("takeprofit.tp_roi_pct", 200))
-                                        / (100 * max(1, live.leverage))) if live.side == LONG else \
-                live.open_avg_price * (1 - float(self.cfg.get("takeprofit.tp_roi_pct", 200))
-                                       / (100 * max(1, live.leverage)))
-            uid = f"adopted-{symbol}-{int(time.time())}"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ATR unavailable for orphan %s: %s", symbol, exc)
+
+            tp_roi = float(self.cfg.get("takeprofit.tp_roi_pct", 200))
+            is_long = live.side == LONG
+            tp = live.open_avg_price * (1 + tp_roi / (100 * live.leverage)) if is_long else \
+                live.open_avg_price * (1 - tp_roi / (100 * live.leverage))
+            notional = live.hold_vol * spec.contract_size * live.open_avg_price
+            sl = 0.0
+            sl_roi = 0.0
+            if atr_price > 0:
+                sizing = Sizing(qty=live.hold_vol, margin_usd=live.im,
+                                notional_usd=notional, leverage=live.leverage, ok=True)
+                plan = build_plan(side=live.side, entry_price=live.open_avg_price,
+                                  atr=atr_price, sizing=sizing,
+                                  contract_size=spec.contract_size, cfg=self.cfg)
+                sl, sl_roi = plan.sl_price, plan.sl_roi_pct
+
+            handle: Dict[str, Any] = {}
+            try:
+                handle = await self.broker.arm_protection(
+                    symbol=symbol, side=live.side, qty=live.hold_vol,
+                    sl_price=sl if sl > 0 else None, adopt=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("protection adoption failed for orphan %s", symbol)
+                await self._latch_recovery_incident(
+                    symbol, f"orphan stop adoption failed ({type(exc).__name__})",
+                    {"side": live.side, "qty": live.hold_vol, "entry_price": live.open_avg_price,
+                     "leverage": live.leverage},
+                )
+            if self._valid_protection(handle):
+                sl = float(handle["stop_price"])
+                sl_roi = abs(roi_from_price(live.open_avg_price, sl, live.leverage, is_long))
+            else:
+                handle = {}
+                await self._latch_recovery_incident(
+                    symbol, "orphan position has no verified stop; operator reconciliation required",
+                    {"side": live.side, "qty": live.hold_vol, "entry_price": live.open_avg_price,
+                     "leverage": live.leverage, "atr_known": atr_price > 0},
+                )
+
+            now = time.time()
+            uid = f"adopted-{symbol}-{int(now)}"
+            meta = {
+                "adopted": True,
+                "atr_known": atr_price > 0,
+                "fee_history_known": False,
+                "protection_verified": bool(handle),
+            }
             trade_id = await self.db.insert_trade({
                 "trade_uid": uid, "symbol": symbol, "side": live.side, "status": "OPEN",
-                "qty": live.hold_vol, "contract_size": (spec.contract_size if spec else 1.0),
+                "qty": live.hold_vol, "contract_size": spec.contract_size,
                 "entry_price": live.open_avg_price, "leverage": live.leverage,
-                "margin_usd": live.im, "notional_usd": live.hold_vol * (spec.contract_size if spec else 1) * live.open_avg_price,
-                "sl_price": sl, "tp_price": tp, "sl_roi_pct": 0.0, "tp_roi_pct": float(self.cfg.get("takeprofit.tp_roi_pct", 200)),
+                "margin_usd": live.im, "notional_usd": notional,
+                "sl_price": sl, "tp_price": tp, "sl_roi_pct": sl_roi, "tp_roi_pct": tp_roi,
                 "trail_active": 0, "stop_price": sl, "atr": atr_price,
-                "realized_pnl": 0.0, "fees_usd": 0.0, "opened_at": time.time(),
-                "meta": json.dumps({"adopted": True}),
+                "realized_pnl": 0.0, "fees_usd": 0.0, "opened_at": now,
+                "meta": json.dumps(meta),
             })
-            handle = await self.broker.arm_protection(
-                symbol=symbol, side=live.side, qty=live.hold_vol, sl_price=sl,
-                adopt=True,
-            )
-            self.positions[symbol] = ManagedPosition(
+            managed = ManagedPosition(
                 trade_id=trade_id, trade_uid=uid, symbol=symbol, side=live.side,
-                qty=live.hold_vol, contract_size=(spec.contract_size if spec else 1.0),
+                qty=live.hold_vol, contract_size=spec.contract_size,
                 entry_price=live.open_avg_price, leverage=live.leverage,
-                margin_usd=live.im, notional_usd=live.hold_vol * live.open_avg_price,
-                atr=atr_price, sl_price=sl, sl_roi_pct=0.0, tp_price=tp,
-                tp_roi_pct=float(self.cfg.get("takeprofit.tp_roi_pct", 200)),
-                opened_at=time.time(), protection=handle, stop_price=sl,
-                notes={"adopted": True},
+                margin_usd=live.im, notional_usd=notional,
+                atr=atr_price, sl_price=sl, sl_roi_pct=sl_roi, tp_price=tp,
+                tp_roi_pct=tp_roi, opened_at=now, protection=handle, stop_price=sl,
+                notes={**meta, "atr_source": "exchange_5m" if atr_price > 0 else "unavailable"},
             )
-            log.warning("adopted orphan position %s %s qty=%s entry=%.8g",
-                        live.side, symbol, live.hold_vol, live.open_avg_price)
+            self.positions[symbol] = managed
+            await self._persist(managed)
+            log.warning("adopted orphan position %s %s qty=%s entry=%.8g protected=%s",
+                        live.side, symbol, live.hold_vol, live.open_avg_price, bool(handle))
 
     def _from_state(self, state: Optional[Dict[str, Any]], row: Dict[str, Any],
                     live: Position, contracts: Dict[str, ContractSpec]) -> ManagedPosition:

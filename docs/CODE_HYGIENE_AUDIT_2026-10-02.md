@@ -2,14 +2,15 @@
 
 ## Verdict
 
-**Cleanup and hardening pass completed; unrestricted live deployment is NOT certified.**
-This report supersedes the earlier unconditional “go for live trading” statement.
+**Live-trading decision: NO — do not arm live order routing on this checkout yet.**
+Keep all venues in paper mode until the blockers below are implemented and verified.
+The cleanup/hardening pass is complete, but this report does not certify live deployment
+and supersedes the earlier unconditional “go for live trading” statement.
 Passing unit/integration tests does not prove exchange acceptance, fill finality,
 profitability, or recovery from every failure. No real orders were placed during
 this audit, no credentials were changed, and no venue was switched to live mode.
 
-**Verification after the second pass: 224 Python tests and 8 JavaScript tests passed, zero failures/errors/skips (81 additional tests across both passes).**
-Python static checks and JavaScript syntax validation also passed.
+**Latest verification: 240 Python tests and 11 JavaScript tests passed, zero failures/errors/skips.** Static checks (`pyflakes`, Vulture, `compileall`, `node --check`) and `git diff --check` also pass. These checks do not certify live exchange acceptance or recovery.
 
 ## Scope and method
 
@@ -115,8 +116,12 @@ empty reset list is correctly reported as a no-op. Malformed reset request bodie
 return HTTP 400 instead of accidentally erasing all overrides. Valid paired changes
 are checked together rather than rejected against an intermediate state.
 Integer knobs reject fractional values, and unrecognized boolean inputs are
-rejected instead of silently becoming true or false. File-loaded configuration
-validation remains a separate follow-up; this pass does not add a complete startup schema.
+rejected instead of silently becoming true or false. Startup now validates every
+runtime-tunable key and filter/venue override against the same schema, checks cross-field
+relations, validates the connection/storage settings that are not dashboard-editable, and
+fails closed on malformed JSON, non-object overrides or stale unknown override keys. This is
+not a schema for arbitrary unknown TOML sections; deployment-specific extensions remain a
+separate concern.
 
 ### 5. Clock synchronization
 
@@ -146,8 +151,8 @@ an old venue socket also scheduled a fresh connection. There is now one active
 socket and a tracked reconnect timer. Deliberate closes detach callbacks and
 cancel reconnects. REST settings/state/history/log responses carry a venue epoch:
 late responses are discarded even when the user switches A → B → A. Old socket
-messages cannot render into the active tab. Eight offline Node tests exercise the
-actual client functions with delayed responses and controlled socket/timer mocks;
+messages cannot render into the active page. Eleven offline Node tests exercise the
+actual client functions, route mapping, delayed responses and controlled socket/timer mocks;
 these are not full browser end-to-end tests.
 
 ### 8. Paper-only controls and documentation drift
@@ -194,6 +199,12 @@ submission, uncertain outcomes retain this record and halt that venue.
   refuses to clear it; direct risk-guard resume still cannot bypass the entry gate.
   Corrupt marker contents also fail closed. The authenticated state API includes
   `pending_entry` for diagnosis. Normal risk monitoring of managed positions continues.
+- Restored and orphan positions now require a verified active stop to be treated as
+  protected. A missing/failed stop repair writes a durable `execution.recovery_incident`
+  barrier; both dashboard resume and direct guard resume are unable to re-enable entries.
+  Orphan recovery no longer substitutes 1% of entry price for missing candle ATR: it
+  adopts a real exchange stop if available, otherwise records the position with unknown
+  ATR/stop and latches the incident.
 
 This is a **persisted safety barrier**, not a complete automatic reconciler. In
 particular, an uncertain or still-active partial entry can leave exposure whose
@@ -220,6 +231,17 @@ cancel a pending restart or tear down cleanup midway, and the server's finalizer
 can await the same cleanup task without stopping clients twice.
 Graceful lifecycle coordination still does not protect against forced termination.
 
+### 11. Premium dashboard and addressable pages
+
+The dashboard now uses a lower-glare graphite/emerald workspace theme, responsive page heading,
+clearer active-venue context, visible “live readiness not cleared” notice, and focus/reduced-motion
+states. The compounding target moved off the global header into the strategy/planning page so
+operations data stays focused. Navigation is split into direct-loadable routes for overview,
+positions, trade history, signals, markets, strategy/plan, settings and logs. Browser back/forward
+updates the active view; unknown dashboard page routes return 404. Venue state remains scoped by
+the existing venue selector. This is a set of routes over one shared dashboard shell, not separate
+services or separate authentication domains.
+
 ## Remaining live-deployment blockers
 
 Keep paper mode until these are implemented and verified:
@@ -229,12 +251,13 @@ Keep paper mode until these are implemented and verified:
    to guess a recovery. Authoritative order/fill lookup, outstanding-remainder
    cancellation where appropriate, late-fill detection and protection of unknown
    exposure still need a durable per-order recovery state machine.
-2. **Incident resolution and interrupted bookkeeping:** failed protection attempts
-   now retain evidence and verify emergency-close snapshots, but there is no
-   automatic incident-resolution workflow or atomic transaction spanning the
-   exchange and local persistence. A protected entry whose trade write failed
-   needs reconciliation before reactivation. Recovery/adoption also needs further
-   testing for failed stop repair, opposite-side/hedged exposure and stale snapshots.
+2. **Incident resolution and interrupted bookkeeping:** restored/orphan protection repair
+   now verifies the stop and latches a non-bypassable durable recovery incident on failure,
+   but there is no authenticated resolution workflow or atomic transaction spanning the
+   exchange and local persistence. A protected entry whose trade write failed still needs
+   reconciliation before reactivation. Recovery/adoption needs exchange-acceptance testing
+   for opposite-side/hedged exposure and stale snapshots; an operator must reconcile and
+   clear the persisted incident only after comparing the venue state and local records.
 3. **Partial-fill and external-exit accounting:** residual quantities, partial-close
    fees, delayed fills and external exits still need reconciliation from authoritative
    venue fills. Some paths estimate exit prices. Optional partial TP remains off.
@@ -254,9 +277,10 @@ A flat snapshot alone cannot prove that an outstanding entry will not fill later
 No dashboard "dismiss incident" button was added because that would bypass the
 unimplemented reconciliation checks.
 
-Other follow-up areas: configuration reload/startup schema validation, paper-reset
-synchronization, dependency auditing, and exchange-specific API compatibility.
-No strategy win probability or financial return was established by this audit.
+Other follow-up areas: full schema validation for arbitrary deployment-specific TOML extensions,
+paper-reset synchronization, dependency auditing, and exchange-specific API compatibility.
+Bounded startup validation is implemented, but it is not a complete schema for every possible
+static configuration extension. No strategy win probability or financial return was established.
 
 ## Reproduction
 
@@ -270,8 +294,8 @@ node --check app/web/static/app.js
 git diff --check
 ```
 
-Added regression coverage: `tests/test_hygiene.py` (31 tests), nine HTTP/WebSocket
-cases in `tests/test_api.py`, `tests/test_entry_journal.py` (23 tests),
-`tests/test_lifecycle.py` (10 tests), and `tests/test_dashboard.js` (8 tests). Existing integration tests now change the
-paper account's real running equity rather than passing invented account
-snapshots directly into the executor.
+Regression coverage includes startup configuration validation in `tests/test_hygiene.py`
+(38 tests), nine HTTP/WebSocket cases in `tests/test_api.py`,
+`tests/test_entry_journal.py` (26 tests), `tests/test_lifecycle.py` (10 tests), and
+`tests/test_dashboard.js` (11 tests). Exchange/order tests remain mocked or paper-only;
+no production orders are submitted by the test suite.

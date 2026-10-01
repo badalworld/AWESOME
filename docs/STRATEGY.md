@@ -63,7 +63,7 @@ signals scoring ≥ `min_signal_score` (default 60) are routed to execution.
 
 ## 5. Which symbols
 
-`app/strategy/universe.py` runs a two-stage scan every `universe.rescan_seconds` (default 300):
+`app/strategy/universe.py` runs a two-stage scan every `universe.refresh_sec` (default 60s, with bounded parallel enrichment):
 
 1. **Stage 1 — cheap ticker scan.** Every USDT-M contract is scored on 24h turnover
    (liquidity), 24h range and 24h move, with hard gates on minimum turnover, spread proxies and

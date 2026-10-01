@@ -6,8 +6,8 @@ blockers. Simulator figures below describe synthetic paths, not measured live
 strategy performance.
 
 Read this together with [`EDGE_AND_EXPECTANCY.md`](EDGE_AND_EXPECTANCY.md)
-(win-probability model) and [`AUDIT_2026-10.md`](AUDIT_2026-10.md) (pre-live
-audit: market-only execution, 151 tests).
+(win-probability model) and [`AUDIT_2026-10.md`](AUDIT_2026-10.md) (historical
+pre-live audit; superseded for readiness by the current code-hygiene audit).
 
 ---
 

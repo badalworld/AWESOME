@@ -2,7 +2,7 @@
 
 Every trading route exists twice:
 
-* ``/api/v/{venue}/…``   — the venue-scoped form (used by the three dashboard tabs)
+* ``/api/v/{venue}/…``   — the venue-scoped form (used by the dashboard venue selector)
 * ``/api/…``             — a backwards-compatible alias that targets the
                            *primary* venue (``app.primary_venue``, default MEXC),
                            and accepts ``?venue=binance`` as a shortcut.
@@ -32,10 +32,13 @@ from ..manager import VenueContext, VenueManager
 
 log = logging.getLogger("web")
 STATIC_DIR = Path(__file__).parent / "static"
+DASHBOARD_PAGES = frozenset({
+    "overview", "positions", "trades", "signals", "markets", "strategy", "settings", "logs",
+})
 
 
 def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
-    app = FastAPI(title="AO Divergence Multi-Venue Futures Bot", version="2.0.0", docs_url="/api/docs")
+    app = FastAPI(title="Crypto Hunter — Multi-Venue Futures Dashboard", version="2.1.0", docs_url="/api/docs")
     # The dashboard is same-origin, so CORS is off by default. A wildcard with
     # credentials is both invalid per spec and a needless attack surface for a
     # control panel that can place orders; list explicit origins to enable it.
@@ -130,6 +133,16 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/dashboard")
+    async def dashboard_root() -> FileResponse:
+        return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/dashboard/{page}")
+    async def dashboard_page(page: str) -> FileResponse:
+        if page not in DASHBOARD_PAGES:
+            raise HTTPException(status_code=404, detail="dashboard page not found")
+        return FileResponse(STATIC_DIR / "index.html")
+
     # ------------------------------------------------------------------ #
     #  read endpoints (registered twice: scoped + legacy alias)
     # ------------------------------------------------------------------ #
@@ -190,6 +203,15 @@ def create_app(manager: VenueManager, cfg: Config) -> FastAPI:
             "rejected_sample": (scanner.rejected_sample if scanner else [])[:40],
             "last_scan_ts": scanner.last_scan_ts if scanner else 0,
             "watchlist": engine.watchlist,
+            "scan": ({
+                "started_at": scanner.last_scan_started_at,
+                "duration_ms": scanner.last_scan_duration_ms,
+                "scan_count": scanner.scan_count,
+                "candidate_count": scanner.last_candidate_count,
+                "eligible_count": scanner.last_eligible_count,
+                "selected_count": len(scanner.last_entries),
+                "error": scanner.last_scan_error,
+            } if scanner else {}),
         }
 
     async def logs(request: Request, venue: Optional[str] = None, after: int = 0,

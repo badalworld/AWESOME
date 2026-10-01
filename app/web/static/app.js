@@ -1,5 +1,5 @@
 /* =========================================================================
-   AO Divergence Bot — dashboard client
+   Crypto Hunter — dashboard client
    Vanilla JS, no build step, no external deps (charts are hand-rolled SVG).
    ========================================================================= */
 'use strict';
@@ -35,7 +35,24 @@ const state = {
   venueEpoch: 0,       // discard late responses, including A → B → A switches
   token: localStorage.getItem('ao.token') || '',   // web.api_token (if configured)
   health: null,
+  page: 'overview',
 };
+
+const PAGE_META = Object.freeze({
+  overview: { path: '/dashboard/overview', eyebrow: 'PORTFOLIO', title: 'Overview', description: 'A live, venue-scoped view of account health, exposure and execution.' },
+  positions: { path: '/dashboard/positions', eyebrow: 'RISK & EXPOSURE', title: 'Open positions', description: 'Monitor live exposure, protective stops, trailing state and unrealized P/L.' },
+  trades: { path: '/dashboard/trades', eyebrow: 'PERFORMANCE', title: 'Trade history', description: 'Review closed executions, realized results, costs and exit reasons.' },
+  signals: { path: '/dashboard/signals', eyebrow: 'STRATEGY', title: 'Signal review', description: 'Inspect accepted and rejected divergence candidates with their filter decisions.' },
+  universe: { path: '/dashboard/markets', eyebrow: 'MARKET INTELLIGENCE', title: 'Market universe', description: 'See the active scan, ranked symbols and the reasons markets were excluded.' },
+  plan: { path: '/dashboard/strategy', eyebrow: 'PLANNING', title: 'Strategy & compounding plan', description: 'Review the configured rules and modeled outcomes; projections are not a return forecast.' },
+  settings: { path: '/dashboard/settings', eyebrow: 'CONTROL PLANE', title: 'Settings', description: 'Manage venue credentials, runtime risk limits, strategy filters and connectivity.' },
+  logs: { path: '/dashboard/logs', eyebrow: 'OBSERVABILITY', title: 'System logs', description: 'Inspect recent engine events for the selected venue.' },
+});
+
+function dashboardPageUrl(page) { return PAGE_META[page]?.path || PAGE_META.overview.path; }
+function dashboardPageFromPath(pathname) {
+  return Object.keys(PAGE_META).find(page => PAGE_META[page].path === pathname) || 'overview';
+}
 
 /** Remember the dashboard token (asked once, then reused for REST + WS). */
 function setToken(token) {
@@ -77,6 +94,7 @@ function renderVenueTabs() {
       </span>
     </button>`;
   }).join('');
+  setText('pageVenue', venueLabel(state.venue));
   $$('#venueTabs .venue-tab').forEach(btn => btn.onclick = () => switchVenue(btn.dataset.venue));
 }
 
@@ -350,9 +368,9 @@ function renderOverview(d) {
   $('#kOpenSub').textContent = `max ${state.config?.risk?.max_open_positions ?? 10} · margin ${fmtMoney(acct.position_margin)}`;
   $('#kExp').textContent = fmtMoney(stats.expectancy_usd);
   $('#kExpSub').textContent = `avg ROI ${fmtPct(stats.expectancy_roi)} · avg win ${fmtMoney(stats.avg_win)} / loss ${fmtMoney(stats.avg_loss)}`;
-  const lat = d.state.latency || {};
+  const lat = d.metrics?.order_latency || {};
   $('#kLat').textContent = lat.count ? `${lat.p50 ?? 0} / ${lat.p95 ?? 0} ms` : '—';
-  $('#kLatSub').textContent = lat.count ? `${lat.count} requests · max ${lat.max} ms` : 'no requests yet';
+  $('#kLatSub').textContent = lat.count ? `${lat.count} completed orders · max ${lat.max} ms` : 'no completed order timings yet';
 
   const curve = d.equity.map(p => Number(p.equity));
   lineChart($('#equityChart'), [{ data: curve.length ? curve : [acct.equity], color: '#22d3ee', fill: true }]);
@@ -362,9 +380,21 @@ function renderOverview(d) {
   barChart($('#roiChart'), rois);
 
   const risk = d.state.risk || {};
-  $('#riskTable').innerHTML = [
+  const riskRows = [
     ['Trading', d.state.engine.trading_enabled ? 'enabled' : 'paused'],
     ['Halted', risk.halted ? `<span class="neg">${esc(risk.halt_reason || 'yes')}</span>` : 'no'],
+  ];
+  if (d.state.pending_entry) {
+    const pending = d.state.pending_entry;
+    riskRows.push(['Entry incident', `<span class="neg">${esc(pending.phase || 'pending')} · ${esc(pending.symbol || '')} · ${esc(pending.client_id || 'unknown order')}</span>`]);
+  }
+  if (d.state.recovery_incident) {
+    const incident = d.state.recovery_incident;
+    const latest = incident.latest || incident;
+    const count = Array.isArray(incident.events) ? ` · ${incident.events.length} unresolved` : '';
+    riskRows.push(['Recovery incident', `<span class="neg">${esc(latest.reason || 'operator reconciliation required')} · ${esc(latest.symbol || '')}${count}</span>`]);
+  }
+  riskRows.push(
     ['Day', `${risk.day || '—'} · PnL ${fmtPct(risk.day_pnl_pct)}`],
     ['Day start equity', fmtMoney(risk.day_start_equity)],
     ['Equity peak', fmtMoney(risk.equity_peak)],
@@ -372,7 +402,8 @@ function renderOverview(d) {
     ['Max open positions', state.config?.risk?.max_open_positions ?? '—'],
     ['Risk per trade', `${state.config?.risk?.equity_per_trade_pct ?? '—'}% × ${state.config?.risk?.leverage ?? '—'}x`],
     ['Cooldowns', Object.keys(risk.cooldowns || {}).length ? esc(JSON.stringify(risk.cooldowns)) : 'none'],
-  ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  );
+  $('#riskTable').innerHTML = riskRows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
 
   const bd = d.state.broker_diagnostics || {};
   const ws = bd.ws || {};
@@ -580,7 +611,7 @@ function setHeartbeat(engine, connected) {
   if (!dot || !label) return;
   const live = !!(engine.running && connected);
   dot.className = 'live-dot' + (live ? '' : ' off');
-  label.textContent = live ? (engine.trading_enabled ? 'LIVE' : 'PAUSED') : 'OFFLINE';
+  label.textContent = live ? (engine.trading_enabled ? 'CONNECTED' : 'PAUSED') : 'OFFLINE';
 }
 function tickClock() {
   const el = $('#topClock');
@@ -666,6 +697,7 @@ const FIELD_GROUPS = {
     ['stoploss.atr_period', 'ATR period', 'number', 1],
     ['stoploss.local_watchdog', 'Local SL watchdog', 'bool'],
     ['stoploss.watchdog_grace_bps', 'Watchdog grace (bps)', 'number', 1],
+    ['market_data.max_ws_stale_sec', 'Block new live entries if feed older than (s)', 'number', 1],
     ['takeprofit.tp_roi_pct', 'Take profit (ROI %)', 'number', 5],
     ['takeprofit.partial_tp_enabled', 'Partial TP (bank part early)', 'bool'],
     ['takeprofit.partial_tp_roi_pct', 'Partial TP at ROI (%)', 'number', 5],
@@ -722,6 +754,7 @@ const FIELD_GROUPS = {
     ['universe.enabled', 'Dynamic universe', 'bool'],
     ['universe.max_symbols', 'Max symbols monitored', 'number', 1],
     ['universe.refresh_sec', 'Rescan interval (s)', 'number', 30],
+    ['universe.scan_concurrency', 'Parallel scan requests (bounded)', 'number', 1],
     ['universe.min_turnover_24h_usd', 'Min 24h turnover ($)', 'number', 100000],
     ['universe.min_atr_pct', 'Min 5m ATR%', 'number', 0.01],
     ['universe.max_atr_pct', 'Max 5m ATR%', 'number', 0.1],
@@ -925,6 +958,120 @@ async function pollLogs() {
   } catch (e) { /* ignore */ }
 }
 
+/* ------------------------------ operations pulse ------------------------------ */
+function setOpsStatus(id, dotId, label, tone = 'unknown') {
+  const stateEl = document.getElementById(id);
+  const dot = document.getElementById(dotId);
+  if (stateEl) { stateEl.textContent = label; stateEl.className = `ops-state ${tone}`; }
+  if (dot) dot.className = `ops-dot ${tone}`;
+}
+
+function renderOps(d) {
+  const state_ = d.state || {};
+  const engine = state_.engine || {};
+  const diagnostics = state_.broker_diagnostics || {};
+  const apiUsage = diagnostics.api_usage || diagnostics.stats?.api_usage || null;
+  const quota = apiUsage?.quota || null;
+  const rpm = Number(apiUsage?.requests_last_minute || 0);
+  const rateLimits = Number(apiUsage?.rate_limit_hits_last_minute || 0);
+  const quotaPct = quota && quota.utilization_pct != null ? Number(quota.utilization_pct) : NaN;
+  const quotaFresh = quota && Number(quota.age_s ?? 0) <= 120;
+  const quotaMeasured = Number.isFinite(quotaPct) && quotaFresh;
+  const usageValue = document.getElementById('apiQuotaValue');
+  const usageDetail = document.getElementById('apiQuotaDetail');
+  const usageFill = document.getElementById('apiQuotaFill');
+  const usageMeter = document.getElementById('apiQuotaMeter');
+
+  if (quotaMeasured) {
+    const pressure = Math.max(0, Math.min(100, quotaPct));
+    if (usageValue) usageValue.textContent = `${pressure.toFixed(1)}%`;
+    if (usageDetail) {
+      const remaining = quota.remaining == null ? '—' : fmtNum(quota.remaining, 0);
+      const limit = quota.limit == null ? '—' : fmtNum(quota.limit, 0);
+      usageDetail.textContent = `${remaining} / ${limit} units left · ${rpm} req/min`;
+    }
+    if (usageFill) usageFill.style.width = `${pressure}%`;
+    if (usageMeter) {
+      usageMeter.classList.remove('unknown', 'warn', 'alert');
+      if (pressure >= 95) usageMeter.classList.add('alert');
+      else if (pressure >= 80) usageMeter.classList.add('warn');
+    }
+    const tone = rateLimits > 0 ? 'alert' : pressure >= 95 ? 'alert' : pressure >= 80 ? 'warn' : 'ok';
+    setOpsStatus('apiQuotaState', 'apiQuotaDot', rateLimits > 0 ? 'THROTTLED' : pressure >= 95 ? 'NEAR LIMIT' : pressure >= 80 ? 'HIGH' : 'WITHIN BUDGET', tone);
+  } else if (quota && quota.used != null) {
+    if (usageValue) usageValue.textContent = `${fmtNum(quota.used, 0)} units`;
+    if (usageDetail) usageDetail.textContent = `${quota.source || 'exchange header'} · ${rpm} req/min · limit not reported`;
+    if (usageFill) usageFill.style.width = '0%';
+    if (usageMeter) { usageMeter.classList.remove('warn', 'alert'); usageMeter.classList.add('unknown'); }
+    setOpsStatus('apiQuotaState', 'apiQuotaDot', rateLimits ? 'THROTTLED' : 'USAGE ONLY', rateLimits ? 'alert' : 'unknown');
+  } else {
+    if (usageValue) usageValue.textContent = apiUsage ? `${rpm} req/min` : '—';
+    if (usageDetail) {
+      const errors = Number(apiUsage?.errors_total || 0);
+      usageDetail.textContent = apiUsage
+        ? `${Number(apiUsage.requests_total || 0)} total · ${rateLimits} recent 429s · quota % not reported${errors ? ` · ${errors} errors` : ''}`
+        : 'venue quota headers unavailable';
+    }
+    if (usageFill) usageFill.style.width = '0%';
+    if (usageMeter) { usageMeter.classList.remove('warn', 'alert'); usageMeter.classList.add('unknown'); }
+    setOpsStatus('apiQuotaState', 'apiQuotaDot', rateLimits ? 'THROTTLED' : 'UNREPORTED', rateLimits ? 'alert' : 'unknown');
+  }
+
+  const ws = diagnostics.ws || {};
+  const age = engine.market_data_age_s == null ? NaN : Number(engine.market_data_age_s);
+  const source = String(engine.market_data || 'unknown').toLowerCase();
+  const staleAfter = Number(state.effective?.['market_data.max_ws_stale_sec'] ?? getPath(state.config || {}, 'market_data.max_ws_stale_sec') ?? 10);
+  const feedValue = document.getElementById('feedValue');
+  const feedDetail = document.getElementById('feedDetail');
+  let feedTone = 'unknown', feedLabel = 'AWAITING', feedText = '—';
+  if (!engine.running) {
+    feedTone = 'alert'; feedLabel = 'OFFLINE'; feedText = 'OFFLINE';
+  } else if (source === 'synthetic') {
+    feedTone = 'warn'; feedLabel = 'SIMULATED'; feedText = 'SIMULATED';
+  } else if (Number.isFinite(age)) {
+    const fresh = age <= staleAfter;
+    const connected = source === 'live' ? ws.connected === true : source === 'public' ? true : ws.connected !== false;
+    const timely = age > Math.min(3, staleAfter) ? 'warn' : 'ok';
+    feedTone = !fresh || !connected ? 'alert' : timely;
+    feedLabel = !connected ? 'DISCONNECTED' : !fresh ? 'STALE' : source === 'public' ? 'PUBLIC' : age > Math.min(3, staleAfter) ? 'DELAYED' : 'LIVE';
+    feedText = `${age.toFixed(1)}s`;
+  }
+  if (feedValue) feedValue.textContent = feedText;
+  if (feedDetail) {
+    const sourceLabel = source === 'public' ? 'live public REST data' : source === 'live' ? 'exchange WebSocket' : source;
+    const stream = source === 'public' ? 'public market polling' : source === 'live'
+      ? (ws.connected === true ? 'socket connected' : 'socket disconnected')
+      : source === 'synthetic' ? 'generated data' : 'stream status unknown';
+    feedDetail.textContent = `${sourceLabel} · ${stream} · ${Number(engine.market_tick_count || 0).toLocaleString()} ticks`;
+  }
+  setOpsStatus('feedState', 'feedDot', feedLabel, feedTone);
+
+  const scan = state_.universe_scan || {};
+  const scanValue = document.getElementById('scanValue');
+  const scanDetail = document.getElementById('scanDetail');
+  const scanAge = scan.started_at ? Math.max(0, Date.now() / 1000 - Number(scan.started_at)) : null;
+  const scanDuration = Number(scan.duration_ms || 0);
+  if (scanValue) scanValue.textContent = scan.scan_count ? `${scanDuration.toLocaleString()} ms` : '—';
+  if (scanDetail) {
+    const cadence = Number(state.effective?.['universe.refresh_sec'] ?? getPath(state.config || {}, 'universe.refresh_sec') ?? 60);
+    scanDetail.textContent = scan.scan_count
+      ? `${scan.selected_count || 0} selected · ${scan.candidate_count || 0} candidates · ${scanAge == null ? '—' : `${fmtAge(scanAge)} ago`} · ${cadence}s cadence`
+      : 'scan metrics appear after startup';
+  }
+  setOpsStatus('scanState', 'scanDot', scan.error ? 'SCAN ERROR' : scan.scan_count ? 'ACTIVE' : 'WAITING', scan.error ? 'alert' : scan.scan_count ? 'ok' : 'unknown');
+
+  const orderLatency = d.metrics?.order_latency || {};
+  const execValue = document.getElementById('execValue');
+  const execDetail = document.getElementById('execDetail');
+  if (execValue) execValue.textContent = orderLatency.count ? `${orderLatency.p50 ?? 0} / ${orderLatency.p95 ?? 0} ms` : '—';
+  if (execDetail) execDetail.textContent = orderLatency.count
+    ? `${orderLatency.count} completed orders · p99 ${orderLatency.p99 ?? '—'} ms`
+    : (engine.mode === 'live' ? 'live routing · awaiting completed order timings' : 'simulation mode · live order routing disabled');
+  const risk = state_.risk || {};
+  const execTone = risk.halted ? 'alert' : !engine.running ? 'unknown' : engine.mode !== 'live' ? 'warn' : engine.trading_enabled ? 'ok' : 'warn';
+  setOpsStatus('execState', 'execDot', risk.halted ? 'RISK HALT' : !engine.running ? 'OFFLINE' : engine.mode !== 'live' ? 'PAPER' : engine.trading_enabled ? 'ARMED' : 'PAUSED', execTone);
+}
+
 /* ------------------------------ live feed ------------------------------ */
 function renderAll(payload) {
   if (!payload) return;
@@ -951,6 +1098,7 @@ function renderAll(payload) {
   }
   state.lastState = payload;
   renderHeader(payload);
+  renderOps(payload);
   renderTickerStrip(payload);
   renderOverview(payload);
   renderPositions(payload);
@@ -1006,14 +1154,41 @@ function connectWS() {
 }
 
 /* ------------------------------ wiring ------------------------------ */
-function initTabs() {
-  $$('.tab').forEach(tab => tab.onclick = () => {
-    $$('.tab').forEach(t => t.classList.remove('active'));
-    $$('.tab-panel').forEach(p => p.classList.remove('active'));
-    tab.classList.add('active');
-    $('#tab-' + tab.dataset.tab).classList.add('active');
-    if (tab.dataset.tab === 'logs') $('#logView').scrollTop = $('#logView').scrollHeight;
+function activateDashboardPage(page, { push = false, scroll = false } = {}) {
+  const key = PAGE_META[page] ? page : 'overview';
+  const meta = PAGE_META[key];
+  state.page = key;
+  $$('.tab').forEach(link => {
+    const active = link.dataset.tab === key;
+    link.classList.toggle('active', active);
+    if (active) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
   });
+  $$('.tab-panel').forEach(panel => panel.classList.toggle('active', panel.id === `tab-${key}`));
+  setText('pageEyebrow', meta.eyebrow);
+  setText('pageTitle', meta.title);
+  setText('pageDescription', meta.description);
+  setText('pageVenue', venueLabel(state.venue));
+  setText('pageRoute', meta.path);
+  document.title = `Crypto Hunter · ${meta.title}`;
+  if (push && window.location.pathname !== meta.path) window.history.pushState({ page: key }, '', meta.path);
+  if (scroll) window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (key === 'logs') {
+    const logView = $('#logView');
+    if (logView) logView.scrollTop = logView.scrollHeight;
+  }
+}
+
+function initTabs() {
+  $$('.tab').forEach(link => link.onclick = event => {
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    activateDashboardPage(link.dataset.tab, { push: true, scroll: true });
+  });
+  window.addEventListener('popstate', () => {
+    activateDashboardPage(dashboardPageFromPath(window.location.pathname));
+  });
+  activateDashboardPage(dashboardPageFromPath(window.location.pathname));
 }
 
 function initControls() {
@@ -1110,8 +1285,17 @@ function initControls() {
 
   $('#saveMode').onclick = async () => {
     const vid = state.venue;
+    const selectedMode = $('#cfgMode').value;
+    const activeMode = state.lastState?.state?.engine?.mode;
+    if (selectedMode === 'live' && activeMode !== 'live') {
+      const accepted = confirm(
+        `Enable LIVE futures order routing on ${venueLabel(vid)}? This sends real, leveraged orders and can lose the account balance. ` +
+        `The deployment audit (docs/CODE_HYGIENE_AUDIT_2026-10-02.md) does not certify unrestricted live trading. Review it and verify this venue's API permissions before continuing.`
+      );
+      if (!accepted) return;
+    }
     const patch = {
-      [`venues.${vid}.mode`]: $('#cfgMode').value,
+      [`venues.${vid}.mode`]: selectedMode,
       [`venues.${vid}.paper_data_source`]: $('#cfgPaperSource').value,
       'account.paper_starting_equity': Number($('#cfgPaperEquity').value || 1000),
     };

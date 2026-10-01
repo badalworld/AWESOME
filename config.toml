@@ -1,11 +1,11 @@
 # =============================================================================
-#  AO-DIVERGENCE FUTURES BOT  —  main configuration
+#  CRYPTO HUNTER  —  multi-venue AO-divergence futures system
 #  Edit here for defaults. The dashboard "Settings" tab writes runtime overrides
 #  to data/settings.json (which takes precedence and survives restarts).
 # =============================================================================
 
 [app]
-mode = "paper"              # "paper" (simulated fills, real market data) | "live" (real orders)
+mode = "paper"              # Safe startup. Enable live order routing explicitly per venue after reviewing the live-readiness audit.
 data_dir = "data"
 log_level = "INFO"
 
@@ -68,6 +68,11 @@ paper_data_source = "auto"   # auto | live | synthetic  (paper mode market data)
 # placed. The only orders that ever rest on the exchange are the protective
 # trigger orders described under [stoploss]/[trailing].
 time_sync_interval_s = 300   # re-sync clock offset vs exchange server
+
+[market_data]
+# New live entries are blocked when the exchange WebSocket is disconnected or
+# its last message is older than this. Existing exchange-side stops remain armed.
+max_ws_stale_sec = 10.0
 
 [account]
 # Starting balance. The dashboard's "Reset paper account" button uses this too.
@@ -225,7 +230,8 @@ block_before_funding_sec = 0    # optional funding-window blackout
 [universe]
 enabled = true
 max_symbols = 20                # how many contracts to actively monitor
-refresh_sec = 300               # rescan cadence
+refresh_sec = 60                # refresh volatile-market selection once per minute
+scan_concurrency = 10           # bounded parallel candle enrichment; venue rate limiters still apply
 min_turnover_24h_usd = 5000000
 min_atr_pct = 0.15              # 5m ATR% (volatility)
 max_atr_pct = 6.0

@@ -233,10 +233,17 @@ class ApiTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.client.get(path).status_code, 200, path)
 
-    def test_dashboard_static(self):
+    def test_dashboard_static_and_deep_link_pages(self):
         r = self.client.get("/")
         self.assertEqual(r.status_code, 200)
-        self.assertIn("AO Divergence", r.text)
+        self.assertIn("Crypto Hunter", r.text)
+        pages = ("overview", "positions", "trades", "signals", "markets", "strategy", "settings", "logs")
+        for page in pages:
+            with self.subTest(page=page):
+                response = self.client.get(f"/dashboard/{page}")
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(f'href="/dashboard/{page}"', response.text)
+        self.assertEqual(self.client.get("/dashboard/not-a-page").status_code, 404)
         self.assertEqual(self.client.get("/static/app.js").status_code, 200)
         self.assertEqual(self.client.get("/static/styles.css").status_code, 200)
 

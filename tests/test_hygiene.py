@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.config import Config
 from app.db import Database
 from app.exchange.base import AccountSnapshot, ContractSpec, LONG, OrderResult, Position
 from app.exchange.paper import PaperBroker
@@ -111,9 +113,17 @@ class ConfigurationRegressionTest(unittest.TestCase):
         self.assertEqual(self.cfg.get('risk.leverage'), 20)
 
     def test_fractional_integer_knobs_are_rejected(self):
-        for key in ('risk.leverage', 'risk.max_open_positions', 'venues.binance.retry_attempts'):
+        for key in ('risk.leverage', 'risk.max_open_positions', 'venues.binance.retry_attempts',
+                    'universe.scan_concurrency'):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.cfg.set(key, 2.5)
+
+    def test_live_feed_staleness_guard_has_bounded_configuration(self):
+        for value in (0, 0.5, 121):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.cfg.set('market_data.max_ws_stale_sec', value)
+        self.cfg.set('market_data.max_ws_stale_sec', 5)
+        self.assertEqual(self.cfg.get('market_data.max_ws_stale_sec'), 5)
 
     def test_invalid_boolean_values_are_rejected(self):
         for value in ('maybe', [], {}, 2, float('nan')):
@@ -131,6 +141,56 @@ class ConfigurationRegressionTest(unittest.TestCase):
                 self.cfg.set(key, True)
         self.assertTrue(self.cfg.get('exchange.set_leverage_on_entry'))
         self.assertIsNone(self.cfg.get('account.set_leverage_on_entry'))
+
+
+class StartupConfigurationTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = isolated_config()
+
+    def test_out_of_range_toml_knob_fails_before_engine_start(self):
+        text = self.cfg.path.read_text()
+        self.assertIn("leverage = 10                   # 10x", text)
+        self.cfg.path.write_text(text.replace(
+            "leverage = 10                   # 10x",
+            "leverage = 201                  # 10x",
+            1,
+        ))
+        with self.assertRaisesRegex(ValueError, "risk.leverage"):
+            Config(self.cfg.path)
+
+    def test_out_of_range_saved_override_fails_closed(self):
+        self.cfg.overrides_path.write_text(json.dumps({"risk": {"leverage": 201}}))
+        with self.assertRaisesRegex(ValueError, "risk.leverage"):
+            Config(self.cfg.path)
+
+    def test_corrupt_or_non_object_override_file_is_not_silently_ignored(self):
+        for contents in ("{broken", "[]"):
+            with self.subTest(contents=contents):
+                self.cfg.overrides_path.write_text(contents)
+                with self.assertRaises(ValueError):
+                    Config(self.cfg.path)
+
+    def test_stale_or_unknown_override_key_fails_startup(self):
+        self.cfg.overrides_path.write_text(json.dumps({"risk": {"not_a_setting": 1}}))
+        with self.assertRaisesRegex(ValueError, "unknown or read-only"):
+            Config(self.cfg.path)
+
+    def test_invalid_base_cross_field_rules_fail_at_startup(self):
+        text = self.cfg.path.read_text()
+        text = text.replace("ao_fast = 5                     #", "ao_fast = 40                    #", 1)
+        self.cfg.path.write_text(text)
+        with self.assertRaisesRegex(ValueError, "strategy.ao_fast"):
+            Config(self.cfg.path)
+
+    def test_invalid_universe_weight_shape_fails_at_startup(self):
+        text = self.cfg.path.read_text()
+        text = text.replace(
+            "weights = { turnover = 0.40, volatility = 0.40, momentum = 0.20 }",
+            'weights = "not-a-table"', 1,
+        )
+        self.cfg.path.write_text(text)
+        with self.assertRaisesRegex(ValueError, "universe.weights"):
+            Config(self.cfg.path)
 
 
 class MultiMarket(StaticMarket):

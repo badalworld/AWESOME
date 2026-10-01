@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Entry point: boots the trading engine and the dashboard web server.
+"""Crypto Hunter entry point: boots the trading engines and dashboard.
 
-    python3 run.py                # start engine + dashboard on :8080
+    python3 run.py                # start engines + dashboard on :8080
     python3 run.py --port 9000    # custom port
     python3 run.py --no-engine    # dashboard only (engine can be started from the UI)
 
@@ -56,7 +56,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     log = logging.getLogger("main")
     log.info("=" * 78)
-    log.info("AO Divergence Futures Bot — %d venues | data_dir=%s",
+    log.info("Crypto Hunter — %d venues | data_dir=%s",
              len(manager.all()), data_dir)
     for ctx in manager.all():
         log.info("  %-8s %-24s mode=%-5s enabled=%s db=%s",
@@ -114,7 +114,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="AO Divergence Futures Bot (MEXC + Binance + KuCoin)")
+        description="Crypto Hunter — automated futures trading across MEXC, Binance and KuCoin")
     parser.add_argument("--port", type=int, default=None, help="dashboard port")
     parser.add_argument("--no-engine", action="store_true", help="start the dashboard only")
     args = parser.parse_args()

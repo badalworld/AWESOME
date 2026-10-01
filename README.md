@@ -1,4 +1,4 @@
-# AWESOME — Awesome-Oscillator Divergence Futures Bot (MEXC · Binance · KuCoin)
+# Crypto Hunter — Awesome-Oscillator Futures Bot (MEXC · Binance · KuCoin)
 
 An event-driven, low-latency trading system for **USDT-M perpetual futures on three venues —
 MEXC, Binance Futures and KuCoin Futures** — that trades **Awesome-Oscillator (AO) divergences on
@@ -12,10 +12,10 @@ positions, order router and market-data socket — inside one process and one da
 or rate-limit on one exchange never touches the others. The **strategy, filters, risk and trailing
 rules are shared code**, identical on all three.
 
-The dashboard (FastAPI + vanilla JS, no build step) provides real-time balance tracking,
-trade history, live performance metrics, an equity curve, universe scanner output, signal
-explanations (why a signal was taken or skipped), latency telemetry, and a settings panel
-where you enter a separate API key/secret per venue (plus the KuCoin passphrase).
+**Crypto Hunter** is the dashboard and product name. The FastAPI + vanilla-JS terminal (no build
+step) provides live account/position state, trade history, an equity curve, scanner output, signal
+explanations, order latency, WebSocket freshness and exchange-reported REST quota telemetry. Each
+venue has its own encrypted API key/secret (plus the KuCoin passphrase).
 
 > ⚠️ **Risk warning.** Leveraged futures trading can lose your entire balance. The shipped
 > configuration runs a **$20 starting balance** with a $10,000 target: at that size the target
@@ -24,9 +24,8 @@ where you enter a separate API key/secret per venue (plus the KuCoin passphrase)
 > ladder (what this edge does over 7/30/90/365 days from $20). Always start in **paper mode** and
 > validate with your own data before risking capital. Nothing here is financial advice.
 >
-> 🛡️ Before going live read the [pre-live audit](docs/AUDIT_2026-10.md) — it lists the defects that
-> were found and fixed on the money path, and the live-readiness checklist (the short version: set
-> `web.api_token`, IP-restrict the API keys, paper-trade first, start tiny).
+> ⛔ The latest [final audit](docs/CODE_HYGIENE_AUDIT_2026-10-02.md) does **not** clear this build for live trading. Keep all venues in paper mode until uncertain-order recovery, partial/external-exit accounting, and authenticated venue acceptance testing are resolved.
+
 
 ---
 
@@ -46,7 +45,8 @@ where you enter a separate API key/secret per venue (plus the KuCoin passphrase)
 - [Expectancy & win probability](docs/EDGE_AND_EXPECTANCY.md)
 - [Honest win-probability & feedback](docs/WIN_PROBABILITY.md)
 - [Final rules: TP / trail / SL, measured](docs/FINAL_RULES.md)
-- [Pre-live audit & checklist](docs/AUDIT_2026-10.md)
+- [Final live-readiness audit](docs/CODE_HYGIENE_AUDIT_2026-10-02.md)
+- [Historical pre-live audit](docs/AUDIT_2026-10.md)
 - [Testing](#testing)
 - [Project layout](#project-layout)
 - [FAQ / troubleshooting](#faq--troubleshooting)
@@ -58,7 +58,7 @@ where you enter a separate API key/secret per venue (plus the KuCoin passphrase)
 | Requirement | Implementation |
 |---|---|
 | AO divergence on 5m | `app/strategy/divergence.py` — fractal pivots + AO displacement, entry only on confirmed structure break |
-| Most volatile assets | `app/strategy/universe.py` — two-stage scan (ticker → candles) scoring turnover × realised 5m volatility × momentum |
+| Most volatile assets | `app/strategy/universe.py` — two-stage scan, 60s refresh by default, bounded parallel candle enrichment and turnover × volatility × momentum ranking |
 | Avoid fake signals | `app/strategy/filters.py` — 8 independent filters + composite quality score, all persisted and shown |
 | Real multi-venue execution | `app/exchange/{mexc,binance,kucoin}.py` + `live.py` — signed REST + own WSS per venue, venue-specific attached/standalone SL/TP, reduce-only exits |
 | Low-latency routing | HTTP/2 keep-alive pool, time-sync offset, idempotent `externalOid`, priority lanes for exits, coalesced tick dispatch, p50/p95/p99 telemetry |
@@ -69,6 +69,9 @@ where you enter a separate API key/secret per venue (plus the KuCoin passphrase)
 | Compounding to a target | `app/analytics/compound.py` — Monte-Carlo + required-win-rate maths, live on the dashboard |
 | Dashboard: balance, history, metrics | `app/web/` — WebSocket live feed, equity curve, ROI distribution, trade table, latency panel |
 | API keys in dashboard | Settings tab → **one key/secret per venue**, encrypted (AES-256-GCM) at rest, live verification per venue |
+| API quota health | Per-venue REST request/minute, retries, throttles and exchange-reported quota headers; displays unknown when a venue omits a limit (never fabricates a 95% figure) |
+| Live data guard | Dashboard shows market-tick age and scanner duration; new live entries fail closed while the exchange WebSocket is disconnected or stale |
+| Restart safety | Startup validates config and saved overrides; uncertain entries and unverified restored stops latch a persistent incident that cannot be resumed from the dashboard |
 
 ---
 
@@ -217,9 +220,9 @@ the dashboard can explain *exactly* why a divergence was traded or skipped.
 | `shock_candle` | last candle ≤ 4× ATR | entering right after an impulse/news candle |
 | `quality_score` | ≥ 60 | weak composites get skipped even if every gate passed |
 
-Tune any of them live in **Settings → Strategy & anti-fake-signal filters**. Loosening increases
-trade frequency and fake-signal rate; tightening reduces both. The **Signals** tab shows the
-rejection reason for every candidate, so you can tune with evidence.
+Tune any of them in **Dashboard → Settings → Strategy & anti-fake-signal filters**. Loosening
+increases trade frequency and fake-signal rate; tightening reduces both. The **Signals** page shows
+the rejection reason for every candidate, so you can tune with evidence.
 
 ## Risk model
 
@@ -314,11 +317,16 @@ Auth: `ApiKey` + `Request-Time` + `Signature` headers where
 
 ## The dashboard
 
+The premium dark workspace has addressable pages under `/dashboard/*`; direct links, refreshes and
+browser back/forward preserve the selected view. The global header and venue selector stay in place,
+while **Strategy & plan**, **Settings**, **Trade history**, **Signals**, and **Logs** each have a
+separate page route instead of competing for one long screen.
+
 - **Header (per active venue)** — **starting balance (fixed 🔒)**, equity with return %, **released
   P/L** (closed trades) with the W/L count, **win rate**, open (unrealised) P/L, open positions and
-  the UTC clock. Every figure belongs to the venue of the active tab; nothing is mixed.
-- **Venue tabs** — one tab per platform showing that venue's live equity, released P/L, win rate and
-  open positions at a glance, plus engine/market-data/watchlist/keys chips. Switching a tab swaps
+  the UTC clock. Every figure belongs to the selected venue; nothing is mixed.
+- **Venue selector** — one card per platform showing that venue's live equity, released P/L, win rate
+  and open positions at a glance, plus engine/market-data/watchlist/keys chips. Switching venue swaps
   the whole dashboard (state, history, signals, settings scope, websocket).
 - **Overview** — equity, released PnL, win rate, expectancy, open positions, latency percentiles,
   equity curve, ROI distribution, risk/guard state, broker & connectivity diagnostics, activity feed.
@@ -359,29 +367,20 @@ router. Any key can be overridden per venue with `[venues.<id>]` blocks in `conf
               days = 7
 ```
 
-## Going live safely
+## Live readiness
 
-**Current status:** keep paper mode pending the unresolved order-lifecycle fixes
-in the [code-hygiene audit](docs/CODE_HYGIENE_AUDIT_2026-10-02.md). The cleanup pass
-passes 224 Python and 8 JavaScript tests; this is not live-exchange certification. Uncertain entries now
-leave a persisted incident that blocks further entries and risk resume; this is
-a safety barrier, not automatic reconciliation. If an older dashboard
-was publicly reachable, rotate its dashboard API token (a settings-response
-exposure was fixed in this pass).
+**Current decision: do not run this checkout with live order routing.** The final
+[code-hygiene audit](docs/CODE_HYGIENE_AUDIT_2026-10-02.md) records unresolved uncertain-order recovery,
+incident resolution, partial-fill/external-exit accounting and authenticated venue acceptance.
+The 240 Python and 11 JavaScript tests passing is useful evidence, not live-exchange certification.
+The dashboard now shows this closed readiness state; all local venue modes remain paper.
 
-1. Run paper mode for at least a few days and read the **Signals** tab: are the filters rejecting
-   things you would also reject? Tune until the accepted signals look right to you.
-2. Check the **Compounding plan** tab: what does the Monte-Carlo say about *your* parameters?
-   If P(hit target) is tiny, the honest answer is that the target is unrealistic at this risk
-   level — increase the horizon, lower the target, or accept the variance.
-3. Add API keys with **IP whitelist** + futures-order permission only (no withdrawals).
-4. Set `web.api_token` in `config.toml` if the dashboard is reachable from anywhere but localhost.
-5. Start live with a small balance; verify one full trade (entry, SL/TP placement, a trailing step,
-   exit) before scaling up.
-6. Run the bot on a VPS geographically close to your venues' matching engines (Binance's
-   USDⓈ-M and KuCoin Futures sit in Tokyo/Singapore, MEXC in Singapore) and keep `data/` on
-   persistent storage (it contains the machine key, trade history and trailing state for all
-   three venues).
+Paper mode can still help review signal filtering and the interface, but it does not certify live
+execution. Before reconsidering live operation, resolve every blocker in the audit and complete the
+release gate in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). Also secure the dashboard with TLS,
+`web.api_token`, and network restrictions; use futures-only API permissions, disable withdrawals,
+IP-whitelist keys, and keep persistent backups of `data/`. Rotate the dashboard token if the older
+unauthenticated version was reachable by others.
 
 ## Expectancy, win probability & the $10k/7d target
 
@@ -401,7 +400,7 @@ the strategy as configured:
   they do not create the edge. The win rate of the AO-divergence signal is what decides it.
 * **$1,000 → $10,000 in 7 days requires +39 %/day**: ~16 clean TP hits in a row, or a >100 % win
   rate. The honest probability is **< 1 % (≈0 % under trailing-realistic exits)**. It is a stress
-  metric, not a target — the dashboard's *Compounding* tab shows the same maths live against your
+  metric, not a target — the dashboard's *Strategy & plan* page shows the same maths live against your
   own trade history.
 
 Re-run the numbers after you have live history — `python3 tools/edge_report.py --out
@@ -411,8 +410,8 @@ from being overwritten; add `--force` if you really want to regenerate it in pla
 ## Testing
 
 ```bash
-python3 tests/run_all.py            # 224 tests, ~23 s, no network needed
-node --test tests/test_dashboard.js # 8 offline dashboard lifecycle tests
+python3 tests/run_all.py            # 240 Python tests, no network needed
+node --test tests/test_dashboard.js # 11 offline dashboard lifecycle/routing tests
 python3 -m unittest tests.test_core         # maths, indicators, strategy, filters, analytics
 python3 -m unittest tests.test_integration  # trade lifecycle on a deterministic market
 python3 -m unittest tests.test_engine       # the orchestrator on the offline synthetic feed

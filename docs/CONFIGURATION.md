@@ -13,8 +13,10 @@ values; boolean settings reject unrecognized values rather than guessing.
 
 Venue overrides (`venues.<id>.*`) take precedence over global settings. Each venue
 has its own `mode`, credentials, balances and database; the common strategy/risk
-values are inherited unless explicitly overridden. File-loaded configuration still
-needs operator review: runtime validation is not a full startup schema validator.
+values are inherited unless explicitly overridden. Startup validates all dashboard-editable
+settings, filters, venue overrides, key connection/storage values and cross-field relations.
+Malformed or stale runtime override files fail startup instead of being silently discarded.
+This remains a bounded schema, not validation of arbitrary unknown TOML sections.
 
 Config paths (`data_dir`, `persistence.db_path`) are resolved **relative to the config file's
 directory**, so `AO_CONFIG=/tmp/exp/config.toml python3 run.py` is fully isolated (separate DB,
@@ -24,7 +26,7 @@ separate overrides). This matters for testing and for running paper + live insta
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mode` | `paper` | `paper` \| `live`. Switching requires an engine restart (dashboard does it for you). |
+| `mode` | `paper` | `paper` \| `live`. Paper is the safe startup mode; live routing requires an explicit per-venue apply/restart and credentials. |
 | `data_dir` | `data` | runtime directory: DB, settings, machine key |
 | `log_level` | `INFO` | console/dashboard logging level (applied at process startup) |
 
@@ -43,6 +45,12 @@ Risk-day boundaries use UTC; the dashboard formats dates in the browser’s time
 | `request_timeout_s` | `5` | per-request timeout |
 | `retry_attempts` | `3` | adapter retry limit; not proof of fill finality |
 | `set_leverage_on_entry` | `true` | set leverage before entry; reject when setup fails |
+
+## `[market_data]`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_ws_stale_sec` | `10` | fail closed on new live entries when the exchange socket is down or the last mark tick is older; exchange-side protection on existing positions remains in place |
 
 ## `[risk]`
 
@@ -125,7 +133,8 @@ recorded so you can audit why a divergence was skipped.
 |---|---|---|
 | `enabled` | `true` | run new scans (disabled retains the last selected watchlist) |
 | `max_symbols` | `20` | watchlist size |
-| `refresh_sec` | `300` | rescan cadence |
+| `refresh_sec` | `60` | rescan cadence |
+| `scan_concurrency` | `10` | bounded parallel candle enrichment; venue rate limiters still apply |
 | `min_turnover_24h_usd` | `5e6` | hard liquidity floor |
 | `[universe.weights]` (`turnover`, `volatility`, `momentum`) | 0.4/0.4/0.2 | composite ranking |
 

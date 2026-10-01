@@ -75,6 +75,13 @@ class UniverseScanner:
         self.broker = broker
         self.cfg = cfg
         self.last_scan_ts = 0.0
+        self.last_scan_started_at = 0.0
+        self.last_scan_duration_ms = 0.0
+        self.last_scan_error = ""
+        self.scan_count = 0
+        self.last_candidate_count = 0
+        self.last_eligible_count = 0
+        self.last_tickers = {}
         self.last_entries: List[UniverseEntry] = []
         self.rejected_sample: List[Dict[str, Any]] = []
 
@@ -83,13 +90,30 @@ class UniverseScanner:
         return self.cfg.section("universe")
 
     async def scan(self) -> List[UniverseEntry]:
+        self.last_scan_started_at = time.time()
+        started = time.perf_counter()
+        try:
+            entries = await self._scan_once()
+            self.last_scan_error = ""
+            return entries
+        except Exception as exc:
+            self.last_scan_error = str(exc)
+            raise
+        finally:
+            self.scan_count += 1
+            self.last_scan_duration_ms = round((time.perf_counter() - started) * 1000.0, 1)
+
+    async def _scan_once(self) -> List[UniverseEntry]:
         ucfg = self._universe_cfg()
         if not ucfg.get("enabled", True):
             return self.last_entries
 
         contracts = await self.broker.contracts()
         tickers = await self.broker.tickers()
+        self.last_tickers = tickers
         if not contracts or not tickers:
+            self.last_candidate_count = 0
+            self.last_eligible_count = 0
             return self.last_entries
 
         whitelist = set(ucfg.get("whitelist") or [])
@@ -166,6 +190,8 @@ class UniverseScanner:
                 contract=spec,
             ))
 
+        self.last_candidate_count = len(candidates)
+        self.last_eligible_count = 0
         if not candidates:
             self.rejected_sample = rejected[:60]
             return self.last_entries
@@ -173,7 +199,7 @@ class UniverseScanner:
         # ---- stage 2: real candle statistics for the most promising ones ---
         candidates.sort(key=lambda e: e.turnover24 * max(e.range24_pct, 0.1), reverse=True)
         stage2 = candidates[: int(min(45, len(candidates)))]
-        await self._enrich(stage2)
+        await self._enrich(stage2, concurrency=int(ucfg.get("scan_concurrency", 10)))
 
         min_atr = float(ucfg.get("min_atr_pct", 0.15))
         max_atr = float(ucfg.get("max_atr_pct", 6.0))
@@ -188,6 +214,7 @@ class UniverseScanner:
                 continue
             eligible.append(e)
 
+        self.last_eligible_count = len(eligible)
         if not eligible:
             self.rejected_sample = rejected[:60]
             return self.last_entries
