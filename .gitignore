@@ -26,3 +26,10 @@ venv/
 
 # Local scratch
 /tmp_*
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
