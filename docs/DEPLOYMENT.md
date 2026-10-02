@@ -160,6 +160,18 @@ server directly and no CORS setup is needed.
 
 Set `web.api_token` before exposing the engine publicly — the dashboard prompts for it once.
 
+## Vercel-hosted dashboard
+
+Vercel works the same way as Netlify: it serves only the static dashboard (`vercel.json` disables
+framework detection, so the FastAPI preset is not used), and `api/engine-proxy.js` forwards every
+`/api/*` call to the engine. The engine itself cannot run on Vercel — it is a long-running process
+with background trading loops, SQLite on disk and WebSockets.
+
+1. In the Vercel project, open **Settings → Environment Variables** and add `ENGINE_URL`
+   (same formats as Netlify; `IPAddress` is also accepted).
+2. Make sure the engine's port is reachable from the internet and `web.api_token` is set.
+3. Redeploy. Live `/ws` streams are not proxied; the dashboard falls back to REST polling.
+
 ## AWS with Terraform
 
 For AWS the repository ships a Terraform module for **AWS provider v6**
