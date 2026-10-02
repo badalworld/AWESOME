@@ -46,7 +46,6 @@ venue has its own encrypted API key/secret (plus the KuCoin passphrase).
 - [Honest win-probability & feedback](docs/WIN_PROBABILITY.md)
 - [Final rules: TP / trail / SL, measured](docs/FINAL_RULES.md)
 - [Final live-readiness audit](docs/CODE_HYGIENE_AUDIT_2026-10-02.md)
-- [Historical pre-live audit](docs/AUDIT_2026-10.md)
 - [Testing](#testing)
 - [Project layout](#project-layout)
 - [FAQ / troubleshooting](#faq--troubleshooting)
@@ -118,7 +117,7 @@ To trade live (repeat per venue; venues are independent):
                  └───────────────▲──────────────────────────────▲─────────────────────────────────┘
                                  │ REST /ws                     │ control
    ┌─────────────────────────────┴──────────────────────────────┴───────────────────────────────┐
-   │                                   TradingEngine (asyncio)                                  │
+   ��                                   TradingEngine (asyncio)                                  │
    │  universe loop → SignalEngine → RiskGuard → Executor → position/trailing manager           │
    │  equity loop · position-sync loop · time-sync loop · maintenance                           │
    └───────▲───────────────────────────────▲──────────────────────────────▲─────────────────────┘

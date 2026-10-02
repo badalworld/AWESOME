@@ -1,4 +1,4 @@
-"""Regression tests for the pre-live audit (see docs/AUDIT_2026-10.md).
+"""Regression tests for defects fixed during the 2026-10 pre-live audit.
 
 Each test here pins a defect that was found by auditing the money path, so the
 fix can never silently regress:

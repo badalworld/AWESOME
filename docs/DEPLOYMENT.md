@@ -128,7 +128,7 @@ Do not treat this checklist as permission to switch `mode` to `live`; the curren
 | Expect affordability rejections on a small book | the venue's smallest order can exceed 8 % of a $20 account; such symbols are filtered out of the universe and rejected with a reason in the Signals tab | `universe.only_affordable_orders` |
 | Never run two instances on one account | both would manage the same positions | — |
 
-See [`CODE_HYGIENE_AUDIT_2026-10-02.md`](CODE_HYGIENE_AUDIT_2026-10-02.md) for current findings and blockers; `AUDIT_2026-10.md` is historical.
+See [`CODE_HYGIENE_AUDIT_2026-10-02.md`](CODE_HYGIENE_AUDIT_2026-10-02.md) for current findings and blockers.
 
 ## 7. Known limitations
 

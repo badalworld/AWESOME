@@ -774,12 +774,6 @@ const FIELD_GROUPS = {
 function getPath(obj, path) {
   return path.split('.').reduce((acc, k) => (acc == null ? undefined : acc[k]), obj);
 }
-function setPath(obj, path, value) {
-  const parts = path.split('.');
-  let node = obj;
-  for (const p of parts.slice(0, -1)) node = node[p] = node[p] || {};
-  node[parts[parts.length - 1]] = value;
-}
 
 const VENUE_FIELDS = [
   ['enabled', 'enabled', 'bool'],

@@ -49,7 +49,6 @@ class Divergence:
     trigger_note: str = ""
     structure_high: float = 0.0
     structure_low: float = 0.0
-    ao_slope_up: bool = False
     score: float = 0.0
     meta: dict = field(default_factory=dict)
 
@@ -190,10 +189,6 @@ def _build(
 ) -> Optional[Divergence]:
     n = len(candles)
     last = candles[-1]
-    slope_up = False
-    # AO slope from the last two closed candles
-    if n >= 2:
-        slope_up = candles[-1].c > candles[-2].c
     trigger_level = structure_high if side == LONG else structure_low
 
     confirmed = False
@@ -232,7 +227,6 @@ def _build(
         trigger_note=note,
         structure_high=structure_high,
         structure_low=structure_low,
-        ao_slope_up=slope_up,
         meta={
             "p1_bar": int(p1),
             "p2_bar": int(p2),
