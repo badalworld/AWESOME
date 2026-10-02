@@ -31,6 +31,17 @@ export default async function handler(req) {
   }
 
   const incoming = new URL(req.url);
+  const forwardedHost = req.headers.get("x-forwarded-host");
+  if (
+    base.host === incoming.host ||
+    (forwardedHost && base.host === forwardedHost) ||
+    /\.vercel\.app$/i.test(base.hostname)
+  ) {
+    return Response.json(
+      { detail: `ENGINE_URL points at a Vercel address (${base.host}), so the dashboard is calling itself. Set it to the server running the Python engine (e.g. http://203.0.113.10:8080), then redeploy.` },
+      { status: 508 },
+    );
+  }
   const enginePath = (incoming.searchParams.get(PATH_PARAM) || "").replace(/^\/+/, "");
   incoming.searchParams.delete(PATH_PARAM);
   const target = new URL(`/api/${enginePath}${incoming.search}`, base);
