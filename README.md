@@ -90,6 +90,10 @@ python3 run.py --no-engine     # dashboard only, start the engine from the UI
 AO_CONFIG=/path/to/config.toml python3 run.py
 ```
 
+Deploying to AWS? `terraform init && terraform apply` from the repository root builds a ready-to-run host
+(see [AWS with Terraform](docs/DEPLOYMENT.md#aws-with-terraform)); for any other server see
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 Out of the box all three venues start in **paper mode**. When a venue's public REST/WS is reachable
 the venue paper-trades on **live market data from that venue**; otherwise (offline/CI) it uses the
 built-in **synthetic volatile-market simulator** so every part of the system is still exercisable —
@@ -372,7 +376,7 @@ router. Any key can be overridden per venue with `[venues.<id>]` blocks in `conf
 **Current decision: do not run this checkout with live order routing.** The final
 [code-hygiene audit](docs/CODE_HYGIENE_AUDIT_2026-10-02.md) records unresolved uncertain-order recovery,
 incident resolution, partial-fill/external-exit accounting and authenticated venue acceptance.
-The 240 Python and 11 JavaScript tests passing is useful evidence, not live-exchange certification.
+The 259 Python and 11 JavaScript tests passing is useful evidence, not live-exchange certification.
 The dashboard now shows this closed readiness state; all local venue modes remain paper.
 
 Paper mode can still help review signal filtering and the interface, but it does not certify live
@@ -410,12 +414,13 @@ from being overwritten; add `--force` if you really want to regenerate it in pla
 ## Testing
 
 ```bash
-python3 tests/run_all.py            # 240 Python tests, no network needed
+python3 tests/run_all.py            # 259 Python tests, no network needed
 node --test tests/test_dashboard.js # 11 offline dashboard lifecycle/routing tests
 python3 -m unittest tests.test_core         # maths, indicators, strategy, filters, analytics
 python3 -m unittest tests.test_integration  # trade lifecycle on a deterministic market
 python3 -m unittest tests.test_engine       # the orchestrator on the offline synthetic feed
 python3 -m unittest tests.test_api          # every dashboard endpoint + websocket
+python3 -m unittest tests.test_terraform_module  # AWS Terraform module contracts (no Terraform needed)
 ```
 
 Coverage highlights: ROI↔price conversions (long/short, TP *and* stop sides), the exact trailing
@@ -435,6 +440,10 @@ never pick up (or corrupt) whatever you have configured in the live dashboard.
 ```
 config.toml               all tunables (defaults; dashboard overrides go to data/settings.json)
 run.py                    entry point: engine + dashboard
+main.tf variables.tf      AWS deployment (Terraform): root configuration that calls the module below
+outputs.tf versions.tf
+modules/
+  crypto-hunter-ec2/      Terraform module for AWS provider v6: EC2 host, state volume, snapshots
 app/
   config.py               layered config + validation
   crypto.py keystore.py   AES-256-GCM credential storage (machine-bound key, 0600)

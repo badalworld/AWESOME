@@ -1,0 +1,174 @@
+#!/bin/bash
+# Crypto Hunter first-boot provisioning.
+# Rendered by Terraform (module crypto-hunter-ec2) and run once, as root, by cloud-init.
+# Progress and errors end up in /var/log/cloud-init-output.log.
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+APP_USER=trader
+APP_DIR=/home/trader/awesome
+DATA_DIR="$APP_DIR/data"
+REPO_URL='${repo_url}'
+REPO_REF='${repo_ref}'
+PORT='${port}'
+DATA_VOLUME_ID='${data_volume_id}'
+TOKEN_PARAMETER='${token_parameter}'
+
+# Package mirrors, GitHub and PyPI fail transiently on a freshly booted host.
+retry() {
+  local attempt=1
+  until "$@"; do
+    if [ "$attempt" -ge 5 ]; then
+      echo "giving up after $attempt attempts: $*" >&2
+      return 1
+    fi
+    sleep $((attempt * 10))
+    attempt=$((attempt + 1))
+  done
+}
+
+as_trader() { sudo -H -u "$APP_USER" "$@"; }
+
+# ---------------------------------------------------------------- packages ---
+retry apt-get update
+retry apt-get install -y -o DPkg::Lock::Timeout=300 ${apt_packages}
+
+# The app reads its config with tomllib (Python 3.11+). Ubuntu 22.04 ships 3.10.
+python3 - <<'PY'
+import sys
+if sys.version_info < (3, 11):
+    sys.exit("Crypto Hunter needs Python 3.11+; this image has %d.%d. Use Ubuntu 24.04 or newer." % sys.version_info[:2])
+PY
+
+# ------------------------------------------------------------- application ---
+id "$APP_USER" >/dev/null 2>&1 || useradd --create-home --shell /usr/sbin/nologin "$APP_USER"
+
+# Clone before mounting the data volume: git refuses a non-empty target and the
+# mount point lives inside it.
+if [ ! -d "$APP_DIR/.git" ]; then
+  retry as_trader git clone "$REPO_URL" "$APP_DIR"
+fi
+cd "$APP_DIR"
+retry as_trader git fetch --tags --prune origin
+as_trader git -c advice.detachedHead=false checkout "$REPO_REF"
+if as_trader git show-ref --verify --quiet "refs/remotes/origin/$REPO_REF"; then
+  as_trader git merge --ff-only "origin/$REPO_REF"
+fi
+
+as_trader python3 -m venv "$APP_DIR/.venv"
+retry as_trader "$APP_DIR/.venv/bin/pip" install --no-cache-dir --disable-pip-version-check -r "$APP_DIR/requirements.txt"
+
+# ------------------------------------------------------------- data volume ---
+# Terraform attaches the volume after it has created the instance, so it may not
+# be there yet. Nitro instances expose it as NVMe with a stable by-id link whose
+# serial is the volume id without the dash; older Xen types as /dev/xvdf.
+VOLUME_SERIAL="$(printf '%s' "$DATA_VOLUME_ID" | tr -d '-')"
+
+find_data_device() {
+  local candidate
+  for candidate in "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$VOLUME_SERIAL" /dev/sdf /dev/xvdf; do
+    if [ -b "$candidate" ]; then
+      readlink -f "$candidate"
+      return 0
+    fi
+  done
+  # Fallback that does not depend on udev's link naming: EBS sets the NVMe serial
+  # number to the volume id. Prints the device and succeeds only on a match.
+  lsblk -dpno NAME,SERIAL | awk -v serial="$VOLUME_SERIAL" '$2 == serial { print $1; found = 1 } END { exit !found }'
+}
+
+DATA_DEV=""
+for _ in $(seq 1 60); do
+  if DATA_DEV="$(find_data_device)"; then
+    break
+  fi
+  sleep 5
+done
+if [ -z "$DATA_DEV" ]; then
+  echo "data volume $DATA_VOLUME_ID did not appear within 5 minutes" >&2
+  exit 1
+fi
+
+# Format only a device with no signature at all. A volume restored from a
+# snapshot, or re-attached to a replacement instance, already holds the trading
+# state and must never be touched. Anything unexpected (a partition table, say)
+# makes the mount below fail loudly instead. The probe result goes through a
+# plain assignment on purpose: if wipefs itself fails, errexit stops the script
+# here instead of an empty answer being mistaken for "blank device".
+SIGNATURES="$(wipefs --no-act "$DATA_DEV")"
+if [ -z "$SIGNATURES" ]; then
+  mkfs.ext4 -q -L crypto-data "$DATA_DEV"
+fi
+DATA_UUID="$(blkid -p -s UUID -o value "$DATA_DEV")"
+
+mkdir -p "$DATA_DIR"
+if ! grep -qs "[[:space:]]$${DATA_DIR}[[:space:]]" /etc/fstab; then
+  echo "UUID=$DATA_UUID $DATA_DIR ext4 defaults,nofail,noatime 0 2" >> /etc/fstab
+fi
+systemctl daemon-reload
+mountpoint -q "$DATA_DIR" || mount "$DATA_DIR"
+chown -R "$APP_USER:" "$DATA_DIR"
+chmod 0750 "$DATA_DIR"
+
+# ------------------------------------- optional: dashboard token from SSM ---
+# Installed only when the module was given api_token_ssm_parameter_name. The
+# helper runs before every start of the service (ExecStartPre) and copies the
+# parameter into data/settings.json; see files/sync_api_token.py.
+if [ -n "$TOKEN_PARAMETER" ]; then
+  cat > /usr/local/sbin/crypto-hunter-sync-token <<'PY'
+${sync_token_py}
+PY
+  chmod 0755 /usr/local/sbin/crypto-hunter-sync-token
+  mkdir -p /etc/systemd/system/crypto-hunter.service.d
+  cat > /etc/systemd/system/crypto-hunter.service.d/api-token.conf <<EOF
+[Service]
+Environment=CRYPTO_HUNTER_TOKEN_PARAMETER=$TOKEN_PARAMETER
+Environment=CRYPTO_HUNTER_SETTINGS_FILE=$DATA_DIR/settings.json
+Environment=AWS_DEFAULT_REGION=${aws_region}
+Environment=AWS_METADATA_SERVICE_TIMEOUT=5
+Environment=AWS_METADATA_SERVICE_NUM_ATTEMPTS=5
+ExecStartPre=/usr/bin/python3 /usr/local/sbin/crypto-hunter-sync-token
+EOF
+fi
+
+# ----------------------------------------------------------------- service ---
+# RequiresMountsFor keeps the engine from ever starting against an empty root
+# disk if the data volume is missing: its state would silently fork.
+cat > /etc/systemd/system/crypto-hunter.service <<UNIT
+[Unit]
+Description=Crypto Hunter Trading System
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=$DATA_DIR
+
+[Service]
+Type=simple
+User=$APP_USER
+WorkingDirectory=$APP_DIR
+ExecStart=$APP_DIR/.venv/bin/python run.py --port $PORT
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=$DATA_DIR
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now crypto-hunter
+
+# Informational only: the engines start before the web server binds, so give it a minute.
+for _ in $(seq 1 30); do
+  if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/api/health"; then
+    echo "Crypto Hunter is up on port $PORT"
+    exit 0
+  fi
+  sleep 2
+done
+echo "WARNING: no answer yet from http://127.0.0.1:$PORT/api/health - see: journalctl -u crypto-hunter" >&2

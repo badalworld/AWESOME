@@ -10,6 +10,9 @@ a few hundred MB) — 1 vCPU / 1 GB RAM is enough for all three venues.
 
 ## 2. Install
 
+> On AWS, the Terraform module automates this section and section 4, and puts `data/` on its own
+> snapshotted volume: see [AWS with Terraform](#aws-with-terraform).
+
 ```bash
 git clone <your-repo> awesome && cd awesome
 python3 -m venv .venv && . .venv/bin/activate
@@ -53,6 +56,8 @@ Also set `web.api_token` in `config.toml` for defence in depth; the dashboard se
 
 ## 4. systemd unit
 
+Save this as `/etc/systemd/system/crypto-hunter.service` (the name the Terraform module uses too):
+
 ```ini
 [Unit]
 Description=Crypto Hunter Trading System
@@ -78,8 +83,8 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl daemon-reload && sudo systemctl enable --now awesome-bot
-journalctl -u awesome-bot -f
+sudo systemctl daemon-reload && sudo systemctl enable --now crypto-hunter
+journalctl -u crypto-hunter -f
 ```
 
 ## 5. Live-readiness gate — currently NOT CLEARED
@@ -154,3 +159,33 @@ server directly and no CORS setup is needed.
 3. Redeploy. Until `ENGINE_URL` is set, the dashboard shows an "Engine address not configured" error.
 
 Set `web.api_token` before exposing the engine publicly — the dashboard prompts for it once.
+
+## AWS with Terraform
+
+For AWS the repository ships a Terraform module for **AWS provider v6**
+([`modules/crypto-hunter-ec2`](../modules/crypto-hunter-ec2/README.md)) and a root configuration that calls it.
+It automates sections 2 and 4 on one Ubuntu 24.04 EC2 host and keeps `data/` on its own encrypted, snapshotted
+EBS volume, so replacing the host never loses state.
+
+```bash
+terraform init
+terraform apply                                    # region ap-southeast-1 unless you pass -var region=..., see section 1
+$(terraform output -raw ssm_port_forward_command)  # dashboard on http://localhost:8080 with no inbound port open
+```
+
+* **Paper mode only.** The host runs the shipped `config.toml`; the live-readiness gate in section 5 is unchanged.
+* **Access.** By default nothing is reachable from the internet. Use the port forward above, or a shell with
+  `terraform output -raw ssm_session_command`. `-var 'app_cidrs=["203.0.113.7/32"]'` opens the dashboard port to your address.
+* **Netlify.** `terraform output -raw engine_url` is the value for `ENGINE_URL`. Netlify has no fixed egress addresses,
+  so this needs a wide `app_cidrs` range **and** a token. Create a SecureString SSM parameter and pass its name as
+  `api_token_ssm_parameter_name`: the host applies it as `web.api_token` before every start and refuses to start if it
+  cannot read it. To rotate, update the parameter and run `sudo systemctl restart crypto-hunter`.
+* **State and backups.** `data/` is a separate volume with daily snapshots (14 days by default) and a final snapshot if
+  Terraform ever deletes it. Restore a backup with `data_volume_snapshot_id`.
+* **Updates.** Changing `repo_ref`, `repo_url` or `app_port`, or upgrading the module, replaces the instance (a few
+  minutes of downtime, state kept). Pin `repo_ref` to a tag or commit. A new Ubuntu release does not replace the host on its own.
+* **Existing deployments.** The earlier root-level Terraform used provider v5 and kept `data/` on the root disk, which
+  is lost when the instance is replaced. Back it up before applying: see "Upgrading from the pre-module root
+  configuration" in the module README.
+
+The service is called `crypto-hunter`: `sudo journalctl -u crypto-hunter -f`.
