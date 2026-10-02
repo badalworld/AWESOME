@@ -35,7 +35,7 @@ variable "subnet_id" {
 }
 
 variable "create_eip" {
-  description = "Allocate an Elastic IP and attach it to the instance. This gives the dashboard / Netlify ENGINE_URL / exchange API-key IP allow-list a stable address that survives instance replacement. Set false for an instance in a private subnet that you reach through SSM Session Manager."
+  description = "Allocate an Elastic IP and attach it to the instance. This gives the dashboard / Vercel ENGINE_URL / exchange API-key IP allow-list a stable address that survives instance replacement. Set false for an instance in a private subnet that you reach through SSM Session Manager."
   type        = bool
   default     = true
 }
@@ -180,7 +180,7 @@ variable "api_token_ssm_parameter_name" {
 ###############################################################################
 
 variable "app_cidrs" {
-  description = "IPv4 or IPv6 CIDR blocks allowed to reach app_port. Empty keeps the port closed: use the ssm_port_forward_command output instead. Netlify has no fixed egress IPs, so proxying through it needs a wide range, in which case also set api_token_ssm_parameter_name."
+  description = "IPv4 or IPv6 CIDR blocks allowed to reach app_port. Empty keeps the port closed: use the ssm_port_forward_command output instead. Vercel has no fixed egress IPs, so proxying through it needs a wide range, in which case also set api_token_ssm_parameter_name."
   type        = list(string)
   default     = []
 

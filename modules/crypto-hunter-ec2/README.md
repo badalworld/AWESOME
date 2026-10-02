@@ -9,7 +9,7 @@ Venues stay in paper mode: the module changes nothing about the engine's own liv
 
 ```
   you ── SSM Session Manager ───────────►  no inbound port needed
-  you / Netlify ── HTTP :8080 ───────────►  only from app_cidrs (optional)
+  you / Vercel ── HTTP :8080 ───────────►  only from app_cidrs (optional)
 
   ┌─ subnet (one Availability Zone) ─────────────────────────────────────────────────────┐
   │ EC2 host: Ubuntu 24.04, IMDSv2, no SSH key by default                                │
@@ -105,7 +105,7 @@ $(terraform output -raw ssm_session_command)        # a shell on the host
 **Direct access.** Put your address in `app_cidrs` (IPv4 or IPv6, e.g. `["203.0.113.7/32"]`) and open
 `http://<public_ip>:<app_port>`. The dashboard speaks plain HTTP, so keep this to addresses you trust.
 
-**Through the Netlify proxy.** Set `ENGINE_URL` on Netlify to the `engine_url` output. Netlify has no fixed
+**Through the Vercel proxy.** Set `ENGINE_URL` on Vercel to the `engine_url` output. Vercel has no fixed
 egress addresses, so the proxy needs a wide `app_cidrs` range; do that only together with
 `api_token_ssm_parameter_name` below (the module warns at plan time if you do not).
 
@@ -242,7 +242,7 @@ stack are `aws_eip` `domain` (already used), `data.aws_region` `.region` instead
 | `name` | Name prefix for every resource and the value of the Name tag. Use a different name for each deployment in the same account and region. | `string` | `"crypto-hunter"` |
 | `tags` | Extra tags applied to every resource. They are merged with (and win over) any default_tags configured on the AWS provider. | `map(string)` | `{}` |
 | `subnet_id` | Subnet to launch in. Null picks a default subnet of the default VPC, in an Availability Zone that offers instance_type. Pin it for production: the data volume is created in this subnet's Availability Zone and cannot follow the instance to another one. | `string` | `null` |
-| `create_eip` | Allocate an Elastic IP and attach it to the instance. This gives the dashboard / Netlify ENGINE_URL / exchange API-key IP allow-list a stable address that survives instance replacement. Set false for an instance in a private subnet that you reach through SSM Session Manager. | `bool` | `true` |
+| `create_eip` | Allocate an Elastic IP and attach it to the instance. This gives the dashboard / Vercel ENGINE_URL / exchange API-key IP allow-list a stable address that survives instance replacement. Set false for an instance in a private subnet that you reach through SSM Session Manager. | `bool` | `true` |
 | `instance_type` | EC2 instance type. The default AMI is x86_64; for a Graviton (arm64) type also pass an arm64 ami_id. | `string` | `"t3.micro"` |
 | `ami_id` | AMI to launch instead of the latest Canonical Ubuntu 24.04 LTS (amd64), which is resolved from Canonical's public SSM parameter. It must be Ubuntu 24.04 or newer (the bootstrap uses apt and needs Python 3.11+). Changing this value replaces the instance; newer releases of the default image do not. | `string` | `null` |
 | `key_name` | Name of an existing EC2 key pair for SSH. Null (the default) means no SSH key at all: use SSM Session Manager. | `string` | `null` |
@@ -255,7 +255,7 @@ stack are `aws_eip` `domain` (already used), `data.aws_region` `.region` instead
 | `repo_ref` | Branch, tag or commit to check out. Pin a tag or commit SHA for reproducible deployments. Changing it replaces the instance (the data volume is kept and re-attached). | `string` | `"main"` |
 | `app_port` | TCP port the dashboard and API listen on (run.py --port). | `number` | `8080` |
 | `api_token_ssm_parameter_name` | Name of an existing SSM Parameter Store parameter (type SecureString recommended) that holds the dashboard API token. When set, the instance may read only that parameter, and every start of the service copies its value into data/settings.json as web.api_token, so the token never appears in user_data or the Terraform state. Null leaves the dashboard unauthenticated. | `string` | `null` |
-| `app_cidrs` | IPv4 or IPv6 CIDR blocks allowed to reach app_port. Empty keeps the port closed: use the ssm_port_forward_command output instead. Netlify has no fixed egress IPs, so proxying through it needs a wide range, in which case also set api_token_ssm_parameter_name. | `list(string)` | `[]` |
+| `app_cidrs` | IPv4 or IPv6 CIDR blocks allowed to reach app_port. Empty keeps the port closed: use the ssm_port_forward_command output instead. Vercel has no fixed egress IPs, so proxying through it needs a wide range, in which case also set api_token_ssm_parameter_name. | `list(string)` | `[]` |
 | `ssh_cidrs` | IPv4 or IPv6 CIDR blocks allowed to reach SSH (port 22). Only useful together with key_name; SSM Session Manager needs no inbound rule at all. | `list(string)` | `[]` |
 | `additional_iam_policy_arns` | Extra managed policies to attach to the instance role, for example one granting kms:Decrypt on the customer-managed key that protects the SSM token parameter. | `list(string)` | `[]` |
 | `iam_permissions_boundary_arn` | ARN of a permissions boundary to put on the IAM roles this module creates, for accounts that require one. | `string` | `null` |
@@ -267,7 +267,7 @@ stack are `aws_eip` `domain` (already used), `data.aws_region` `.region` instead
 | `instance_id` | ID of the EC2 instance. |
 | `public_ip` | Public IPv4 address (the Elastic IP when create_eip is true). Null when the instance has none. |
 | `private_ip` | Private IPv4 address of the instance. |
-| `engine_url` | Base URL of the engine, for the ENGINE_URL variable of the Netlify dashboard proxy. Null when the instance has no public address. |
+| `engine_url` | Base URL of the engine, for the ENGINE_URL variable of the Vercel dashboard proxy. Null when the instance has no public address. |
 | `ssm_session_command` | Opens a shell on the instance through Session Manager (needs the AWS CLI and the Session Manager plugin). Logs: journalctl -u crypto-hunter -f |
 | `ssm_port_forward_command` | Forwards the dashboard to http://localhost:<app_port> through Session Manager, so no inbound port has to be open at all. |
 | `security_group_id` | Security group of the instance. Attach extra aws_vpc_security_group_ingress_rule resources to it for any access this module does not model. |

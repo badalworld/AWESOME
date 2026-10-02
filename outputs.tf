@@ -1,10 +1,10 @@
 output "public_ip" {
-  description = "Elastic IP of the engine host. Use http://<ip>:<port> as ENGINE_URL for the Netlify edge proxy."
+  description = "Elastic IP of the engine host. Use http://<ip>:<port> as ENGINE_URL for the Vercel dashboard proxy."
   value       = module.engine.public_ip
 }
 
 output "engine_url" {
-  description = "Value for the ENGINE_URL Netlify environment variable."
+  description = "Value for the ENGINE_URL Vercel environment variable."
   value       = module.engine.engine_url
 }
 

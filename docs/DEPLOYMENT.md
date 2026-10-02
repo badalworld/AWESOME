@@ -144,33 +144,25 @@ See [`CODE_HYGIENE_AUDIT_2026-10-02.md`](CODE_HYGIENE_AUDIT_2026-10-02.md) for c
 * Single-process by design; to run multiple strategies, use multiple isolated configs/data dirs
   (see CONFIGURATION.md) on different ports.
 
-## Netlify-hosted dashboard
+## Vercel-hosted dashboard
 
-The static dashboard can be served from Netlify while the engine runs on your own server.
-An edge function forwards every `/api/*` call to the engine, so the browser never talks to your
-server directly and no CORS setup is needed.
+The static dashboard can be served from Vercel while the engine runs on your own server.
+Vercel serves only the static dashboard (`vercel.json` disables framework detection, so the
+FastAPI preset is not used), and `api/engine-proxy.js` forwards every `/api/*` call to the engine,
+so the browser never talks to your server directly and no CORS setup is needed. The engine itself
+cannot run on Vercel — it is a long-running process with background trading loops, SQLite on disk
+and WebSockets.
 
-1. In the Netlify UI, open **Project configuration → Environment variables** and add
-   `ENGINE_URL` with your server's address, e.g. `http://203.0.113.10:8080`
+1. In the Vercel project, open **Settings → Environment Variables** and add `ENGINE_URL`
+   with your server's address, e.g. `http://203.0.113.10:8080`
    (a bare `203.0.113.10` or `203.0.113.10:8080` also works; the port defaults to `8080`).
    A variable named `IPAddress` is also accepted if `ENGINE_URL` is not set.
    `203.0.113.10` is a reserved documentation address — use your server's real public IP.
 2. Make sure the engine's port is reachable from the internet (firewall / security group).
 3. Redeploy. Until `ENGINE_URL` is set, the dashboard shows an "Engine address not configured" error.
+   Live `/ws` streams are not proxied; the dashboard falls back to REST polling.
 
 Set `web.api_token` before exposing the engine publicly — the dashboard prompts for it once.
-
-## Vercel-hosted dashboard
-
-Vercel works the same way as Netlify: it serves only the static dashboard (`vercel.json` disables
-framework detection, so the FastAPI preset is not used), and `api/engine-proxy.js` forwards every
-`/api/*` call to the engine. The engine itself cannot run on Vercel — it is a long-running process
-with background trading loops, SQLite on disk and WebSockets.
-
-1. In the Vercel project, open **Settings → Environment Variables** and add `ENGINE_URL`
-   (same formats as Netlify; `IPAddress` is also accepted).
-2. Make sure the engine's port is reachable from the internet and `web.api_token` is set.
-3. Redeploy. Live `/ws` streams are not proxied; the dashboard falls back to REST polling.
 
 ## AWS with Terraform
 
@@ -188,7 +180,7 @@ $(terraform output -raw ssm_port_forward_command)  # dashboard on http://localho
 * **Paper mode only.** The host runs the shipped `config.toml`; the live-readiness gate in section 5 is unchanged.
 * **Access.** By default nothing is reachable from the internet. Use the port forward above, or a shell with
   `terraform output -raw ssm_session_command`. `-var 'app_cidrs=["203.0.113.7/32"]'` opens the dashboard port to your address.
-* **Netlify.** `terraform output -raw engine_url` is the value for `ENGINE_URL`. Netlify has no fixed egress addresses,
+* **Vercel.** `terraform output -raw engine_url` is the value for `ENGINE_URL`. Vercel has no fixed egress addresses,
   so this needs a wide `app_cidrs` range **and** a token. Create a SecureString SSM parameter and pass its name as
   `api_token_ssm_parameter_name`: the host applies it as `web.api_token` before every start and refuses to start if it
   cannot read it. To rotate, update the parameter and run `sudo systemctl restart crypto-hunter`.
