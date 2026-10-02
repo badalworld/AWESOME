@@ -185,7 +185,7 @@ class RootWrapper(unittest.TestCase):
             self.assertIn(name, root_vars, f"root variable {name} existed before the module and must keep working")
         root_outputs = set(declared("output", code_only(read(ROOT / "outputs.tf"))))
         for name in ("public_ip", "engine_url", "instance_id"):
-            self.assertIn(name, root_outputs, f"root output {name} is used by the Netlify ENGINE_URL flow")
+            self.assertIn(name, root_outputs, f"root output {name} is used by the Vercel ENGINE_URL flow")
 
     def test_moved_blocks_point_at_real_module_resources_and_away_from_real_root_ones(self) -> None:
         root_main = code_only(read(ROOT / "main.tf"))

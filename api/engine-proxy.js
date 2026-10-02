@@ -3,7 +3,7 @@
 // Set ENGINE_URL in the Vercel project's Environment Variables to the engine's
 // address, e.g. "http://203.0.113.10:8080" (a bare IP or "IP:port" also works;
 // the port defaults to the engine's web.port of 8080). "IPAddress" is accepted
-// as a fallback, matching the Netlify edge function.
+// as a fallback.
 export const config = { runtime: "edge" };
 
 const PATH_PARAM = "__engine_path";

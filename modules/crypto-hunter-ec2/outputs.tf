@@ -20,7 +20,7 @@ output "private_ip" {
 }
 
 output "engine_url" {
-  description = "Base URL of the engine, for the ENGINE_URL variable of the Netlify dashboard proxy. Null when the instance has no public address."
+  description = "Base URL of the engine, for the ENGINE_URL variable of the Vercel dashboard proxy. Null when the instance has no public address."
   value       = local.public_ip != "" ? "http://${local.public_ip}:${var.app_port}" : null
 }
 

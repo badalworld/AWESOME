@@ -40,7 +40,7 @@ module "engine" {
 
 # Upgrading a deployment that was created before this module existed: keep its identity
 # (above all the Elastic IP, which may already be allow-listed on an exchange or set as
-# ENGINE_URL on Netlify) instead of destroying and recreating it. Delete these blocks after
+# ENGINE_URL on Vercel) instead of destroying and recreating it. Delete these blocks after
 # the first apply. They do nothing for new deployments.
 #
 # The old security group is deliberately not moved: it used inline rules, which cannot be
