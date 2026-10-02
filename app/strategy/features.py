@@ -41,7 +41,6 @@ class FeatureSet:
 
     ao: float = 0.0
     ao_prev: float = 0.0
-    ao_prev2: float = 0.0
     ao_series: List[float] = field(default_factory=list)
     ao_signal: float = 0.0          # SMA9 of AO (classic signal line)
 
@@ -149,7 +148,6 @@ def build_features(
         atr_series=atr_vals,
         ao=ao_vals[-1],
         ao_prev=ao_vals[-2],
-        ao_prev2=ao_vals[-3] if len(ao_vals) >= 3 else 0.0,
         ao_series=ao_vals,
         ao_signal=float(ao_signal),
         ema200=ema200_now,
