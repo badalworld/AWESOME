@@ -1,5 +1,10 @@
-# Infrastructure for the self-hosted trading engine described in docs/DEPLOYMENT.md:
-# one small EC2 host running `python run.py` under systemd.
+# Quick-start deployment of the self-hosted trading engine described in docs/DEPLOYMENT.md:
+# one small EC2 host running `python run.py` under systemd, with its state (SQLite databases,
+# credential key, dashboard settings) on a separate, snapshotted EBS volume.
+#
+# All of the infrastructure lives in ./modules/crypto-hunter-ec2, which is a reusable module for
+# AWS provider v6 (see its README). This file only configures the provider and calls it, so
+# `terraform apply` from the repository root keeps working:
 #
 #   terraform init
 #   terraform apply -var 'app_cidrs=["203.0.113.7/32"]'
@@ -15,109 +20,56 @@ provider "aws" {
   }
 }
 
-data "aws_ssm_parameter" "ubuntu_ami" {
-  name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+module "engine" {
+  source = "./modules/crypto-hunter-ec2"
+
+  name                         = var.name
+  instance_type                = var.instance_type
+  root_volume_size_gb          = var.volume_size_gb
+  repo_url                     = var.repo_url
+  repo_ref                     = var.repo_ref
+  app_port                     = var.app_port
+  key_name                     = var.key_name
+  ssh_cidrs                    = var.ssh_cidrs
+  app_cidrs                    = var.app_cidrs
+  subnet_id                    = var.subnet_id
+  data_volume_size_gb          = var.data_volume_size_gb
+  snapshot_retention_days      = var.snapshot_retention_days
+  api_token_ssm_parameter_name = var.api_token_ssm_parameter_name
 }
 
-data "aws_vpc" "default" {
-  default = true
+# Upgrading a deployment that was created before this module existed: keep its identity
+# (above all the Elastic IP, which may already be allow-listed on an exchange or set as
+# ENGINE_URL on Netlify) instead of destroying and recreating it. Delete these blocks after
+# the first apply. They do nothing for new deployments.
+#
+# The old security group is deliberately not moved: it used inline rules, which cannot be
+# combined with the standalone rule resources the module uses, so it is replaced.
+#
+# The instance is replaced either way, because its bootstrap script changed. The old
+# data/ directory lived on its root disk and is lost with it: back it up first (see
+# "Upgrading from the pre-module root configuration" in modules/crypto-hunter-ec2/README.md).
+moved {
+  from = aws_iam_role.engine
+  to   = module.engine.aws_iam_role.this
 }
 
-resource "aws_security_group" "engine" {
-  name_prefix = "${var.name}-"
-  description = "Crypto Hunter engine"
-  vpc_id      = data.aws_vpc.default.id
-
-  dynamic "ingress" {
-    for_each = length(var.app_cidrs) > 0 ? [1] : []
-    content {
-      description = "Dashboard / API"
-      from_port   = var.app_port
-      to_port     = var.app_port
-      protocol    = "tcp"
-      cidr_blocks = var.app_cidrs
-    }
-  }
-
-  dynamic "ingress" {
-    for_each = length(var.ssh_cidrs) > 0 ? [1] : []
-    content {
-      description = "SSH"
-      from_port   = 22
-      to_port     = 22
-      protocol    = "tcp"
-      cidr_blocks = var.ssh_cidrs
-    }
-  }
-
-  egress {
-    description = "Exchange APIs, package mirrors, git"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  lifecycle {
-    create_before_destroy = true
-  }
+moved {
+  from = aws_iam_role_policy_attachment.ssm
+  to   = module.engine.aws_iam_role_policy_attachment.ssm
 }
 
-# SSM Session Manager access, so SSH can stay closed.
-resource "aws_iam_role" "engine" {
-  name_prefix = "${var.name}-"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Action    = "sts:AssumeRole"
-      Principal = { Service = "ec2.amazonaws.com" }
-    }]
-  })
+moved {
+  from = aws_iam_instance_profile.engine
+  to   = module.engine.aws_iam_instance_profile.this
 }
 
-resource "aws_iam_role_policy_attachment" "ssm" {
-  role       = aws_iam_role.engine.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+moved {
+  from = aws_instance.engine
+  to   = module.engine.aws_instance.this
 }
 
-resource "aws_iam_instance_profile" "engine" {
-  name_prefix = "${var.name}-"
-  role        = aws_iam_role.engine.name
-}
-
-resource "aws_instance" "engine" {
-  ami                    = data.aws_ssm_parameter.ubuntu_ami.value
-  instance_type          = var.instance_type
-  key_name               = var.key_name
-  iam_instance_profile   = aws_iam_instance_profile.engine.name
-  vpc_security_group_ids = [aws_security_group.engine.id]
-
-  root_block_device {
-    volume_type = "gp3"
-    volume_size = var.volume_size_gb
-    encrypted   = true
-  }
-
-  metadata_options {
-    http_endpoint = "enabled"
-    http_tokens   = "required" # IMDSv2 only
-  }
-
-  user_data = templatefile("${path.module}/user_data.sh.tftpl", {
-    repo_url = var.repo_url
-    repo_ref = var.repo_ref
-    port     = var.app_port
-  })
-  user_data_replace_on_change = true
-
-  tags = {
-    Name = var.name
-  }
-}
-
-resource "aws_eip" "engine" {
-  instance = aws_instance.engine.id
-  domain   = "vpc"
+moved {
+  from = aws_eip.engine
+  to   = module.engine.aws_eip.this[0]
 }
